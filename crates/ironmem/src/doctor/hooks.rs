@@ -37,11 +37,18 @@ model and rebuilds the vector index";
 const INVALID_MODE_HINT: &str = "set IRONMEM_MCP_MODE to trusted, read-only or restricted, \
 or remove it; a hook with any other value exits at startup";
 
+const DYNAMIC_MODE_HINT: &str = "set a literal IRONMEM_MCP_MODE value (trusted, read-only or \
+restricted) in the hook command so doctor can check it";
+
 const DUPLICATE_HINT: &str = "remove the hand-wired ironmem entries from settings.json; \
 the enabled plugin already supplies these hooks";
 
+const HOME_UNKNOWN: &str = "hook mining: skipped (home directory unknown)";
+
 /// The command shape of a plugin hook, used to work out the mode it runs in.
 const PLUGIN_HOOK_COMMAND: &str = "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh";
+
+const MODE_VAR: &str = "IRONMEM_MCP_MODE";
 
 /// Where a hook's effective `IRONMEM_MCP_MODE` came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +67,17 @@ enum ModeSource {
     Default,
 }
 
+/// Why a hook's mode could not be turned into a [`McpAccessMode`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ModeError {
+    /// `Config::load` rejects the value, so the hook exits at startup.
+    Invalid(String),
+    /// The value is built by the shell (`$VAR`, `$(..)`), so doctor can't know it.
+    Unknown(String),
+}
+
+type ModeResult = (Result<McpAccessMode, ModeError>, ModeSource);
+
 fn source_label(source: ModeSource) -> &'static str {
     match source {
         ModeSource::Inline => "set in the hook command",
@@ -77,6 +95,9 @@ fn mode_label(mode: McpAccessMode) -> &'static str {
         McpAccessMode::Restricted => "restricted",
     }
 }
+
+/// Plugin hook events that settings.json wires, with every command matching each.
+type WiredHooks = Vec<(&'static str, Vec<String>)>;
 
 /// What `~/.claude/settings.json` says about the ironmem hooks.
 #[derive(Debug)]
@@ -97,8 +118,8 @@ enum HookWiring {
     },
     /// Hooks registered by hand or by scripts/install-ironmem.sh.
     Manual {
-        /// `(event, command)` for each plugin hook found, in PLUGIN_HOOKS order.
-        wired: Vec<(&'static str, String)>,
+        /// The plugin hooks found, in PLUGIN_HOOKS order.
+        wired: WiredHooks,
         /// Plugin hook events with no matching command.
         missing: Vec<&'static str>,
         /// `env.IRONMEM_MCP_MODE` from settings.json, if set.
@@ -160,36 +181,29 @@ pub(super) fn claude_hook_checks(
             hand_wired,
             settings_env_mode,
         } => {
-            let plugin_miners: Vec<(&'static str, String)> = MINING_EVENTS
+            let wired: WiredHooks = PLUGIN_HOOKS
                 .iter()
-                .map(|event| {
-                    (
-                        *event,
-                        format!("{PLUGIN_HOOK_COMMAND} {}", plugin_hook_name(event)),
-                    )
-                })
+                .map(|(event, name)| (*event, vec![format!("{PLUGIN_HOOK_COMMAND} {name}")]))
                 .collect();
+            let failures = startup_failures(&wired, settings_env_mode.as_deref(), process_env_mode);
             vec![
-                plugin_hooks_check(&hand_wired),
-                mining_check(
-                    &plugin_miners,
-                    settings_env_mode.as_deref(),
-                    process_env_mode,
-                ),
+                plugin_hooks_check(&hand_wired, &failures),
+                mining_check(&wired, settings_env_mode.as_deref(), process_env_mode),
             ]
         }
         HookWiring::Manual {
             wired,
             missing,
             settings_env_mode,
-        } => vec![
-            hooks_check(&path, &missing),
-            mining_check(&wired, settings_env_mode.as_deref(), process_env_mode),
-        ],
+        } => {
+            let failures = startup_failures(&wired, settings_env_mode.as_deref(), process_env_mode);
+            vec![
+                hooks_check(&path, &missing, &failures),
+                mining_check(&wired, settings_env_mode.as_deref(), process_env_mode),
+            ]
+        }
     }
 }
-
-const HOME_UNKNOWN: &str = "hook mining: skipped (home directory unknown)";
 
 fn skipped(hooks_summary: &str, mining_summary: &str) -> Vec<Check> {
     vec![
@@ -224,12 +238,14 @@ fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
     let mut wired = Vec::new();
     let mut missing = Vec::new();
     for (event, hook) in PLUGIN_HOOKS {
-        match commands_for(&doc, event)
+        let matching: Vec<String> = commands_for(&doc, event)
             .into_iter()
-            .find(|c| runs_hook(c, hook))
-        {
-            Some(cmd) => wired.push((event, cmd)),
-            None => missing.push(event),
+            .filter(|c| runs_hook(c, hook))
+            .collect();
+        if matching.is_empty() {
+            missing.push(event);
+        } else {
+            wired.push((event, matching));
         }
     }
     let settings_env_mode = doc
@@ -277,99 +293,458 @@ fn commands_for(doc: &Value, event: &str) -> Vec<String> {
         .collect()
 }
 
-/// A command token without the quotes and shell separators around it.
-fn clean_token(token: &str) -> &str {
-    token.trim_matches(|c| matches!(c, '"' | '\'' | ';' | '&' | '|' | '(' | ')'))
+/// One word of a shell command after quote removal.
+#[derive(Debug, Clone)]
+struct Word {
+    text: String,
+    /// Contains an unquoted or double-quoted `$` or backtick: the shell
+    /// decides its value, not us.
+    dynamic: bool,
 }
 
-fn tokens(command: &str) -> Vec<&str> {
-    command.split_whitespace().map(clean_token).collect()
+/// Accumulates the words and simple commands of [`split_commands`].
+#[derive(Default)]
+struct Splitter {
+    commands: Vec<Vec<Word>>,
+    words: Vec<Word>,
+    cur: String,
+    in_word: bool,
+    dynamic: bool,
+    quoted: bool,
+    /// The next word is a redirection target and is dropped.
+    skip_next: bool,
+}
+
+impl Splitter {
+    fn end_word(&mut self) {
+        if self.in_word {
+            let word = Word {
+                text: std::mem::take(&mut self.cur),
+                dynamic: self.dynamic,
+            };
+            if self.skip_next {
+                self.skip_next = false;
+            } else {
+                self.words.push(word);
+            }
+        }
+        self.in_word = false;
+        self.dynamic = false;
+        self.quoted = false;
+    }
+
+    fn end_command(&mut self) {
+        self.end_word();
+        self.skip_next = false;
+        if !self.words.is_empty() {
+            self.commands.push(std::mem::take(&mut self.words));
+        }
+    }
+}
+
+/// Split a shell command string into simple commands of words.
+///
+/// A deliberately small model, not a shell: single quotes are literal, double
+/// quotes group (a backslash escapes the next character), unquoted whitespace
+/// separates words, and unquoted `; & | ( )` and newlines end a simple
+/// command (so `&&`, `||` and glued forms like `stop&&true` split too). An
+/// unquoted word starting with `#` begins a comment. Redirections (`>`, `>>`,
+/// `<`, `2>`, `2>&1`, `stop>>/log`) are dropped together with their target.
+/// Not modelled: heredocs, here-strings, `$(..)` bodies, brace groups, `if`
+/// and `case`; those shapes are documented limits, not bugs.
+fn split_commands(input: &str) -> Vec<Vec<Word>> {
+    let mut sp = Splitter::default();
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                sp.in_word = true;
+                sp.quoted = true;
+                for q in chars.by_ref() {
+                    if q == '\'' {
+                        break;
+                    }
+                    sp.cur.push(q);
+                }
+            }
+            '"' => {
+                sp.in_word = true;
+                sp.quoted = true;
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' => sp.cur.extend(chars.next()),
+                        '$' | '`' => {
+                            sp.dynamic = true;
+                            sp.cur.push(q);
+                        }
+                        _ => sp.cur.push(q),
+                    }
+                }
+            }
+            '\\' => match chars.next() {
+                Some('\n') | None => {}
+                Some(n) => {
+                    sp.in_word = true;
+                    sp.cur.push(n);
+                }
+            },
+            '$' | '`' => {
+                sp.in_word = true;
+                sp.dynamic = true;
+                sp.cur.push(c);
+            }
+            '#' if !sp.in_word => {
+                for n in chars.by_ref() {
+                    if n == '\n' {
+                        break;
+                    }
+                }
+                sp.end_command();
+            }
+            ';' | '\n' | '&' | '|' | '(' | ')' => sp.end_command(),
+            '>' | '<' => {
+                // `2>` and `2>&1`: a bare file-descriptor number is part of the operator.
+                if sp.in_word && !sp.quoted && sp.cur.chars().all(|d| d.is_ascii_digit()) {
+                    sp.cur.clear();
+                    sp.in_word = false;
+                    sp.dynamic = false;
+                } else {
+                    sp.end_word();
+                }
+                if chars.peek() == Some(&c) || (c == '>' && chars.peek() == Some(&'&')) {
+                    chars.next();
+                }
+                sp.skip_next = true;
+            }
+            c if c.is_whitespace() => sp.end_word(),
+            _ => {
+                sp.in_word = true;
+                sp.cur.push(c);
+            }
+        }
+    }
+    sp.end_command();
+    sp.commands
 }
 
 fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
-/// True when `command` runs `ironmem hook <hook>`, directly, through the
-/// plugin's `ironmem-mcp.sh` wrapper, or through its `ironmem-hook.sh` script.
-/// Tokens are whitespace-split, stripped of quotes and shell separators and
-/// matched on their basename, so any install path counts. A `--harness <v>`
-/// or `--harness=<v>` between `hook` and the name is skipped.
-fn runs_hook(command: &str, hook: &str) -> bool {
-    let tokens = tokens(command);
-    tokens
-        .iter()
-        .enumerate()
-        .any(|(i, token)| match basename(token) {
-            "ironmem" | "ironmem-mcp.sh" => {
-                tokens.get(i + 1) == Some(&"hook") && hook_name_at(&tokens, i + 2) == Some(hook)
-            }
-            "ironmem-hook.sh" => tokens.get(i + 1) == Some(&hook),
-            _ => false,
-        })
+/// A `NAME=value` word, if it is one.
+fn assignment(word: &Word) -> Option<(&str, &str)> {
+    let (name, value) = word.text.split_once('=')?;
+    let mut chars = name.chars();
+    let first_ok = chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+    (first_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')).then_some((name, value))
 }
 
-/// The hook name at `tokens[at]`, after any `--harness` option.
-fn hook_name_at<'a>(tokens: &[&'a str], at: usize) -> Option<&'a str> {
-    match tokens.get(at)? {
-        t if t.starts_with("--harness=") => tokens.get(at + 1).copied(),
-        &"--harness" => tokens.get(at + 2).copied(),
-        t => Some(t),
+/// A value given to `IRONMEM_MCP_MODE` by a command or an `export`.
+#[derive(Debug, Clone)]
+struct ModeValue {
+    raw: String,
+    dynamic: bool,
+}
+
+fn mode_assignment(word: &Word) -> Option<ModeValue> {
+    match assignment(word) {
+        Some((MODE_VAR, value)) => Some(ModeValue {
+            raw: value.to_owned(),
+            dynamic: word.dynamic,
+        }),
+        _ => None,
     }
 }
 
-fn uses_plugin_wrapper(command: &str) -> bool {
-    tokens(command)
-        .iter()
-        .any(|token| matches!(basename(token), "ironmem-hook.sh" | "ironmem-mcp.sh"))
+/// One run of `ironmem hook <hook>` found in a command string.
+#[derive(Debug, Clone)]
+struct Invocation {
+    hook: String,
+    /// Goes through `ironmem-mcp.sh` or `ironmem-hook.sh`, which default the
+    /// mode to trusted (`${IRONMEM_MCP_MODE:-trusted}`).
+    wrapper: bool,
+    /// The mode set for this run by an assignment word or an earlier `export`.
+    mode: Option<ModeValue>,
 }
 
-/// The mode a hook command will run in, and where that came from. Order:
-/// inline `IRONMEM_MCP_MODE=` > settings.json `env` > the inherited
-/// environment > the plugin wrapper's trusted default > read-only.
+/// The hook name after `hook`, skipping `--harness <v>` / `--harness=<v>`.
+fn hook_after_subcommand(args: &[Word]) -> Option<&str> {
+    if args.first()?.text != "hook" {
+        return None;
+    }
+    let at = match args.get(1).map(|w| w.text.as_str()) {
+        Some("--harness") => 3,
+        Some(t) if t.starts_with("--harness=") => 2,
+        _ => 1,
+    };
+    args.get(at).map(|w| w.text.as_str())
+}
+
+/// Consume leading assignment words (and, for `env`, option flags) from `rest`.
+fn take_assignments(rest: &mut &[Word], inline: &mut Option<ModeValue>, allow_flags: bool) {
+    while let Some(word) = rest.first() {
+        if let Some(value) = mode_assignment(word) {
+            *inline = Some(value);
+        } else if !(assignment(word).is_some() || allow_flags && word.text.starts_with('-')) {
+            return;
+        }
+        *rest = &rest[1..];
+    }
+}
+
+/// The `ironmem hook` runs in `command`; see [`runs_hook`] for the model.
+fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
+    let mut exported = inherited;
+    let mut found = Vec::new();
+    for words in split_commands(command) {
+        let mut inline = None;
+        let mut rest: &[Word] = &words;
+        take_assignments(&mut rest, &mut inline, false);
+        while let Some(first) = rest.first() {
+            let name = basename(&first.text);
+            if !matches!(name, "env" | "exec" | "command" | "nohup") {
+                break;
+            }
+            rest = &rest[1..];
+            if name == "env" {
+                take_assignments(&mut rest, &mut inline, true);
+            }
+        }
+        let Some((program, args)) = rest.split_first() else {
+            continue;
+        };
+        let program = basename(&program.text);
+        if program == "export" {
+            if let Some(value) = args.iter().find_map(mode_assignment) {
+                exported = Some(value);
+            }
+            continue;
+        }
+        let mode = inline.or_else(|| exported.clone());
+        let mut push = |hook: &str, wrapper: bool| {
+            found.push(Invocation {
+                hook: hook.to_owned(),
+                wrapper,
+                mode: mode.clone(),
+            });
+        };
+        match program {
+            "ironmem" | "ironmem-mcp.sh" => {
+                if let Some(hook) = hook_after_subcommand(args) {
+                    push(hook, program == "ironmem-mcp.sh");
+                }
+            }
+            "ironmem-hook.sh" => {
+                if let Some(hook) = args.first() {
+                    push(&hook.text, true);
+                }
+            }
+            "bash" | "sh" => shell_args(args, mode.clone(), &mut found),
+            _ => {}
+        }
+    }
+    found
+}
+
+/// Handle the arguments of `bash`/`sh`: `-c <string>` recurses into the
+/// string, otherwise the first non-flag argument is the script.
+fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation>) {
+    for (i, arg) in args.iter().enumerate() {
+        let text = arg.text.as_str();
+        if text.starts_with('-') && !text.starts_with("--") && text.ends_with('c') {
+            if let Some(script) = args.get(i + 1) {
+                found.extend(invocations(&script.text, mode));
+            }
+            return;
+        }
+        if text.starts_with('-') {
+            continue;
+        }
+        if basename(text) == "ironmem-hook.sh" {
+            if let Some(hook) = args.get(i + 1) {
+                found.push(Invocation {
+                    hook: hook.text.clone(),
+                    wrapper: true,
+                    mode,
+                });
+            }
+        }
+        return;
+    }
+}
+
+/// True when `command` runs `ironmem hook <hook>`.
+///
+/// The model is a small simple-command reader, not a shell (see
+/// [`split_commands`] for the word and operator rules). In each simple
+/// command, leading `NAME=value` words are assignments; the wrappers `env`
+/// (with its own assignments and flags), `exec`, `command` and `nohup` are
+/// peeled off; the program's basename must then be `ironmem` or
+/// `ironmem-mcp.sh` followed by `hook`, optionally `--harness <v>` or
+/// `--harness=<v>`, then the name; or `ironmem-hook.sh <name>` run directly or
+/// by `bash`/`sh`; or `bash`/`sh -c <string>`, which is read recursively.
+/// Anything else (`echo`, `printf`, `true`) is not the hook.
+///
+/// Known limits, documented rather than bugs: control flow is not followed, so
+/// `true || ironmem hook stop` counts as wired; heredocs, brace groups and
+/// `$(..)` bodies are not read; aliases and functions are unknown.
+fn runs_hook(command: &str, hook: &str) -> bool {
+    invocations(command, None).iter().any(|i| i.hook == hook)
+}
+
+/// The mode the `hook` run(s) in `command` get, and where that came from.
+///
+/// Only the same simple command counts: the mode comes from the assignment
+/// words (or `env` assignments) of the command that runs the hook, or from an
+/// earlier `export IRONMEM_MCP_MODE=v` in the same string, and the command's
+/// own assignment wins. It never comes from a later or unrelated command, so
+/// `ironmem hook stop; IRONMEM_MCP_MODE=trusted true` runs read-only. When
+/// the command holds several runs of `hook`, a trusted one is returned.
+///
+/// With no inline value the order is settings.json `env`, then the inherited
+/// environment, then the plugin wrapper's trusted default (an empty value
+/// counts as unset to the wrapper, but `Config::load` rejects it), then
+/// read-only. A value containing `$` or a backtick is [`ModeError::Unknown`].
 fn hook_mode(
     command: &str,
+    hook: &str,
     settings_env: Option<&str>,
     process_env: Option<&str>,
-) -> (Result<McpAccessMode, String>, ModeSource) {
-    let inline = tokens(command)
-        .into_iter()
-        .find_map(|token| token.strip_prefix("IRONMEM_MCP_MODE="))
-        .map(clean_token);
-    let (raw, source) = match (inline, settings_env, process_env) {
-        (Some(v), _, _) => (v, ModeSource::Inline),
-        (None, Some(v), _) => (v, ModeSource::SettingsEnv),
-        (None, None, Some(v)) => (v, ModeSource::Environment),
-        (None, None, None) if uses_plugin_wrapper(command) => {
+) -> ModeResult {
+    let results: Vec<ModeResult> = invocations(command, None)
+        .iter()
+        .filter(|i| i.hook == hook)
+        .map(|i| invocation_mode(i, settings_env, process_env))
+        .collect();
+    first_trusted(&results)
+        .or_else(|| results.first())
+        .cloned()
+        .unwrap_or((Ok(McpAccessMode::ReadOnly), ModeSource::Default))
+}
+
+fn is_trusted(result: &ModeResult) -> bool {
+    matches!(result.0, Ok(McpAccessMode::Trusted))
+}
+
+/// A trusted result, preferring one that doesn't depend on doctor's shell.
+fn first_trusted(results: &[ModeResult]) -> Option<&ModeResult> {
+    results
+        .iter()
+        .find(|r| is_trusted(r) && r.1 != ModeSource::Environment)
+        .or_else(|| results.iter().find(|r| is_trusted(r)))
+}
+
+fn invocation_mode(
+    run: &Invocation,
+    settings_env: Option<&str>,
+    process_env: Option<&str>,
+) -> ModeResult {
+    let (raw, dynamic, source) = match (&run.mode, settings_env, process_env) {
+        (Some(v), _, _) => (v.raw.as_str(), v.dynamic, ModeSource::Inline),
+        (None, Some(v), _) => (v, false, ModeSource::SettingsEnv),
+        (None, None, Some(v)) => (v, false, ModeSource::Environment),
+        (None, None, None) if run.wrapper => {
             return (Ok(McpAccessMode::Trusted), ModeSource::PluginWrapper)
         }
         (None, None, None) => return (Ok(McpAccessMode::ReadOnly), ModeSource::Default),
     };
-    (McpAccessMode::parse(raw).map_err(|e| e.to_string()), source)
+    if dynamic {
+        return (Err(ModeError::Unknown(raw.to_owned())), source);
+    }
+    if run.wrapper && raw.is_empty() {
+        return (Ok(McpAccessMode::Trusted), ModeSource::PluginWrapper);
+    }
+    match McpAccessMode::parse(raw) {
+        // The wrapper defaults to trusted, so this holds without doctor's shell.
+        Ok(McpAccessMode::Trusted) if run.wrapper && source == ModeSource::Environment => {
+            (Ok(McpAccessMode::Trusted), ModeSource::PluginWrapper)
+        }
+        Ok(mode) => (Ok(mode), source),
+        Err(e) => (Err(ModeError::Invalid(e.to_string())), source),
+    }
 }
 
-fn plugin_hooks_check(hand_wired: &[&str]) -> Check {
-    if hand_wired.is_empty() {
+/// Per-command results for `event`'s matching commands, best first: a trusted
+/// run if any, else the first command in settings order.
+fn event_mode(
+    event: &str,
+    commands: &[String],
+    settings_env: Option<&str>,
+    process_env: Option<&str>,
+) -> ModeResult {
+    let hook = plugin_hook_name(event);
+    let results: Vec<ModeResult> = commands
+        .iter()
+        .map(|c| hook_mode(c, hook, settings_env, process_env))
+        .collect();
+    first_trusted(&results)
+        .or_else(|| {
+            results
+                .iter()
+                .find(|r| !matches!(r.0, Err(ModeError::Invalid(_))))
+        })
+        .or_else(|| results.first())
+        .cloned()
+        .unwrap_or((Ok(McpAccessMode::ReadOnly), ModeSource::Default))
+}
+
+/// Non-mining hooks (SessionStart, UserPromptSubmit) whose mode is invalid:
+/// `Config::load` fails, so they exit at startup and prompt recall is off.
+fn startup_failures(
+    wired: &WiredHooks,
+    settings_env: Option<&str>,
+    process_env: Option<&str>,
+) -> Vec<String> {
+    wired
+        .iter()
+        .filter(|(event, _)| !MINING_EVENTS.contains(event))
+        .filter_map(|(event, commands)| {
+            match event_mode(event, commands, settings_env, process_env) {
+                (Err(ModeError::Invalid(e)), source) => Some(format!(
+                    "{event} fails to start: {e} ({})",
+                    source_label(source)
+                )),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+fn plugin_hooks_check(hand_wired: &[&str], failures: &[String]) -> Check {
+    if hand_wired.is_empty() && failures.is_empty() {
         return Check::new(
             "hooks",
             CheckStatus::Ok,
             "Claude Code hooks: supplied by the enabled ironmem plugin",
         );
     }
+    let mut problems = Vec::new();
+    let mut hints = Vec::new();
+    if !hand_wired.is_empty() {
+        problems.push(format!(
+            "the enabled ironmem plugin supplies them and settings.json wires {} by hand \
+             too, so those hooks run twice",
+            hand_wired.join(", ")
+        ));
+        hints.push(DUPLICATE_HINT);
+    }
+    if !failures.is_empty() {
+        problems.push(failures.join("; "));
+        hints.push(INVALID_MODE_HINT);
+    }
     Check::new(
         "hooks",
         CheckStatus::Warn,
-        format!(
-            "Claude Code hooks: the enabled ironmem plugin supplies them and settings.json \
-             wires {} by hand too, so those hooks run twice",
-            hand_wired.join(", ")
-        ),
+        format!("Claude Code hooks: {}", problems.join("; ")),
     )
-    .with_hint(DUPLICATE_HINT)
+    .with_hint(hints.join("; "))
 }
 
-fn hooks_check(path: &Path, missing: &[&str]) -> Check {
-    if missing.is_empty() {
+fn hooks_check(path: &Path, missing: &[&str], failures: &[String]) -> Check {
+    if missing.is_empty() && failures.is_empty() {
         return Check::new(
             "hooks",
             CheckStatus::Ok,
@@ -380,27 +755,37 @@ fn hooks_check(path: &Path, missing: &[&str]) -> Check {
             ),
         );
     }
-    let effects: Vec<&str> = missing
-        .iter()
-        .map(|event| match *event {
-            "SessionStart" => "no memory context at session start",
-            "UserPromptSubmit" => "prompt recall is off",
-            "Stop" => "no mining when a session stops",
-            "PreCompact" => "no mining before compaction",
-            _ => "unknown hook",
-        })
-        .collect();
-    Check::new(
-        "hooks",
-        CheckStatus::Warn,
-        format!(
-            "Claude Code hooks: missing {} in {} ({})",
+    let mut problems = Vec::new();
+    let mut hints = Vec::new();
+    if !missing.is_empty() {
+        let effects: Vec<&str> = missing
+            .iter()
+            .map(|event| match *event {
+                "SessionStart" => "no memory context at session start",
+                "UserPromptSubmit" => "prompt recall is off",
+                "Stop" => "no mining when a session stops",
+                "PreCompact" => "no mining before compaction",
+                _ => "unknown hook",
+            })
+            .collect();
+        problems.push(format!(
+            "missing {} in {} ({})",
             missing.join(", "),
             path.display(),
             effects.join("; ")
-        ),
+        ));
+        hints.push(INSTALL_HINT);
+    }
+    if !failures.is_empty() {
+        problems.push(format!("{}; prompt recall is off", failures.join("; ")));
+        hints.push(INVALID_MODE_HINT);
+    }
+    Check::new(
+        "hooks",
+        CheckStatus::Warn,
+        format!("Claude Code hooks: {}", problems.join("; ")),
     )
-    .with_hint(INSTALL_HINT)
+    .with_hint(hints.join("; "))
 }
 
 fn no_miner_check() -> Check {
@@ -413,11 +798,11 @@ fn no_miner_check() -> Check {
 }
 
 fn mining_check(
-    wired: &[(&'static str, String)],
+    wired: &WiredHooks,
     settings_env: Option<&str>,
     process_env: Option<&str>,
 ) -> Check {
-    let miners: Vec<&(&'static str, String)> = wired
+    let miners: Vec<&(&'static str, Vec<String>)> = wired
         .iter()
         .filter(|(event, _)| MINING_EVENTS.contains(event))
         .collect();
@@ -426,9 +811,10 @@ fn mining_check(
     }
     let mut cannot = Vec::new();
     let mut failing = Vec::new();
+    let mut unknown = Vec::new();
     let mut from_shell = false;
-    for (event, command) in miners {
-        match hook_mode(command, settings_env, process_env) {
+    for (event, commands) in miners {
+        match event_mode(event, commands, settings_env, process_env) {
             (Ok(McpAccessMode::Trusted), source) => {
                 from_shell |= source == ModeSource::Environment;
             }
@@ -437,14 +823,18 @@ fn mining_check(
                 mode_label(mode),
                 source_label(source)
             )),
-            (Err(e), source) => failing.push(format!(
+            (Err(ModeError::Invalid(e)), source) => failing.push(format!(
                 "{event} fails to start: {e} ({})",
                 source_label(source)
+            )),
+            (Err(ModeError::Unknown(raw)), _) => unknown.push(format!(
+                "{event} mode cannot be determined statically (IRONMEM_MCP_MODE={raw})"
             )),
         }
     }
     if !failing.is_empty() {
         let mut parts = failing;
+        parts.extend(unknown);
         parts.extend(cannot);
         return Check::new(
             "hook_mining",
@@ -456,6 +846,16 @@ fn mining_check(
             ),
         )
         .with_hint(INVALID_MODE_HINT);
+    }
+    if !unknown.is_empty() {
+        let mut parts = unknown;
+        parts.extend(cannot);
+        return Check::new(
+            "hook_mining",
+            CheckStatus::Warn,
+            format!("hooks may not mine: {}", parts.join("; ")),
+        )
+        .with_hint(DYNAMIC_MODE_HINT);
     }
     if !cannot.is_empty() {
         return Check::new(
@@ -538,6 +938,7 @@ mod tests {
                 runs_hook(cmd, name),
                 "{event}: `{cmd}` should run hook {name}"
             );
+            assert_eq!(cmd, format!("{PLUGIN_HOOK_COMMAND} {name}"), "{event}");
         }
     }
 
@@ -571,43 +972,48 @@ mod tests {
         use McpAccessMode::*;
         let bare = "~/.ironrace/bin/ironmem hook stop";
         assert_eq!(
-            hook_mode(bare, None, None),
+            hook_mode(bare, "stop", None, None),
             (Ok(ReadOnly), ModeSource::Default)
         );
         assert_eq!(
-            hook_mode(bare, None, Some("trusted")),
+            hook_mode(bare, "stop", None, Some("trusted")),
             (Ok(Trusted), ModeSource::Environment)
         );
         assert_eq!(
-            hook_mode(bare, Some("trusted"), Some("read-only")),
+            hook_mode(bare, "stop", Some("trusted"), Some("read-only")),
             (Ok(Trusted), ModeSource::SettingsEnv)
         );
         assert_eq!(
             hook_mode(
                 "IRONMEM_MCP_MODE='read-only' ironmem hook stop",
+                "stop",
                 Some("trusted"),
                 Some("trusted")
             ),
             (Ok(ReadOnly), ModeSource::Inline)
         );
         assert_eq!(
-            hook_mode("bash /p/hooks/ironmem-hook.sh stop", None, None),
+            hook_mode("bash /p/hooks/ironmem-hook.sh stop", "stop", None, None),
             (Ok(Trusted), ModeSource::PluginWrapper)
         );
         assert_eq!(
             hook_mode(
                 "bash /p/hooks/ironmem-hook.sh stop",
+                "stop",
                 None,
                 Some("read-only")
             ),
             (Ok(ReadOnly), ModeSource::Environment),
             "the wrapper only defaults; an inherited mode wins"
         );
-        assert!(
-            hook_mode("IRONMEM_MCP_MODE=bogus ironmem hook stop", None, None)
-                .0
-                .is_err()
-        );
+        assert!(hook_mode(
+            "IRONMEM_MCP_MODE=bogus ironmem hook stop",
+            "stop",
+            None,
+            None
+        )
+        .0
+        .is_err());
     }
 
     #[test]
@@ -859,6 +1265,7 @@ mod tests {
         assert_eq!(
             hook_mode(
                 "export IRONMEM_MCP_MODE=trusted; ironmem hook stop",
+                "stop",
                 None,
                 None
             ),
@@ -866,7 +1273,8 @@ mod tests {
         );
         assert_eq!(
             hook_mode(
-                "IRONMEM_MCP_MODE=\"read-only\"; ironmem hook stop",
+                "export IRONMEM_MCP_MODE=\"read-only\"; ironmem hook stop",
+                "stop",
                 None,
                 None
             ),
@@ -917,6 +1325,207 @@ mod tests {
             c[1].summary.contains("Stop runs restricted"),
             "{}",
             c[1].summary
+        );
+    }
+
+    fn mining_of(settings: &str, process_env: Option<&str>) -> Check {
+        let home = home_with_settings(settings);
+        claude_hook_checks(Some(home.path()), process_env).remove(1)
+    }
+
+    #[test]
+    fn mode_is_scoped_to_the_simple_command_that_runs_the_hook() {
+        use McpAccessMode::*;
+        let later = "ironmem hook stop; IRONMEM_MCP_MODE=trusted true";
+        assert_eq!(
+            hook_mode(later, "stop", None, None),
+            (Ok(ReadOnly), ModeSource::Default)
+        );
+        let two = "IRONMEM_MCP_MODE=read-only ironmem hook precompact; \
+                   IRONMEM_MCP_MODE=trusted ironmem hook stop";
+        assert_eq!(
+            hook_mode(two, "stop", None, None),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+        assert_eq!(
+            hook_mode(two, "precompact", None, None),
+            (Ok(ReadOnly), ModeSource::Inline)
+        );
+        let exported = "export IRONMEM_MCP_MODE=trusted; ironmem hook stop";
+        assert_eq!(
+            hook_mode(exported, "stop", None, None),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+        let inline_wins =
+            "export IRONMEM_MCP_MODE=trusted; IRONMEM_MCP_MODE=read-only ironmem hook stop";
+        assert_eq!(
+            hook_mode(inline_wins, "stop", None, None),
+            (Ok(ReadOnly), ModeSource::Inline)
+        );
+        let late_export = "ironmem hook stop; export IRONMEM_MCP_MODE=trusted";
+        assert_eq!(
+            hook_mode(late_export, "stop", None, None),
+            (Ok(ReadOnly), ModeSource::Default)
+        );
+        let c = mining_of(&settings_with(&[("Stop", later)]), None);
+        assert_eq!(c.status, CheckStatus::Warn, "{}", c.summary);
+        assert!(c.summary.contains("Stop runs read-only"), "{}", c.summary);
+    }
+
+    #[test]
+    fn any_trusted_command_for_an_event_mines() {
+        let restricted_precompact = "IRONMEM_MCP_MODE=restricted ironmem hook precompact";
+        let doc = serde_json::json!({"hooks": {
+            "Stop": [{"hooks": [
+                {"type": "command", "command": "ironmem hook stop"},
+                {"type": "command", "command": "IRONMEM_MCP_MODE=trusted ironmem hook stop"}
+            ]}],
+            "PreCompact": [{"hooks": [
+                {"type": "command", "command": "ironmem hook precompact"},
+                {"type": "command", "command": restricted_precompact}
+            ]}]
+        }});
+        let c = mining_of(&doc.to_string(), None);
+        assert_eq!(c.status, CheckStatus::Warn, "{}", c.summary);
+        assert!(
+            !c.summary.contains("Stop runs"),
+            "Stop has a trusted command: {}",
+            c.summary
+        );
+        assert!(
+            c.summary.contains("PreCompact runs read-only"),
+            "the first command is reported: {}",
+            c.summary
+        );
+        assert!(!c.summary.contains("restricted"), "{}", c.summary);
+    }
+
+    #[test]
+    fn empty_mode_follows_the_wrapper_default_or_config_load() {
+        let plugin = format!(r#"{PLUGIN_ON}, "env": {{"IRONMEM_MCP_MODE": ""}}}}"#);
+        let c = mining_of(&plugin, None);
+        assert_eq!(
+            c.status,
+            CheckStatus::Ok,
+            "wrapper treats empty as unset: {}",
+            c.summary
+        );
+        // Config::load parses an empty IRONMEM_MCP_MODE and rejects it.
+        let mut doc: Value = serde_json::from_str(&settings_with(&ALL_FOUR_BARE)).unwrap();
+        doc["env"] = serde_json::json!({"IRONMEM_MCP_MODE": ""});
+        let c = mining_of(&doc.to_string(), None);
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(c.summary.contains("fails to start"), "{}", c.summary);
+    }
+
+    #[test]
+    fn dynamic_mode_value_cannot_be_judged() {
+        let cmd = "IRONMEM_MCP_MODE=$MODE ironmem hook stop";
+        let c = mining_of(&settings_with(&[("Stop", cmd)]), None);
+        assert_eq!(c.status, CheckStatus::Warn);
+        assert!(
+            c.summary.contains("cannot be determined statically"),
+            "{}",
+            c.summary
+        );
+        assert!(!c.summary.contains("fails to start"), "{}", c.summary);
+        assert!(c.hint.as_deref().unwrap().contains("literal"));
+        let quoted = "IRONMEM_MCP_MODE=\"$(cat /m)\" ironmem hook stop";
+        let c = mining_of(&settings_with(&[("Stop", quoted)]), None);
+        assert!(
+            c.summary.contains("cannot be determined statically"),
+            "{}",
+            c.summary
+        );
+    }
+
+    #[test]
+    fn plugin_with_trusted_shell_does_not_blame_the_shell() {
+        let c = mining_of(&format!("{PLUGIN_ON}}}"), Some("trusted"));
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+        assert!(!c.summary.contains("must be launched"), "{}", c.summary);
+    }
+
+    #[test]
+    fn simple_command_model_resolves_odd_shapes() {
+        assert!(!runs_hook("echo ironmem hook stop", "stop"));
+        assert!(!runs_hook("# ironmem hook stop", "stop"));
+        assert!(!runs_hook("true # ironmem hook stop", "stop"));
+        assert!(!runs_hook("printf '%s' 'ironmem hook stop'", "stop"));
+        assert!(runs_hook("ironmem hook stop>>/tmp/log", "stop"));
+        assert!(runs_hook("ironmem hook stop >/dev/null 2>&1", "stop"));
+        assert!(runs_hook("ironmem hook stop&&true", "stop"));
+        assert!(
+            runs_hook("true || ironmem hook stop", "stop"),
+            "documented limit"
+        );
+        assert!(runs_hook("sh -c 'ironmem hook stop'", "stop"));
+        assert!(runs_hook("nohup ironmem hook stop", "stop"));
+        assert!(runs_hook("exec ironmem hook stop", "stop"));
+        assert!(runs_hook("command ironmem hook stop", "stop"));
+        assert!(runs_hook(
+            "bash -x \"/p/hooks/ironmem-hook.sh\" stop",
+            "stop"
+        ));
+        assert!(!runs_hook("bash /p/other.sh ironmem-hook.sh stop", "stop"));
+        use McpAccessMode::*;
+        let env = "env IRONMEM_MCP_MODE=trusted ironmem hook stop";
+        assert_eq!(
+            hook_mode(env, "stop", None, None),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+        let sh = "IRONMEM_MCP_MODE=trusted sh -c 'ironmem hook stop'";
+        assert_eq!(
+            hook_mode(sh, "stop", None, None),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+    }
+
+    #[test]
+    fn invalid_mode_on_a_non_mining_hook_is_reported() {
+        let mut cmds: Vec<(&str, String)> = ALL_FOUR_BARE
+            .iter()
+            .map(|(e, c)| (*e, (*c).to_string()))
+            .collect();
+        cmds[1].1 = format!("IRONMEM_MCP_MODE=bogus {}", cmds[1].1);
+        let refs: Vec<(&str, &str)> = cmds.iter().map(|(e, c)| (*e, c.as_str())).collect();
+        let home = home_with_settings(&settings_with(&refs));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Warn, "{}", c[0].summary);
+        assert!(
+            c[0].summary.contains("UserPromptSubmit fails to start"),
+            "{}",
+            c[0].summary
+        );
+        assert!(
+            !c[0].summary.contains("SessionStart fails"),
+            "{}",
+            c[0].summary
+        );
+        assert!(c[0]
+            .hint
+            .as_deref()
+            .unwrap()
+            .contains("trusted, read-only or restricted"));
+
+        let mut doc: Value = serde_json::from_str(&settings_with(&ALL_FOUR_BARE[..2])).unwrap();
+        doc["env"] = serde_json::json!({"IRONMEM_MCP_MODE": "bogus"});
+        let c = claude_hook_checks(Some(home_with_settings(&doc.to_string()).path()), None);
+        assert_eq!(c[0].status, CheckStatus::Warn);
+        assert!(
+            c[0].summary.contains("SessionStart fails to start"),
+            "{}",
+            c[0].summary
+        );
+        assert!(
+            c[0].summary.contains("UserPromptSubmit fails to start"),
+            "{}",
+            c[0].summary
+        );
+        assert!(
+            c[0].summary.contains("missing Stop, PreCompact"),
+            "{}",
+            c[0].summary
         );
     }
 }
