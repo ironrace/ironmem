@@ -111,7 +111,7 @@ Goal: a rough estimate of how much code the issue touches.
      the class chosen in Step 3. Autopilot takes the merge class from the
      issue's `risk:*` label, so without it the PR is held.
 
-   For both `gh label list` reads, a non-zero exit, an auth error or a rate limit means the label is missing.
+   For both `gh label list` reads, a non-zero exit, an auth error or a rate limit is a failed read: it counts as not meeting the requirement, and the router reports it as a failed read, naming the command and its error, never as a missing label and with no label-creation fix line.
 
 Keep this to a handful of searches. If the issue is purely prose (docs,
 process, a question), the scan may legitimately find nothing — that is a

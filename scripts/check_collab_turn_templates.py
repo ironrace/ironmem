@@ -540,7 +540,8 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 #   - the Step 1 stop when the issue or its labels cannot be read;
 #   - the three Step 2 prerequisite reads (gate-config drawer key, both
 #     `gh label list` commands), the gate-config fail-closed rule and the
-#     label-read fail-closed rule;
+#     label-read rule (a failed read is reported as one, never as a missing
+#     label);
 #   - rule 1's unreadable-labels rule, its unsure-class-is-`logic` rule, and
 #     the requirement that the `risk:*` label survive until `advance`;
 #   - both missing-prerequisite lines;
@@ -589,7 +590,9 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "entry — means not approved.",
     "Never infer gate commands from the repo.",
     "For both `gh label list` reads, a non-zero exit, an auth error or a rate "
-    "limit means the label is missing.",
+    "limit is a failed read: it counts as not meeting the requirement, and the "
+    "router reports it as a failed read, naming the command and its error, "
+    "never as a missing label and with no label-creation fix line.",
     "Labels that could not be read count as not meeting this requirement.",
     "which must still be on the issue when `advance` runs",
     "once that dispatch has succeeded and pushed its branch",

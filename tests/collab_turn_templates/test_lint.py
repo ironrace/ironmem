@@ -803,7 +803,7 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "If the issue fetch fails, or the result has no `labels` field, stop and report the failure; never route an issue whose labels were not read.",
     "Anything else — a tool error, redacted or non-JSON content, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved.",
     "Never infer gate commands from the repo.",
-    "For both `gh label list` reads, a non-zero exit, an auth error or a rate limit means the label is missing.",
+    "For both `gh label list` reads, a non-zero exit, an auth error or a rate limit is a failed read: it counts as not meeting the requirement, and the router reports it as a failed read, naming the command and its error, never as a missing label and with no label-creation fix line.",
     "Labels that could not be read count as not meeting this requirement.",
     "which must still be on the issue when `advance` runs",
     "once that dispatch has succeeded and pushed its branch",
