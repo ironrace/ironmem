@@ -169,6 +169,16 @@ pub const DEFAULT_MAX_UNPRICED_REVIEWS_PER_DAY: u32 = 20;
 /// mechanical renames, test-only changes. Everything touching logic,
 /// protocol, security, or public API opens a PR and waits for a human
 /// regardless of reviewer verdict."
+///
+/// Do not put `#[serde(skip*)]` on a variant: the router-envelope test
+/// (`crates/ironmem/tests/autopilot_router_envelope.rs`) lists the variants
+/// through the derive, which leaves a skipped variant out, so a skipped class
+/// would slip past it. Do not put `#[serde(other)]` on one either, for a
+/// different reason: the derive keeps an `other` variant in its list, but
+/// that variant would silently absorb an unknown class in a stored review
+/// record (`risk_class: Option<RiskClass>` is deserialized when a recorded
+/// review is read back), turning a class this build does not know into one it
+/// does instead of failing to parse. That test refuses both.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RiskClass {
@@ -190,6 +200,15 @@ impl RiskClass {
     /// ninth class added later must be classified deliberately at this line
     /// rather than defaulting into either group by omission. Defaulting the
     /// wrong way here ships unreviewed code.
+    ///
+    /// The router-envelope integration test
+    /// (`crates/ironmem/tests/autopilot_router_envelope.rs`) calls this on
+    /// every variant and checks the `/evaluate-issue` router text against the
+    /// result. It sees the library as built for integration tests, without
+    /// `cfg(test)`, as the binary does; only logic gated on
+    /// `cfg(debug_assertions)` (on in the test profile, off in release) could
+    /// still make the release binary differ from what it checked, so keep
+    /// such gates out of this function.
     pub fn is_low_risk(self) -> bool {
         match self {
             RiskClass::Documentation
