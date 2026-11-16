@@ -291,17 +291,21 @@ A headless `claude -p` loop can edit, run the gate, commit and push only if
 the flags it runs with permit it. The user grants that by appending one or
 both of `--permission-mode <mode>` (choices in `claude --help`) and
 `--allowed-tools`, after the quoted `/goal` argument. Together they must cover
-file edits and writes, every `gate_commands` entry, and git; give
-`--allowed-tools` one quoted, comma-separated value, e.g.
-`--allowed-tools "Edit,Write,Bash(git *),Bash(<each gate command>)"`, or
-`--permission-mode acceptEdits --allowed-tools "Bash(git *),Bash(<each gate command>)"`.
+file edits and writes, every `gate_commands` entry, and `git add`,
+`git commit` and `git push`; give `--allowed-tools` one quoted,
+comma-separated value, e.g.
+`--allowed-tools "Edit,Write,Bash(git add *),Bash(git commit *),Bash(git push *),Bash(<each gate command>)"`,
+or
+`--permission-mode acceptEdits --allowed-tools "Bash(git add *),Bash(git commit *),Bash(git push *),Bash(<each gate command>)"`.
 `acceptEdits` alone is never enough: it covers file edits, but not the gate
-commands, `git commit` or `git push`, which go through Bash. If a gate command
-contains `"`, `$` or a backtick, single-quote the value instead and write any
-`'` in it as `'\''`. `--allowed-tools <tools...>` takes a variable number of
-values, so its position after the quoted argument, not the comma, keeps it
-from swallowing that argument as a tool name. The router never chooses a
-permission mode or a tool list.
+commands, `git commit` or `git push`, which go through Bash. The allowlist
+covers the gate, not setup: run the loop in a worktree whose dependencies are
+installed and bootstrapped. If a gate command contains `"`, `$` or a
+backtick, single-quote the value instead and write any `'` in it as `'\''`.
+`--allowed-tools <tools...>` takes a variable number of values, so its
+position after the quoted argument, not the comma, keeps it from swallowing
+that argument as a tool name. The router never chooses a permission mode or a
+tool list.
 
 Phase-2 AUTOPILOT remainder-issue command:
 

@@ -420,17 +420,21 @@ A headless `claude -p` loop can edit, run the gate, commit and push only if
 the flags it runs with permit it. The user grants that by appending one or
 both of `--permission-mode <mode>` (choices in `claude --help`) and
 `--allowed-tools`, after the quoted `/goal` argument. Together they must cover
-file edits and writes, every `gate_commands` entry, and git; give
-`--allowed-tools` one quoted, comma-separated value, e.g.
-`--allowed-tools "Edit,Write,Bash(git *),Bash(<each gate command>)"`, or
-`--permission-mode acceptEdits --allowed-tools "Bash(git *),Bash(<each gate command>)"`.
+file edits and writes, every `gate_commands` entry, and `git add`,
+`git commit` and `git push`; give `--allowed-tools` one quoted,
+comma-separated value, e.g.
+`--allowed-tools "Edit,Write,Bash(git add *),Bash(git commit *),Bash(git push *),Bash(<each gate command>)"`,
+or
+`--permission-mode acceptEdits --allowed-tools "Bash(git add *),Bash(git commit *),Bash(git push *),Bash(<each gate command>)"`.
 `acceptEdits` alone is never enough: it covers file edits, but not the gate
-commands, `git commit` or `git push`, which go through Bash. If a gate command
-contains `"`, `$` or a backtick, single-quote the value instead and write any
-`'` in it as `'\''`. `--allowed-tools <tools...>` takes a variable number of
-values, so its position after the quoted argument, not the comma, keeps it
-from swallowing that argument as a tool name. The router never chooses a
-permission mode or a tool list.
+commands, `git commit` or `git push`, which go through Bash. The allowlist
+covers the gate, not setup: run the loop in a worktree whose dependencies are
+installed and bootstrapped. If a gate command contains `"`, `$` or a
+backtick, single-quote the value instead and write any `'` in it as `'\''`.
+`--allowed-tools <tools...>` takes a variable number of values, so its
+position after the quoted argument, not the comma, keeps it from swallowing
+that argument as a tool name. The router never chooses a permission mode or a
+tool list.
 
 For a phase-2 AUTOPILOT, the remainder-issue command is:
 
@@ -463,10 +467,10 @@ block rather than holding it.
 
 The issue that surfaced the GOAL route (per-trade recognition keyterms plus
 a resilient bilingual speech configuration), re-routed under this table on
-2026-11-16. The example routes the issue from its text as filed. The issue
-has since closed: it closed on 2026-09-12 via PR #361, "feat(voice): per-trade
-keyterms and resilient bilingual speech configuration (#282)". A live scan
-today would find the work landed.
+2026-11-16. The example routes the issue from its text as filed. It closed
+on 2026-09-12 via PR #361, "feat(voice): per-trade keyterms and resilient
+bilingual speech configuration (#282)". A live scan today would find the work
+landed.
 
 ```
 Issue #282: feat(voice): add per-trade keyterms and resilient bilingual speech configuration
@@ -475,8 +479,8 @@ Task estimate: 9 independent execution tasks
 
 Why:
  - Design judgment: two contracts are undefined — what a Spanish caller hears when the English-only fallback STT takes over, and where a "sellable + language evidence" gate lives (no such concept exists in the codebase yet)
- - Unattended fit: once those are decided, ~80% of the effort is authoring twelve trades of EN/ES keyterms, wiring them through vapiAssistantConfig.ts, and updating fixtures — mechanical, and `npm test` can prove it
- - AUTOPILOT: not recommended — the remainder changes provisioning behavior, so its expected class is `logic`, which decide_merge holds for a human; the repo has none of the `agent:*` labels (and the repo has no `risk:*` label that would authorize it)
+ - Unattended fit: once those are decided, ~80% of the effort is authoring a bounded keyterm set for every trade (Spanish where the phase-1 gate allows), wiring them through vapiAssistantConfig.ts, and updating fixtures — mechanical, and `npm test` can prove it
+ - AUTOPILOT: not recommended — the remainder changes provisioning behavior, so its expected class is `logic`, which decide_merge holds for a human; the repo has none of the `agent:*` labels and no `risk:*` labels, though no `risk:*` label would authorize a `logic` merge
  - GOAL prerequisite: met — the gate config for jeffreycrum/tenfourpro is approved (`npm test`)
  - Human follow-ups (neither phase): native-speaker review of dates, numbers, addresses, repair and safety wording; per-customer go-live language evidence
 
@@ -498,11 +502,13 @@ Proceed with phase 1? [y/N]
 ```
 
 The router prints phase 2's command ready to run and launches nothing past
-phase 1. The user appends the permissions, e.g. `--permission-mode acceptEdits --allowed-tools "Bash(git *),Bash(npm test)"`, after the quoted argument.
-Before running it, the user asks an agent session to run the Step 2
-`get_drawer` read and confirms the config is still approved and its
-`gate_commands` still match `npm test`. When the loop ends, the user
-opens the PR, and a human reviews and merges it.
+phase 1. The user appends the permissions after the quoted argument, e.g.
+`--permission-mode acceptEdits --allowed-tools "Bash(git add *),Bash(git commit *),Bash(git push *),Bash(npm test)"`.
+The allowlist covers the gate, not setup: run the loop in a worktree whose
+dependencies are installed and bootstrapped. Before running it, the user
+asks an agent session to run the Step 2 `get_drawer` read and confirms the
+config is still approved and its `gate_commands` still match `npm test`. When
+the loop ends, the user opens the PR, and a human reviews and merges it.
 
 Under the earlier four-route table the same issue routed COLLAB as a whole,
 pricing every trade's terminology at the cost of its two contract decisions.
