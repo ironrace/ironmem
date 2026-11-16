@@ -1112,6 +1112,22 @@ def test_lint_fails_closed_on_an_attribute_or_nested_match_in_is_low_risk(
     assert "AUTOPILOT envelope drifted" not in r.stdout
 
 
+def test_lint_fails_closed_on_a_conditional_true_arm(tmp_path):
+    # `=> true && SMALL_DIFF` is not unconditionally low-risk; counting it as
+    # `=> true` derives `logic` as auto-merge and asks the router to say so.
+    fixture = copy_fixture(tmp_path)
+    mutate(fixture / AUTOPILOT_REVIEW_RS, IS_LOW_RISK_HELD_ARM,
+           "            RiskClass::Logic => true && SMALL_DIFF,\n"
+           "            RiskClass::Protocol | RiskClass::Security | RiskClass::PublicApi => {\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert (CANNOT_DERIVE + " — is_low_risk has a conditional true arm; "
+            "derive by hand") in r.stdout
+    assert "AUTOPILOT envelope drifted" not in r.stdout
+
+
 AS_STR_DECOY_LATER_IN_IMPL = (
     "    pub fn label(self) -> &'static str {\n"
     "        match self {\n"

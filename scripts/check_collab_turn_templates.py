@@ -1039,6 +1039,11 @@ def autopilot_envelope_sentences() -> list[tuple[str, str]] | None:
         err(prefix + "`is_low_risk` has a wildcard `_ => true` arm, "
             "which would make every class low-risk")
         return None
+    # `=> true && SMALL_DIFF` would otherwise count as an unconditional
+    # `=> true`: only `,`, `}`, or the end of the body may follow it.
+    if re.search(r"=>\s*true\b(?!\s*(?:,|\}|\Z))", low_body):
+        err(prefix + "is_low_risk has a conditional true arm; derive by hand")
+        return None
     low_variants = [
         v
         for arm in re.findall(r"((?:(?:RiskClass|Self)::\w+[\s|]*)+)=>\s*true\b",
