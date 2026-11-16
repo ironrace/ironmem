@@ -291,18 +291,22 @@ A headless `claude -p` loop can edit, run the gate, commit and push only if
 the flags it runs with permit it. The user grants that by appending one or
 both of `--permission-mode <mode>` (choices in `claude --help`) and
 `--allowed-tools`, after the quoted `/goal` argument. Together they must cover
-file edits and writes, every `gate_commands` entry, and `git add`,
-`git commit` and `git push`; give `--allowed-tools` one quoted,
-comma-separated value, e.g.
+file edits and writes, every `gate_commands` entry, `git add`, `git commit`
+and `git push`, and read-only git such as `git status` and `git diff`, which
+the loop needs to confirm every change is committed (no pattern for those is
+given here: how a `Bash()` rule matches a bare `git status` is unverified);
+give `--allowed-tools` one quoted, comma-separated value, e.g.
 `--allowed-tools "Edit,Write,Bash(git add *),Bash(git commit *),Bash(git push *),Bash(<each gate command>)"`,
 or
 `--permission-mode acceptEdits --allowed-tools "Bash(git add *),Bash(git commit *),Bash(git push *),Bash(<each gate command>)"`.
 `acceptEdits` alone is never enough: it covers file edits, but not the gate
 commands, `git commit` or `git push`, which go through Bash.
-`Bash(git push *)` still matches a force push; the loop pushes only its own
-feature branch, and the default branch's branch protection is what stops a
-force push there. The allowlist covers the gate, not setup: run the loop in a
-worktree whose dependencies are installed and bootstrapped. If a gate command
+`Bash(git push *)` still matches a force push, to any branch including the
+default one; nothing in the allowlist stops it. Only the default branch's
+protection can, so before an unattended run check
+`gh api repos/<owner>/<repo>/branches/<default branch> --jq .protected` and
+treat `false` as unprotected. The allowlist covers the gate, not setup: run
+the loop in a worktree whose dependencies are installed and bootstrapped. If a gate command
 contains `"`, `$` or a backtick, single-quote the value instead and write any
 `'` in it as `'\''`.
 `--allowed-tools <tools...>` takes a variable number of values, so its
