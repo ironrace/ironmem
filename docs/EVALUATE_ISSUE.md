@@ -512,10 +512,14 @@ The router prints phase 2's command ready to run and launches nothing past
 phase 1. The user appends the permissions after the quoted argument, e.g.
 `--permission-mode acceptEdits --allowed-tools "Bash(git add *),Bash(git commit *),Bash(git push *),Bash(npm test)"`.
 The allowlist covers the gate, not setup: run the loop in a worktree whose
-dependencies are installed and bootstrapped. Before running it, the user
-asks an agent session to run the Step 2 `get_drawer` read and confirms the
-config is still approved and its `gate_commands` still match `npm test`. When
-the loop ends, the user opens the PR, and a human reviews and merges it.
+dependencies are installed and bootstrapped. jeffreycrum/tenfourpro's `main`
+is unprotected
+(`gh api repos/jeffreycrum/tenfourpro/branches/main --jq .protected` printed
+`false` on 2026-11-16), so nothing in this allowlist stops a force push to it;
+protect `main` before an unattended run. Before running it, the user asks an
+agent session to run the Step 2 `get_drawer` read and confirms the config is
+still approved and its `gate_commands` still match `npm test`. When the loop
+ends, the user opens the PR, and a human reviews and merges it.
 
 Under the earlier four-route table the same issue routed COLLAB as a whole,
 pricing every trade's terminology at the cost of its two contract decisions.
