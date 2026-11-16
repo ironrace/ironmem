@@ -31,7 +31,7 @@ pub enum McpAccessMode {
 }
 
 impl McpAccessMode {
-    fn parse(raw: &str) -> Result<Self, MemoryError> {
+    pub(crate) fn parse(raw: &str) -> Result<Self, MemoryError> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "trusted" => Ok(Self::Trusted),
             "read-only" | "readonly" => Ok(Self::ReadOnly),
