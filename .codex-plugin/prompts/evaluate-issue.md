@@ -17,10 +17,10 @@ verdict. This is **advisory** — print a verdict and the recommended next
 step, then wait for the user to confirm before invoking anything. Steps 1–4
 are read-only.
 
-> Codex tool mapping: use your native shell for `git`/`gh`/`grep`, your file
-> search for glob, and load skills natively from `~/.codex/skills`. Interpret
-> any "invoke the <name> skill" instruction as activating that skill. Call
-> ironmem MCP tools (e.g. `get_drawer`) through your MCP connection.
+> Codex tool mapping: use your native shell for `git`/`gh`/`grep`/`ironmem`,
+> your file search for glob, and load skills natively from `~/.codex/skills`.
+> Interpret any "invoke the <name> skill" instruction as activating that
+> skill.
 
 ## Parse the argument
 
@@ -67,12 +67,15 @@ tracing.**
    (`crates/*/migrations/`, version bumps), or a **new subsystem / crate**.
 4. Read the unattended-route prerequisites for the **issue's** repo. All are
    reads; none creates, labels, or onboards anything:
-   - **Approved gate config** — ironmem MCP
-     `get_drawer(wing="autopilot", room="backlog-lineage", logical_key="gate-config:<slug>")`,
-     `<slug>` = `<owner>/<repo>` with every character other than `A-Z`,
-     `a-z`, `0-9`, `-`, `_`, `.` replaced by `-`. Approved only when found with
-     JSON `state` `"approved"`; keep its `gate_commands`.
-     Anything else — a tool error, redacted or non-JSON content, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
+   - **Approved gate config** — run
+     `ironmem autopilot status <owner>/<repo> --json` (read-only: it never
+     creates or migrates the database, and asks `gh` only to list labels).
+     Approved only when it exits 0 and its JSON `gate_config` is an object
+     with `state` `"approved"`; keep its `gate_commands`. A `null`
+     `gate_config` is a repo that was never onboarded.
+     Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
+     A non-zero exit is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
+     An installed `ironmem` that predates `status` fails this way.
    - **Agent labels** —
      `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`
      must list all three of `agent:ready`, `agent:blocked`, `agent:exhausted`.
@@ -251,8 +254,8 @@ For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the
 user**. On an explicit yes, invoke the recommended path; for a two-phase
 verdict, phase 1 only — phase 2 is the user's to run after phase 1's PR
 merges. A phase-2 GOAL is printed as a ready-to-run command: before running
-it, the user asks an agent session to run the Step 2 `get_drawer` read (no
-read-only CLI prints it) and confirms that the gate config is still approved
+it, the user reruns the Step 2 `ironmem autopilot status` read
+and confirms that the gate config is still approved
 and that its `gate_commands` still match the printed condition. Rerunning
 `/evaluate-issue` on the parent is not the mechanism; it would re-score the
 original issue and print the same two-phase verdict. A

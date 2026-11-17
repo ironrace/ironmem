@@ -538,10 +538,11 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 # file's live text (HTML comments stripped), so it must sit on one line. They
 # cover:
 #   - the Step 1 stop when the issue or its labels cannot be read;
-#   - the three Step 2 prerequisite reads (gate-config drawer key, both
-#     `gh label list` commands), the gate-config fail-closed rule and the
-#     label-read rule (a failed read is reported as one, never as a missing
-#     label);
+#   - the three Step 2 prerequisite reads (the `ironmem autopilot status`
+#     command, both `gh label list` commands), the gate-config fail-closed
+#     rule, the status-read rule (a non-zero exit is reported as a failed
+#     read, never as a repo that is not onboarded) and the label-read rule (a
+#     failed read is reported as one, never as a missing label);
 #   - rule 1's unreadable-labels rule, its unsure-class-is-`logic` rule, and
 #     the requirement that the `risk:*` label survive until `advance`;
 #   - both missing-prerequisite lines;
@@ -564,7 +565,7 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 # can be fooled. These pins are presence checks: none of them stops
 # contradicting prose placed next to a pinned line.
 REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
-    'logical_key="gate-config:<slug>"',
+    "`ironmem autopilot status <owner>/<repo> --json`",
     "`agent:ready`, `agent:blocked`, `agent:exhausted`",
     "Missing AUTOPILOT prerequisite:",
     "Missing GOAL prerequisite:",
@@ -585,9 +586,12 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "When unsure between an envelope class and `logic`, the class is `logic`.",
     "If the issue fetch fails, or the result has no `labels` field, stop and "
     "report the failure; never route an issue whose labels were not read.",
-    "Anything else — a tool error, redacted or non-JSON content, another "
-    "`state`, or a `gate_commands` that is missing, empty or has a blank "
-    "entry — means not approved.",
+    "Anything else — a non-zero exit, output that is not JSON, a `null` "
+    "`gate_config`, another `state`, or a `gate_commands` that is missing, "
+    "empty or has a blank entry — means not approved.",
+    "A non-zero exit is a failed read: the router reports it as one, naming "
+    "the command and its error, never as a repo that is not onboarded and "
+    "with no onboard fix line.",
     "Never infer gate commands from the repo.",
     "For both `gh label list` reads, a non-zero exit, an auth error or a rate "
     "limit is a failed read: it counts as not meeting the requirement, and the "

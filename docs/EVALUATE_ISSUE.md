@@ -91,14 +91,17 @@ Goal: a rough estimate of how much code the issue touches.
    (`<owner>/<repo>` of the issue, which differs from the local checkout when
    a URL named another repo). All are reads; none creates, labels, or
    onboards anything:
-   - **Approved gate config.** Call the ironmem MCP tool
-     `get_drawer(wing="autopilot", room="backlog-lineage", logical_key="gate-config:<slug>")`,
-     where `<slug>` is `<owner>/<repo>` with every character other than
-     `A-Z`, `a-z`, `0-9`, `-`, `_`, `.` replaced by `-`
-     (`ironrace/ironmem` → `ironrace-ironmem`). The repo qualifies only when
-     the drawer is found and its JSON `state` is `"approved"`; keep its
-     `gate_commands` for a GOAL command.
-     Anything else — a tool error, redacted or non-JSON content, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
+   - **Approved gate config.** Run
+     `ironmem autopilot status <owner>/<repo> --json`. It is read-only: it
+     opens the database read-only, never creates or migrates it, and asks
+     `gh` only to list labels. The repo qualifies only when the command
+     exits 0 and its JSON `gate_config` is an object whose `state` is
+     `"approved"`; keep that object's `gate_commands` for a GOAL command. A
+     `gate_config` of `null`, printed with `"onboarded": false`, is a repo
+     that was never onboarded.
+     Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
+     A non-zero exit is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
+     An installed `ironmem` that predates `status` fails this way.
    - **Agent labels.** Run
      `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`.
      The repo qualifies only when the output contains all three of
@@ -369,8 +372,8 @@ For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the
 user**. On an explicit yes, invoke the recommended path. On a yes to a
 two-phase verdict, invoke phase 1 only; phase 2 is the user's to run after
 phase 1's PR merges. A phase-2 GOAL is printed as a ready-to-run command:
-before running it, the user asks an agent session to run the Step 2
-`get_drawer` read (no read-only CLI prints it) and confirms that the gate
+before running it, the user reruns the Step 2 `ironmem autopilot status`
+read and confirms that the gate
 config is still approved and that its `gate_commands` still match the printed
 condition. Rerunning `/evaluate-issue` on the parent is not the mechanism; it
 would re-score the original issue and print the same two-phase verdict. A
@@ -533,8 +536,8 @@ dependencies are installed and bootstrapped. jeffreycrum/tenfourpro's `main`
 is unprotected
 (`gh api repos/jeffreycrum/tenfourpro/branches/main --jq .protected` printed
 `false` on 2026-11-16), so nothing in this allowlist stops a force push to it;
-protect `main` before an unattended run. Before running it, the user asks an
-agent session to run the Step 2 `get_drawer` read and confirms the config is
+protect `main` before an unattended run. Before running it, the user reruns
+`ironmem autopilot status jeffreycrum/tenfourpro --json` and confirms the config is
 still approved and its `gate_commands` still match `npm test`. When the loop
 ends, the user opens the PR, and a human reviews and merges it.
 
