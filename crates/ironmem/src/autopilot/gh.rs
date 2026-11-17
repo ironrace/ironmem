@@ -727,7 +727,8 @@ pub fn label_list_argv(repo: &str) -> Vec<String> {
 
 /// Parse `gh label list --json name` into bare label names, in `gh`'s order.
 ///
-/// A row with no name (or a blank one) is an error: see below.
+/// A row with no name (or a blank one) is an error: GitHub label names cannot
+/// be empty, so a blank name means output this parser does not understand.
 pub fn parse_label_list(stdout: &str) -> Result<Vec<String>, MemoryError> {
     let raw: Vec<LabelJson> = serde_json::from_str(stdout.trim()).map_err(|e| {
         MemoryError::Validation(format!("could not parse `gh label list --json name`: {e}"))
@@ -2917,6 +2918,9 @@ mod tests {
 
         let err = parse_label_list(r#"[{"name":""}]"#).unwrap_err();
         assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+
+        let err = parse_label_list(r#"[{"name":"  "}]"#).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
     }
 
     #[test]
@@ -2951,6 +2955,7 @@ mod tests {
 
         let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
 
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
         assert!(err.to_string().contains("at least the limit"), "{err}");
     }
 }
