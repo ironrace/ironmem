@@ -697,6 +697,64 @@ pub fn issue_labels(gh: &mut dyn GhRunner, issue: &IssueRef) -> Result<Vec<Strin
     )?)
 }
 
+/// How many labels one [`repo_labels`] read asks `gh` for.
+///
+/// `gh label list` fetches 30 by default. A list that comes back with this
+/// many rows may have been cut off, and a cut-off list cannot prove a label
+/// is absent, so [`repo_labels`] refuses it rather than report the labels it
+/// did not see as missing.
+pub const LABEL_LIST_LIMIT: usize = 1000;
+
+/// `gh label list --repo R --limit N --json name` (#420).
+///
+/// Deliberately no `--search`: that flag matches names *and descriptions*,
+/// fuzzily (on one repo `--search "risk:"` returned `sev:critical`), so the
+/// caller matches the returned names itself. Measured against
+/// `gh label list --help` (gh 2.96.0): `-R/--repo`, `-L/--limit int`
+/// (default 30) and `--json fields`, with `name` among the fields.
+pub fn label_list_argv(repo: &str) -> Vec<String> {
+    vec![
+        "label".into(),
+        "list".into(),
+        "--repo".into(),
+        repo.into(),
+        "--limit".into(),
+        LABEL_LIST_LIMIT.to_string(),
+        "--json".into(),
+        "name".into(),
+    ]
+}
+
+/// Parse `gh label list --json name` into bare label names, in `gh`'s order.
+pub fn parse_label_list(stdout: &str) -> Result<Vec<String>, MemoryError> {
+    let raw: Vec<LabelJson> = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse `gh label list --json name`: {e}"))
+    })?;
+    Ok(raw.into_iter().map(|label| label.name).collect())
+}
+
+/// Read every label name defined in `repo`. A read, never a write.
+///
+/// Every way this can fail is an `Err`, and none of them is an empty list: a
+/// `gh` that could not start, a non-zero exit (auth, rate limit, unknown
+/// repo), output that is not the expected JSON, and a list long enough to
+/// have been truncated. The caller reports each as a *failed read*; an empty
+/// `Ok` means the repo really has no labels.
+pub fn repo_labels(gh: &mut dyn GhRunner, repo: &str) -> Result<Vec<String>, MemoryError> {
+    let out = gh.run(&label_list_argv(repo))?;
+    let names = parse_label_list(
+        out.require_success(&format!("gh label list on {repo}"), GhFailure::NotFound)?,
+    )?;
+    if names.len() >= LABEL_LIST_LIMIT {
+        return Err(MemoryError::Validation(format!(
+            "gh label list on {repo} returned {} labels, the limit it was asked for — the list \
+             may be truncated, so no label can be reported missing from it",
+            names.len()
+        )));
+    }
+    Ok(names)
+}
+
 /// Post a comment on an issue.
 pub fn comment_on_issue(
     gh: &mut dyn GhRunner,
@@ -2742,5 +2800,96 @@ mod tests {
     fn unparseable_pr_list_output_is_a_validation_error() {
         let err = parse_pr_list_head("not json").unwrap_err();
         assert!(matches!(err, MemoryError::Validation(_)), "got {err:?}");
+    }
+
+    // ── #420: listing a repo's labels ───────────────────────────────────
+
+    #[test]
+    fn the_label_list_argv_names_the_repo_and_never_searches() {
+        let argv = label_list_argv("owner/repo");
+        assert_eq!(
+            argv,
+            vec![
+                "label",
+                "list",
+                "--repo",
+                "owner/repo",
+                "--limit",
+                "1000",
+                "--json",
+                "name"
+            ]
+        );
+        // `--search` matches names AND descriptions, fuzzily: on one repo
+        // `--search "risk:"` returned `sev:critical`. Matching is done on the
+        // returned names instead.
+        assert!(!argv.iter().any(|arg| arg == "--search" || arg == "-S"));
+    }
+
+    #[test]
+    fn a_label_list_parses_to_bare_names() {
+        // The shape gh 2.96.0 prints for `gh label list --json name`.
+        let names =
+            parse_label_list(r#"[{"name":"bug"},{"name":"agent:ready"},{"name":"risk:logic"}]"#)
+                .unwrap();
+        assert_eq!(names, vec!["bug", "agent:ready", "risk:logic"]);
+    }
+
+    #[test]
+    fn a_repo_with_no_labels_parses_to_an_empty_list() {
+        assert_eq!(parse_label_list("[]\n").unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_refused_label_list_is_an_error_not_an_empty_list() {
+        // An empty list would report every label as missing. A `gh` that
+        // exited non-zero has not said that.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed(
+            "",
+            "GraphQL: Could not resolve to a Repository with the name 'owner/repo'. (repository)",
+        ))]);
+
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+
+        assert!(matches!(err, MemoryError::NotFound(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("gh label list on owner/repo"), "{message}");
+        assert!(
+            message.contains("Could not resolve to a Repository"),
+            "{message}"
+        );
+        assert_eq!(gh.seen, vec![label_list_argv("owner/repo")]);
+    }
+
+    #[test]
+    fn a_label_list_that_is_not_json_is_an_error() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("not json"))]);
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn a_label_list_that_fills_the_limit_is_refused_as_possibly_truncated() {
+        // A list cut off at the limit cannot prove a label is absent.
+        let rows: Vec<String> = (0..LABEL_LIST_LIMIT)
+            .map(|i| format!(r#"{{"name":"label-{i}"}}"#))
+            .collect();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(&format!("[{}]", rows.join(","))))]);
+
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+        assert!(err.to_string().contains("may be truncated"), "{err}");
+    }
+
+    #[test]
+    fn a_label_list_under_the_limit_is_returned_whole() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(
+            r#"[{"name":"agent:ready"},{"name":"agent:blocked"}]"#,
+        ))]);
+        assert_eq!(
+            repo_labels(&mut gh, "owner/repo").unwrap(),
+            vec!["agent:ready", "agent:blocked"]
+        );
     }
 }
