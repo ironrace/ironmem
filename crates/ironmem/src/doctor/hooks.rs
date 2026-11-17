@@ -2007,9 +2007,16 @@ mod tests {
                 let home = home_with_settings(&manual_with_ups(&cmd));
                 let c = claude_hook_checks(Some(home.path()), None);
                 assert_eq!(c[0].status, CheckStatus::Ok, "{cmd}: {}", c[0].summary);
+                assert_eq!(c[0].summary, all_four_wired(home.path()), "{cmd}");
                 assert_eq!(c[0].hint, None, "{cmd}");
             }
         }
+    }
+
+    /// The Ok `hooks` summary for a manual install under `home`.
+    fn all_four_wired(home: &Path) -> String {
+        let path = home.join(".claude").join("settings.json");
+        format!("Claude Code hooks: all 4 wired in {}", path.display())
     }
 
     #[test]
@@ -2030,6 +2037,7 @@ mod tests {
             let home = home_with_settings(&manual_with_ups(&cmd));
             let c = claude_hook_checks(Some(home.path()), None);
             assert_eq!(c[0].status, CheckStatus::Ok, "{cmd}: {}", c[0].summary);
+            assert_eq!(c[0].summary, all_four_wired(home.path()), "{cmd}");
         }
     }
 
