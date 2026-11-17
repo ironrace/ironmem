@@ -338,7 +338,8 @@ fn event_mode(
     best_result(results)
 }
 
-/// What is lost when `event`'s hook does not run.
+/// What is lost when `event`'s hook does not run, as a noun phrase for the
+/// list of missing hooks.
 fn event_effect(event: &str) -> &'static str {
     match event {
         "SessionStart" => "no memory context at session start",
@@ -346,6 +347,18 @@ fn event_effect(event: &str) -> &'static str {
         "Stop" => "no mining when a session stops",
         "PreCompact" => "no mining before compaction",
         _ => "unknown hook",
+    }
+}
+
+/// What is lost when `event`'s hook exits at startup, as a clause that can
+/// follow "so" or "if it does,".
+fn failure_consequence(event: &str) -> &'static str {
+    match event {
+        "SessionStart" => "no memory context is loaded at session start",
+        "UserPromptSubmit" => "prompt recall is off",
+        "Stop" => "no transcript is mined when a session stops",
+        "PreCompact" => "no transcript is mined before compaction",
+        _ => "an unknown hook does not run",
     }
 }
 
@@ -360,7 +373,7 @@ fn startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
         "{event} fails to start: {} ({}), so {}",
         invalid_reason(raw),
         source_label(source),
-        event_effect(event)
+        failure_consequence(event)
     )
 }
 
@@ -368,9 +381,9 @@ fn startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
 fn possible_startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
     format!(
         "{event}'s mode cannot be determined statically (IRONMEM_MCP_MODE={raw}, {}), so it \
-         may fail to start, and then {}",
+         may fail to start, and if it does, {}",
         source_label(source),
-        event_effect(event)
+        failure_consequence(event)
     )
 }
 
@@ -502,10 +515,11 @@ fn split_hand_wired(
                 format!(
                     "the plugin's {event} fails to start: {} ({}), so only the hand-wired copy \
                      may run: its mode cannot be determined statically \
-                     (IRONMEM_MCP_MODE={copy_raw}, {})",
+                     (IRONMEM_MCP_MODE={copy_raw}, {}), and if it fails too, {}",
                     invalid_reason(&raw),
                     source_label(source),
-                    source_label(copy_source)
+                    source_label(copy_source),
+                    failure_consequence(event)
                 ),
                 &[INVALID_MODE_HINT, DYNAMIC_MODE_HINT],
             ),
@@ -1346,7 +1360,10 @@ mod tests {
         let s = &c[0].summary;
         assert_eq!(c[0].status, CheckStatus::Warn, "{s}");
         assert!(s.contains("SessionStart fails to start"), "{s}");
-        assert!(s.contains("no memory context at session start"), "{s}");
+        assert!(
+            s.contains("no memory context is loaded at session start"),
+            "{s}"
+        );
         assert!(!s.contains("prompt recall is off"), "{s}");
     }
 
@@ -1358,7 +1375,10 @@ mod tests {
         assert_eq!(c[0].status, CheckStatus::Warn, "{s}");
         assert!(s.contains("UserPromptSubmit fails to start"), "{s}");
         assert!(s.contains("prompt recall is off"), "{s}");
-        assert!(!s.contains("no memory context at session start"), "{s}");
+        assert!(
+            !s.contains("no memory context is loaded at session start"),
+            "{s}"
+        );
     }
 
     #[test]
@@ -1759,8 +1779,9 @@ mod tests {
                 "Claude Code hooks: the plugin's UserPromptSubmit fails to start: {BOGUS_REASON} \
                  (set by env in settings.json), so only the hand-wired copy may run: its mode \
                  cannot be determined statically (IRONMEM_MCP_MODE=$M, set in the hook \
-                 command); SessionStart fails to start: {BOGUS_REASON} (set by env in \
-                 settings.json), so no memory context at session start"
+                 command), and if it fails too, prompt recall is off; SessionStart fails to \
+                 start: {BOGUS_REASON} (set by env in settings.json), so no memory context is \
+                 loaded at session start"
             )
         );
         assert!(
@@ -1905,7 +1926,7 @@ mod tests {
             *s,
             format!(
                 "Claude Code hooks: {}; SessionStart fails to start: {BOGUS_REASON} (set by \
-                 env in settings.json), so no memory context at session start",
+                 env in settings.json), so no memory context is loaded at session start",
                 only_hand_wired_runs("UserPromptSubmit")
             )
         );
@@ -1969,7 +1990,7 @@ mod tests {
             c[0].summary,
             format!(
                 "Claude Code hooks: {}; SessionStart fails to start: {BOGUS_REASON} (set by \
-                 env in settings.json), so no memory context at session start",
+                 env in settings.json), so no memory context is loaded at session start",
                 only_hand_wired_runs("UserPromptSubmit")
             ),
             "{command}"
@@ -2047,7 +2068,7 @@ mod tests {
     }
 
     #[test]
-    fn a_command_with_no_valid_run_keeps_the_existing_outcomes() {
+    fn a_command_with_no_valid_run_fails_or_may_fail() {
         // Every run invalid: fails to start, quoting the first run's value.
         let cmd = format!("IRONMEM_MCP_MODE=bogus {UPS}; IRONMEM_MCP_MODE=other {UPS}");
         let home = home_with_settings(&manual_with_ups(&cmd));
@@ -2067,8 +2088,8 @@ mod tests {
             assert_eq!(
                 c[0].summary,
                 "Claude Code hooks: UserPromptSubmit's mode cannot be determined statically \
-                 (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and \
-                 then prompt recall is off",
+                 (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and if \
+                 it does, prompt recall is off",
                 "{cmd}"
             );
             assert_eq!(c[0].hint.as_deref(), Some(DYNAMIC_MODE_HINT), "{cmd}");
@@ -2083,8 +2104,8 @@ mod tests {
         assert_eq!(
             c[0].summary,
             "Claude Code hooks: SessionStart's mode cannot be determined statically \
-             (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and then \
-             no memory context at session start"
+             (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and if \
+             it does, no memory context is loaded at session start"
         );
         assert_eq!(c[0].hint.as_deref(), Some(DYNAMIC_MODE_HINT));
     }
@@ -2109,16 +2130,44 @@ mod tests {
             format!(
                 "Claude Code hooks: missing PreCompact in {} (no mining before compaction); \
                  SessionStart fails to start: IRONMEM_MCP_MODE=\"bogus\" is not trusted, \
-                 read-only or restricted (set in the hook command), so no memory context at \
-                 session start; UserPromptSubmit's mode cannot be determined statically \
-                 (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and \
-                 then prompt recall is off",
+                 read-only or restricted (set in the hook command), so no memory context is \
+                 loaded at session start; UserPromptSubmit's mode cannot be determined \
+                 statically (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to \
+                 start, and if it does, prompt recall is off",
                 path.display()
             )
         );
         assert_eq!(
             c[0].hint.as_deref(),
             Some(format!("{INSTALL_HINT} | {INVALID_MODE_HINT} | {DYNAMIC_MODE_HINT}").as_str())
+        );
+
+        // Cause order, not event order: the later UserPromptSubmit's failure
+        // comes before the earlier SessionStart's uncertain start.
+        let home = home_with_settings(&settings_with(&[
+            (
+                "SessionStart",
+                "IRONMEM_MCP_MODE=$M ironmem hook session-start",
+            ),
+            (
+                "UserPromptSubmit",
+                "IRONMEM_MCP_MODE=bogus ironmem hook user-prompt-submit",
+            ),
+            ("Stop", "ironmem hook stop"),
+            ("PreCompact", "ironmem hook precompact"),
+        ]));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(
+            c[0].summary,
+            "Claude Code hooks: UserPromptSubmit fails to start: IRONMEM_MCP_MODE=\"bogus\" is \
+             not trusted, read-only or restricted (set in the hook command), so prompt recall \
+             is off; SessionStart's mode cannot be determined statically (IRONMEM_MCP_MODE=$M, \
+             set in the hook command), so it may fail to start, and if it does, no memory \
+             context is loaded at session start"
+        );
+        assert_eq!(
+            c[0].hint.as_deref(),
+            Some(format!("{INVALID_MODE_HINT} | {DYNAMIC_MODE_HINT}").as_str())
         );
     }
 
@@ -2130,11 +2179,22 @@ mod tests {
         assert_eq!(c[0].status, CheckStatus::Ok, "{}", c[0].summary);
         assert_eq!(c[0].summary, all_four_wired(home.path()));
         assert_eq!(c[0].hint, None);
-        assert!(
-            c[1].summary
-                .contains("Stop: $M (set in the hook command) -> mode cannot be determined"),
-            "{}",
-            c[1].summary
+        assert_eq!(c[1].status, CheckStatus::Warn, "{}", c[1].summary);
+        assert_eq!(
+            c[1].summary,
+            "no wired hook is known to mine; Stop may not be — Stop: $M (set in the hook \
+             command) -> mode cannot be determined statically; PreCompact: read-only \
+             (IRONMEM_MCP_MODE unset, so the default) -> not mined"
+        );
+        assert_eq!(
+            c[1].hint.as_deref(),
+            Some(
+                format!(
+                    "{DYNAMIC_MODE_HINT} | {}",
+                    read_only_text("PreCompact command")
+                )
+                .as_str()
+            )
         );
     }
 
@@ -2222,7 +2282,10 @@ mod tests {
             format!(
                 "Claude Code hooks: {}; {}; {}",
                 only_hand_wired_runs("Stop"),
-                fails("SessionStart", "no memory context at session start"),
+                fails(
+                    "SessionStart",
+                    "no memory context is loaded at session start"
+                ),
                 fails("UserPromptSubmit", "prompt recall is off"),
             )
         );
@@ -2257,9 +2320,9 @@ mod tests {
             format!(
                 "Claude Code hooks: the hand-wired UserPromptSubmit fails to start: \
                  {BOGUS_REASON} (set by env in settings.json); SessionStart fails to start: \
-                 {BOGUS_REASON} (set by env in settings.json), so no memory context at session \
-                 start; UserPromptSubmit fails to start: {BOGUS_REASON} (set by env in \
-                 settings.json), so prompt recall is off"
+                 {BOGUS_REASON} (set by env in settings.json), so no memory context is loaded \
+                 at session start; UserPromptSubmit fails to start: {BOGUS_REASON} (set by env \
+                 in settings.json), so prompt recall is off"
             )
         );
         assert!(!s.contains("run twice"), "{s}");
