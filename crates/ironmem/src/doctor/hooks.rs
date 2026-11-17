@@ -338,20 +338,10 @@ fn event_mode(
     best_result(results)
 }
 
-/// What is lost when `event`'s hook does not run, as a noun phrase for the
-/// list of missing hooks.
-fn event_effect(event: &str) -> &'static str {
-    match event {
-        "SessionStart" => "no memory context at session start",
-        "UserPromptSubmit" => "prompt recall is off",
-        "Stop" => "no mining when a session stops",
-        "PreCompact" => "no mining before compaction",
-        _ => "unknown hook",
-    }
-}
-
-/// What is lost when `event`'s hook exits at startup, as a clause that can
-/// follow "so" or "if it does,".
+/// What is lost when `event`'s hook does not run (it is missing or exits at
+/// startup), as a full clause. It follows "so", "and if it does," or "and if
+/// it fails too," in startup entries, and is listed in parentheses, joined by
+/// "; ", for missing hooks.
 fn failure_consequence(event: &str) -> &'static str {
     match event {
         "SessionStart" => "no memory context is loaded at session start",
@@ -391,10 +381,9 @@ fn possible_startup_failure(event: &str, raw: &str, source: ModeSource) -> Strin
 /// UserPromptSubmit), by [`starts`]: entries for those that surely fail
 /// (`No`: `Config::load` rejects every run's mode, so they exit at startup),
 /// then entries for those that may fail (`Maybe`: no run is surely valid and
-/// one's mode is built by the shell). Each entry names its own effect: no
-/// memory context at session start for SessionStart, prompt recall off for
-/// UserPromptSubmit. Miners are left to `hook_mining`, which reports both
-/// outcomes for them.
+/// one's mode is built by the shell). Each entry ends with its event's
+/// [`failure_consequence`]. Miners are left to `hook_mining`, which reports
+/// both outcomes for them.
 fn startup_failures(
     wired: &WiredHooks,
     settings_env: Option<&str>,
@@ -623,7 +612,7 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String], may_fail: &[S
     let mut problems = Vec::new();
     let mut hints = Vec::new();
     if !missing.is_empty() {
-        let effects: Vec<&str> = missing.iter().map(|event| event_effect(event)).collect();
+        let effects: Vec<&str> = missing.iter().map(|e| failure_consequence(e)).collect();
         problems.push(format!(
             "missing {} in {} ({})",
             missing.join(", "),
@@ -764,7 +753,7 @@ fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> Stri
         }
     }
     if !unknown.is_empty() {
-        parts.push(format!("{} may not be", unknown.join(" and ")));
+        parts.push(format!("{} may not be mined", unknown.join(" and ")));
     }
     parts.join("; ")
 }
@@ -977,6 +966,16 @@ mod tests {
             "{s}"
         );
         assert!(s.contains("prompt recall is off"), "{s}");
+        let path = home.path().join(".claude").join("settings.json");
+        assert_eq!(
+            *s,
+            format!(
+                "Claude Code hooks: missing SessionStart, UserPromptSubmit, PreCompact in {} \
+                 (no memory context is loaded at session start; prompt recall is off; no \
+                 transcript is mined before compaction)",
+                path.display()
+            )
+        );
         assert!(checks[0]
             .hint
             .as_deref()
@@ -1679,7 +1678,7 @@ mod tests {
         let c = mining_of(&doc.to_string(), None);
         assert!(
             c.summary
-                .starts_with("no wired hook is known to mine; PreCompact may not be"),
+                .starts_with("no wired hook is known to mine; PreCompact may not be mined — "),
             "{}",
             c.summary
         );
@@ -1761,6 +1760,41 @@ mod tests {
              runs and the hand-wired copy may run too"
         );
         assert_eq!(c[0].hint.as_deref(), Some(DUPLICATE_HINT));
+    }
+
+    #[test]
+    fn dynamic_hand_wired_miners_beside_failing_plugin_copies_name_their_effect() {
+        let home = home_with_settings(&plugin_with(
+            "bogus",
+            &[
+                ("Stop", "IRONMEM_MCP_MODE=$M ironmem hook stop"),
+                ("PreCompact", "IRONMEM_MCP_MODE=$M ironmem hook precompact"),
+            ],
+        ));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let may_cover = |event: &str, effect: &str| {
+            format!(
+                "the plugin's {event} fails to start: {BOGUS_REASON} (set by env in \
+                 settings.json), so only the hand-wired copy may run: its mode cannot be \
+                 determined statically (IRONMEM_MCP_MODE=$M, set in the hook command), and if \
+                 it fails too, {effect}"
+            )
+        };
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: {}; {}; SessionStart fails to start: {BOGUS_REASON} (set by \
+                 env in settings.json), so no memory context is loaded at session start; \
+                 UserPromptSubmit fails to start: {BOGUS_REASON} (set by env in \
+                 settings.json), so prompt recall is off",
+                may_cover("Stop", "no transcript is mined when a session stops"),
+                may_cover("PreCompact", "no transcript is mined before compaction"),
+            )
+        );
+        assert_eq!(
+            c[0].hint.as_deref(),
+            Some(format!("{INVALID_MODE_HINT} | {DYNAMIC_MODE_HINT}").as_str())
+        );
     }
 
     #[test]
@@ -1850,7 +1884,7 @@ mod tests {
             let c = mining_of(&doc.to_string(), None);
             assert!(
                 c.summary
-                    .starts_with("no wired hook is known to mine; Stop may not be"),
+                    .starts_with("no wired hook is known to mine; Stop may not be mined — "),
                 "{pair:?}: {}",
                 c.summary
             );
@@ -2128,7 +2162,8 @@ mod tests {
         assert_eq!(
             c[0].summary,
             format!(
-                "Claude Code hooks: missing PreCompact in {} (no mining before compaction); \
+                "Claude Code hooks: missing PreCompact in {} (no transcript is mined before \
+                 compaction); \
                  SessionStart fails to start: IRONMEM_MCP_MODE=\"bogus\" is not trusted, \
                  read-only or restricted (set in the hook command), so no memory context is \
                  loaded at session start; UserPromptSubmit's mode cannot be determined \
@@ -2182,8 +2217,8 @@ mod tests {
         assert_eq!(c[1].status, CheckStatus::Warn, "{}", c[1].summary);
         assert_eq!(
             c[1].summary,
-            "no wired hook is known to mine; Stop may not be — Stop: $M (set in the hook \
-             command) -> mode cannot be determined statically; PreCompact: read-only \
+            "no wired hook is known to mine; Stop may not be mined — Stop: $M (set in the \
+             hook command) -> mode cannot be determined statically; PreCompact: read-only \
              (IRONMEM_MCP_MODE unset, so the default) -> not mined"
         );
         assert_eq!(
@@ -2208,8 +2243,8 @@ mod tests {
             assert_eq!(c.status, CheckStatus::Warn, "{cmd}");
             assert_eq!(
                 c.summary,
-                "no wired hook is known to mine; Stop may not be — Stop: $M (set in the hook \
-                 command) -> mode cannot be determined statically",
+                "no wired hook is known to mine; Stop may not be mined — Stop: $M (set in the \
+                 hook command) -> mode cannot be determined statically",
                 "{cmd}"
             );
             assert_eq!(c.hint.as_deref(), Some(DYNAMIC_MODE_HINT), "{cmd}");
