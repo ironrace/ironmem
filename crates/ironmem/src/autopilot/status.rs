@@ -14,13 +14,19 @@
 //! labels are read with one `gh label list`. Nothing here can create a
 //! drawer, a label or a database file.
 //!
+//! The label half is read-only because this module only ever builds a
+//! `label list` argv, not because a type forbids more. A read-only connection
+//! to a WAL-mode database may create the `-wal`/`-shm` side files next to it;
+//! the database file itself is never written.
+//!
 //! # A failed read is never a missing label
 //!
 //! [`LabelStatus`] is an enum, not a struct of optional fields: when `gh`
 //! could not be started, exited non-zero, or returned a list that may be
 //! truncated, the status is [`LabelStatus::Failed`] and carries no label
-//! answers at all. Its JSON has no `agent` or `risk` key, so a consumer
-//! cannot read "we do not know" as "the label is not there".
+//! answers at all. Its JSON has no `agent` or `risk` key, so a consumer must
+//! check `read` first; a strict lookup finds nothing, though a loose one (a
+//! missing key read as false) can still be fooled, which is why `read` exists.
 
 use std::collections::BTreeMap;
 
@@ -32,7 +38,6 @@ use crate::error::MemoryError;
 use super::gate_config::{get_gate_config_read_only, GateConfigState};
 use super::gh::{repo_labels, GhRunner};
 use super::labels::AgentLabel;
-use super::lead::RISK_LABEL_PREFIX;
 use super::validate_repo;
 
 /// Everything `ironmem autopilot status` reports for one repo. Its
@@ -69,6 +74,8 @@ pub struct GateConfigStatus {
     /// Never empty and never holding a blank entry: a stored config that
     /// breaks that rule fails to read instead of being reported.
     pub gate_commands: Vec<String>,
+    /// Problems a human must read before approving; empty when there are none.
+    pub manifest_warnings: Vec<String>,
     pub proposed_at: String,
     /// `None` (JSON `null`) while the config is still pending.
     pub approved_at: Option<String>,
@@ -109,7 +116,7 @@ impl LabelStatus {
         }
     }
 
-    /// Match the repo's label names exactly, never by search.
+    /// Match the repo's label names by name — trimmed and case-insensitive — never by search.
     fn from_names(names: &[String]) -> Self {
         // Driven by `AgentLabel::ALL`, so a new variant cannot be left out
         // of the report.
@@ -124,22 +131,12 @@ impl LabelStatus {
             .collect();
         let mut risk: Vec<String> = names
             .iter()
-            .filter(|name| is_risk_label(name))
+            .filter(|name| super::queue::risk_class_of(name).is_some())
             .cloned()
             .collect();
-        risk.sort();
+        risk.sort_by_key(|name| (name.to_ascii_lowercase(), name.clone()));
         Self::Ok { agent, risk }
     }
-}
-
-/// Whether `name` is a `risk:<class>` label: the prefix, compared the way
-/// [`super::queue`] compares an issue's labels (trimmed, case-insensitive),
-/// followed by a non-empty class.
-fn is_risk_label(name: &str) -> bool {
-    name.trim()
-        .to_ascii_lowercase()
-        .strip_prefix(RISK_LABEL_PREFIX)
-        .is_some_and(|class| !class.is_empty())
 }
 
 /// Read `repo`'s gate config, whatever state it is in. `Ok(None)` is a repo
@@ -150,24 +147,55 @@ pub fn gate_config_status(
     repo: &str,
 ) -> Result<Option<GateConfigStatus>, MemoryError> {
     validate_repo(repo)?;
-    Ok(
-        get_gate_config_read_only(db, repo)?.map(|config| GateConfigStatus {
-            state: config.state,
-            gate_commands: config.gate_commands().to_vec(),
-            proposed_at: config.proposed_at,
-            approved_at: config.approved_at,
-        }),
-    )
+    let Some(config) = get_gate_config_read_only(db, repo)? else {
+        return Ok(None);
+    };
+    if config.repo != repo {
+        return Err(MemoryError::Validation(format!(
+            "the gate config stored under this key belongs to '{}', not '{repo}' — two repo \
+             names that differ only in `/` versus `-` share one key, so this status cannot be \
+             reported",
+            config.repo
+        )));
+    }
+    Ok(Some(GateConfigStatus {
+        state: config.state,
+        gate_commands: config.gate_commands().to_vec(),
+        manifest_warnings: config.manifest_warnings.clone(),
+        proposed_at: config.proposed_at,
+        approved_at: config.approved_at,
+    }))
 }
 
-/// The human-readable report.
-pub fn render_text(status: &RepoStatus) -> String {
+/// `arg` quoted for a POSIX shell: unchanged when it is non-empty and made only
+/// of characters a shell never treats specially, otherwise in single quotes
+/// with each `'` written as `'\''`.
+fn shell_quote(arg: &str) -> String {
+    let plain = !arg.is_empty()
+        && arg.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '@' | '=' | '-')
+        });
+    if plain {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', r"'\''"))
+    }
+}
+
+/// The human-readable report. `db` is the `--db` value the command was run
+/// with, if any; every hinted `ironmem autopilot` command carries it so the
+/// hint acts on the database that was read.
+pub fn render_text(status: &RepoStatus, db: Option<&str>) -> String {
     let repo = &status.repo;
+    let quoted_repo = shell_quote(repo);
+    let db_flag = db
+        .map(|path| format!(" --db {}", shell_quote(path)))
+        .unwrap_or_default();
     let mut out = String::new();
     match &status.gate_config {
         None => out.push_str(&format!(
-            "{repo}: not onboarded — no gate config. Run `ironmem autopilot onboard {repo} \
-             --path <checkout>` first.\n"
+            "{repo}: not onboarded — no gate config. Run `ironmem autopilot onboard \
+             {quoted_repo} --path <checkout>{db_flag}` first.\n"
         )),
         Some(config) => {
             let state = match config.state {
@@ -178,11 +206,17 @@ pub fn render_text(status: &RepoStatus) -> String {
             for command in &config.gate_commands {
                 out.push_str(&format!("  - {command}\n"));
             }
+            if !config.manifest_warnings.is_empty() {
+                out.push_str("  warnings (read these before approving):\n");
+                for warning in &config.manifest_warnings {
+                    out.push_str(&format!("    - {warning}\n"));
+                }
+            }
             out.push_str(&format!("  proposed: {}\n", config.proposed_at));
             match &config.approved_at {
                 Some(at) => out.push_str(&format!("  approved: {at}\n")),
                 None => out.push_str(&format!(
-                    "  approved: not yet — run `ironmem autopilot approve {repo}`\n"
+                    "  approved: not yet — run `ironmem autopilot approve {quoted_repo}{db_flag}`\n"
                 )),
             }
         }
@@ -193,15 +227,20 @@ pub fn render_text(status: &RepoStatus) -> String {
         }
         LabelStatus::Ok { agent, risk } => {
             out.push_str("Labels:\n");
-            for label in AgentLabel::ALL {
-                let present = agent.get(label.as_str()).copied().unwrap_or(false);
-                let word = if present { "present" } else { "MISSING" };
-                out.push_str(&format!("  {} — {word}\n", label.as_str()));
+            for (label, present) in agent {
+                let word = if *present { "present" } else { "MISSING" };
+                out.push_str(&format!("  {label} — {word}\n"));
             }
             if risk.is_empty() {
                 out.push_str("  risk:* — none\n");
             } else {
                 out.push_str(&format!("  risk:* — {}\n", risk.join(", ")));
+            }
+            if agent.values().any(|present| !present) {
+                out.push_str(&format!(
+                    "  create the missing agent:* labels with `ironmem autopilot labels \
+                     {quoted_repo}`\n"
+                ));
             }
         }
     }
@@ -391,6 +430,7 @@ mod tests {
             GateConfigStatus {
                 state: GateConfigState::Approved,
                 gate_commands: vec!["cargo fmt --all -- --check".into(), "cargo test".into()],
+                manifest_warnings: vec![],
                 proposed_at: stored.proposed_at.clone(),
                 approved_at: stored.approved_at.clone(),
             }
@@ -428,6 +468,51 @@ mod tests {
         assert!(matches!(err, MemoryError::Validation(_)), "{err}");
     }
 
+    #[test]
+    fn a_config_stored_under_a_colliding_key_is_refused() {
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(&db, "foo-bar/baz", vec!["cargo test".into()], vec![]).unwrap();
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let err = gate_config_status(&ro, "foo/bar-baz").unwrap_err();
+
+        match err {
+            MemoryError::Validation(message) => {
+                assert!(message.contains("'foo-bar/baz'"), "{message}");
+                assert!(message.contains("'foo/bar-baz'"), "{message}");
+            }
+            other => panic!("expected a Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn risk_labels_sort_case_insensitively_not_by_byte() {
+        // A byte sort would put the capital `Z` first.
+        let status = read_labels(&["Risk:Zeta", "risk:alpha"]);
+        assert_eq!(
+            status,
+            LabelStatus::Ok {
+                agent: agent_map(false, false, false),
+                risk: vec!["risk:alpha".into(), "Risk:Zeta".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn risk_labels_sort_case_insensitively() {
+        let status = read_labels(&["risk:logic", "Risk:Documentation"]);
+        assert_eq!(
+            status,
+            LabelStatus::Ok {
+                agent: agent_map(false, false, false),
+                risk: vec!["Risk:Documentation".into(), "risk:logic".into()],
+            }
+        );
+    }
+
     // ── the report ──────────────────────────────────────────────────────
 
     #[test]
@@ -437,6 +522,7 @@ mod tests {
         let config = GateConfigStatus {
             state: GateConfigState::Pending,
             gate_commands: vec!["cargo test".into()],
+            manifest_warnings: vec![],
             proposed_at: "2026-01-01T00:00:00+00:00".into(),
             approved_at: None,
         };
@@ -459,11 +545,14 @@ mod tests {
 
     #[test]
     fn the_text_report_says_not_onboarded_and_that_labels_were_not_read() {
-        let text = render_text(&RepoStatus::new(
-            "owner/repo",
+        let text = render_text(
+            &RepoStatus::new(
+                "owner/repo",
+                None,
+                LabelStatus::failed("gh label list on owner/repo failed (exit Some(1)): HTTP 401"),
+            ),
             None,
-            LabelStatus::failed("gh label list on owner/repo failed (exit Some(1)): HTTP 401"),
-        ));
+        );
         assert!(text.contains("owner/repo: not onboarded"), "{text}");
         assert!(
             text.contains("ironmem autopilot onboard owner/repo"),
@@ -481,16 +570,20 @@ mod tests {
 
     #[test]
     fn the_text_report_lists_the_gate_and_marks_a_missing_label() {
-        let text = render_text(&RepoStatus::new(
-            "owner/repo",
-            Some(GateConfigStatus {
-                state: GateConfigState::Pending,
-                gate_commands: vec!["cargo test".into()],
-                proposed_at: "2026-01-01T00:00:00+00:00".into(),
-                approved_at: None,
-            }),
-            read_labels(&["agent:ready", "agent:blocked", "risk:logic"]),
-        ));
+        let text = render_text(
+            &RepoStatus::new(
+                "owner/repo",
+                Some(GateConfigStatus {
+                    state: GateConfigState::Pending,
+                    gate_commands: vec!["cargo test".into()],
+                    manifest_warnings: vec![],
+                    proposed_at: "2026-01-01T00:00:00+00:00".into(),
+                    approved_at: None,
+                }),
+                read_labels(&["agent:ready", "agent:blocked", "risk:logic"]),
+            ),
+            None,
+        );
         assert!(text.contains("owner/repo: gate config pending"), "{text}");
         assert!(text.contains("  - cargo test"), "{text}");
         assert!(
@@ -500,5 +593,264 @@ mod tests {
         assert!(text.contains("  agent:ready — present"), "{text}");
         assert!(text.contains("  agent:exhausted — MISSING"), "{text}");
         assert!(text.contains("  risk:* — risk:logic"), "{text}");
+    }
+
+    fn config_status(
+        state: GateConfigState,
+        warnings: Vec<String>,
+        approved_at: Option<&str>,
+    ) -> GateConfigStatus {
+        GateConfigStatus {
+            state,
+            gate_commands: vec!["cargo test".into()],
+            manifest_warnings: warnings,
+            proposed_at: "2026-01-01T00:00:00+00:00".into(),
+            approved_at: approved_at.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn stored_manifest_warnings_are_reported() {
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(
+                &db,
+                "owner/repo",
+                vec!["cargo test".into()],
+                vec!["manifest X could not be read".into()],
+            )
+            .unwrap();
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let status = gate_config_status(&ro, "owner/repo").unwrap().unwrap();
+
+        assert_eq!(
+            status.manifest_warnings,
+            vec!["manifest X could not be read".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_text_report_prints_manifest_warnings_after_the_commands() {
+        let text = render_text(
+            &RepoStatus::new(
+                "owner/repo",
+                Some(config_status(
+                    GateConfigState::Pending,
+                    vec!["manifest X could not be read".into()],
+                    None,
+                )),
+                read_labels(&[]),
+            ),
+            None,
+        );
+        assert!(
+            text.contains(
+                "  - cargo test\n  warnings (read these before approving):\n    - manifest X could not be read\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn the_text_report_has_no_warnings_block_when_there_are_none() {
+        let text = render_text(
+            &RepoStatus::new(
+                "owner/repo",
+                Some(config_status(GateConfigState::Pending, vec![], None)),
+                read_labels(&[]),
+            ),
+            None,
+        );
+        assert!(!text.contains("warnings"), "{text}");
+    }
+
+    #[test]
+    fn a_gate_config_status_serializes_every_key() {
+        assert_eq!(
+            serde_json::to_value(config_status(
+                GateConfigState::Pending,
+                vec!["w".into()],
+                None
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "state": "pending",
+                "gate_commands": ["cargo test"],
+                "manifest_warnings": ["w"],
+                "proposed_at": "2026-01-01T00:00:00+00:00",
+                "approved_at": null,
+            })
+        );
+    }
+
+    #[test]
+    fn a_full_repo_status_serializes_the_pinned_shape() {
+        let status = RepoStatus::new(
+            "owner/repo",
+            Some(config_status(GateConfigState::Pending, vec![], None)),
+            read_labels(&["agent:ready", "risk:logic"]),
+        );
+        assert_eq!(
+            serde_json::to_value(&status).unwrap(),
+            serde_json::json!({
+                "repo": "owner/repo",
+                "onboarded": true,
+                "gate_config": {
+                    "state": "pending",
+                    "gate_commands": ["cargo test"],
+                    "manifest_warnings": [],
+                    "proposed_at": "2026-01-01T00:00:00+00:00",
+                    "approved_at": null,
+                },
+                "labels": {
+                    "read": "ok",
+                    "agent": {
+                        "agent:ready": true,
+                        "agent:blocked": false,
+                        "agent:exhausted": false,
+                    },
+                    "risk": ["risk:logic"],
+                },
+            })
+        );
+    }
+
+    #[test]
+    fn the_text_report_for_an_approved_config_shows_the_approval_time() {
+        let text = render_text(
+            &RepoStatus::new(
+                "owner/repo",
+                Some(config_status(
+                    GateConfigState::Approved,
+                    vec![],
+                    Some("2026-02-02T00:00:00+00:00"),
+                )),
+                read_labels(&[]),
+            ),
+            None,
+        );
+        assert!(text.contains("owner/repo: gate config approved"), "{text}");
+        assert!(
+            text.contains("  approved: 2026-02-02T00:00:00+00:00"),
+            "{text}"
+        );
+        assert!(!text.contains("not yet"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_label_list_is_a_read_with_every_label_missing() {
+        let status = read_labels(&[]);
+        assert_eq!(
+            status,
+            LabelStatus::Ok {
+                agent: agent_map(false, false, false),
+                risk: vec![],
+            }
+        );
+        let text = render_text(&RepoStatus::new("owner/repo", None, status), None);
+        assert!(text.contains("  risk:* — none"), "{text}");
+        assert!(text.contains("  agent:ready — MISSING"), "{text}");
+    }
+
+    #[test]
+    fn gh_output_that_is_not_json_is_a_failed_read() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("this is not json"))]);
+        let status = LabelStatus::read(&mut gh, "owner/repo");
+        assert!(matches!(status, LabelStatus::Failed { .. }), "{status:?}");
+    }
+
+    #[test]
+    fn an_unrecognized_risk_class_is_still_listed() {
+        let status = read_labels(&["risk:banana"]);
+        assert_eq!(
+            status,
+            LabelStatus::Ok {
+                agent: agent_map(false, false, false),
+                risk: vec!["risk:banana".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn hints_carry_the_db_the_command_was_run_with_quoted() {
+        let status = RepoStatus::new(
+            "owner/repo",
+            Some(config_status(GateConfigState::Pending, vec![], None)),
+            read_labels(&[]),
+        );
+        let text = render_text(&status, Some("/tmp/x y.sqlite3"));
+        assert!(
+            text.contains("ironmem autopilot approve owner/repo --db '/tmp/x y.sqlite3'"),
+            "{text}"
+        );
+
+        let not_onboarded = RepoStatus::new("owner/repo", None, read_labels(&[]));
+        let text = render_text(&not_onboarded, Some("/tmp/x y.sqlite3"));
+        assert!(
+            text.contains(
+                "ironmem autopilot onboard owner/repo --path <checkout> --db '/tmp/x y.sqlite3'"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn hints_quote_the_repo() {
+        let status = RepoStatus::new("owner/it's", None, read_labels(&[]));
+        let text = render_text(&status, None);
+        assert!(
+            text.contains(r"ironmem autopilot onboard 'owner/it'\''s' --path"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_missing_agent_label_gets_a_create_hint_without_a_db() {
+        let status = RepoStatus::new("owner/repo", None, read_labels(&["agent:ready"]));
+        let text = render_text(&status, Some("/tmp/db"));
+        assert!(
+            text.contains(
+                "  create the missing agent:* labels with `ironmem autopilot labels owner/repo`\n"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn no_create_hint_when_no_label_is_missing_or_the_read_failed() {
+        let all = RepoStatus::new(
+            "owner/repo",
+            None,
+            read_labels(&["agent:ready", "agent:blocked", "agent:exhausted"]),
+        );
+        assert!(!render_text(&all, None).contains("create the missing"));
+        let failed = RepoStatus::new("owner/repo", None, LabelStatus::failed("boom"));
+        assert!(!render_text(&failed, None).contains("create the missing"));
+    }
+
+    #[test]
+    fn the_label_lines_follow_the_map_and_never_invent_a_missing_entry() {
+        let status = RepoStatus::new(
+            "owner/repo",
+            None,
+            LabelStatus::Ok {
+                agent: BTreeMap::from([("agent:ready", true)]),
+                risk: vec![],
+            },
+        );
+        let text = render_text(&status, None);
+        assert!(text.contains("  agent:ready — present"), "{text}");
+        assert!(!text.contains("agent:blocked"), "{text}");
+    }
+
+    #[test]
+    fn shell_quote_quotes_only_what_needs_it() {
+        assert_eq!(shell_quote("owner/repo"), "owner/repo");
+        assert_eq!(shell_quote("a b"), "'a b'");
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!(shell_quote(""), "''");
     }
 }
