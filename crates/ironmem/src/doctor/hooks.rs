@@ -361,10 +361,10 @@ fn startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
     )
 }
 
-/// Non-mining hooks (SessionStart, UserPromptSubmit) whose mode is invalid:
-/// `Config::load` fails, so they exit at startup. Each entry names its own
-/// effect: no memory context at session start for SessionStart, prompt recall
-/// off for UserPromptSubmit.
+/// Non-mining hooks (SessionStart, UserPromptSubmit) where no run of the hook
+/// has a valid or dynamic mode ([`starts`] is `No`): `Config::load` fails, so
+/// they exit at startup. Each entry names its own effect: no memory context
+/// at session start for SessionStart, prompt recall off for UserPromptSubmit.
 fn startup_failures(
     wired: &WiredHooks,
     settings_env: Option<&str>,
@@ -373,14 +373,13 @@ fn startup_failures(
     wired
         .iter()
         .filter(|(event, _)| !MINING_EVENTS.contains(event))
-        .filter_map(|(event, commands)| {
-            match event_mode(event, commands, settings_env, process_env) {
-                ((Err(ModeError::Invalid(e)), source), _) => {
-                    Some(startup_failure(event, &e, source))
-                }
-                _ => None,
-            }
-        })
+        .filter_map(
+            |(event, commands)| match starts(event, commands, settings_env, process_env) {
+                Starts::No(raw, source) => Some(startup_failure(event, &raw, source)),
+                // A valid run surely starts; a dynamic one may.
+                Starts::Yes | Starts::Maybe(..) => None,
+            },
+        )
         .collect()
 }
 
@@ -1976,6 +1975,79 @@ mod tests {
     fn a_hand_wired_command_with_a_dynamic_and_a_valid_run_replaces_a_failing_plugin() {
         for cmd in both_orders("IRONMEM_MCP_MODE=$M", "IRONMEM_MCP_MODE=read-only") {
             assert_only_hand_wired_runs(&cmd);
+        }
+    }
+
+    /// A manual install with all four hooks bare except UserPromptSubmit,
+    /// which runs `command`.
+    fn manual_with_ups(command: &str) -> String {
+        let cmds: Vec<(&str, &str)> = ALL_FOUR_BARE
+            .iter()
+            .map(|(e, c)| {
+                (
+                    *e,
+                    if *e == "UserPromptSubmit" {
+                        command
+                    } else {
+                        *c
+                    },
+                )
+            })
+            .collect();
+        settings_with(&cmds)
+    }
+
+    #[test]
+    fn a_command_with_any_valid_run_is_not_a_startup_failure() {
+        for (first, second) in [
+            ("IRONMEM_MCP_MODE=$M", "IRONMEM_MCP_MODE=read-only"),
+            ("IRONMEM_MCP_MODE=bogus", "IRONMEM_MCP_MODE=read-only"),
+        ] {
+            for cmd in both_orders(first, second) {
+                let home = home_with_settings(&manual_with_ups(&cmd));
+                let c = claude_hook_checks(Some(home.path()), None);
+                assert_eq!(c[0].status, CheckStatus::Ok, "{cmd}: {}", c[0].summary);
+                assert_eq!(c[0].hint, None, "{cmd}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_command_with_no_valid_run_keeps_the_existing_outcomes() {
+        // Every run invalid: fails to start, quoting the first run's value.
+        let cmd = format!("IRONMEM_MCP_MODE=bogus {UPS}; IRONMEM_MCP_MODE=other {UPS}");
+        let home = home_with_settings(&manual_with_ups(&cmd));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(
+            c[0].summary,
+            "Claude Code hooks: UserPromptSubmit fails to start: IRONMEM_MCP_MODE=\"bogus\" is \
+             not trusted, read-only or restricted (set in the hook command), so prompt recall \
+             is off"
+        );
+        assert_eq!(c[0].hint.as_deref(), Some(INVALID_MODE_HINT));
+        // A dynamic run may start, so it is not reported as a failure.
+        for cmd in both_orders("IRONMEM_MCP_MODE=$M", "IRONMEM_MCP_MODE=bogus") {
+            let home = home_with_settings(&manual_with_ups(&cmd));
+            let c = claude_hook_checks(Some(home.path()), None);
+            assert_eq!(c[0].status, CheckStatus::Ok, "{cmd}: {}", c[0].summary);
+        }
+    }
+
+    #[test]
+    fn a_dynamic_run_beside_a_read_only_one_may_mine() {
+        for cmd in [
+            "IRONMEM_MCP_MODE=$M ironmem hook stop; IRONMEM_MCP_MODE=read-only ironmem hook stop",
+            "IRONMEM_MCP_MODE=read-only ironmem hook stop; IRONMEM_MCP_MODE=$M ironmem hook stop",
+        ] {
+            let c = mining_of(&settings_with(&[("Stop", cmd)]), None);
+            assert_eq!(c.status, CheckStatus::Warn, "{cmd}");
+            assert_eq!(
+                c.summary,
+                "no wired hook is known to mine; Stop may not be — Stop: $M (set in the hook \
+                 command) -> mode cannot be determined statically",
+                "{cmd}"
+            );
+            assert_eq!(c.hint.as_deref(), Some(DYNAMIC_MODE_HINT), "{cmd}");
         }
     }
 
