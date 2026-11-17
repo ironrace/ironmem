@@ -269,6 +269,7 @@ pub mod review_prompt;
 pub mod run;
 pub mod scrub;
 pub mod stagnation;
+pub mod status;
 pub mod supervise;
 #[cfg(test)]
 pub(crate) use crate::test_git;
