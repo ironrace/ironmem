@@ -2038,6 +2038,7 @@ mod tests {
             let c = claude_hook_checks(Some(home.path()), None);
             assert_eq!(c[0].status, CheckStatus::Ok, "{cmd}: {}", c[0].summary);
             assert_eq!(c[0].summary, all_four_wired(home.path()), "{cmd}");
+            assert_eq!(c[0].hint, None, "{cmd}");
         }
     }
 
