@@ -550,14 +550,31 @@ pub(crate) fn read_current(db: &Database, key: &str) -> Result<Option<Drawer>, M
 /// [`read_current`] over a read-only handle (#420).
 ///
 /// Same id, same lookup. It exists as a separate function rather than a
-/// generic one because [`ReadOnlyDb`] is the guarantee: a caller holding
-/// only that type cannot reach a write or a migration, so `ironmem autopilot
-/// status` is read-only by construction instead of by review.
+/// generic one because [`ReadOnlyDb`] is the guarantee: it has no write or
+/// migrate method, and the connection under it is opened
+/// `SQLITE_OPEN_READ_ONLY`, so `ironmem autopilot status` cannot write even
+/// by mistake.
 pub(crate) fn read_current_read_only(
     db: &ReadOnlyDb,
     key: &str,
 ) -> Result<Option<Drawer>, MemoryError> {
     db.get_drawer(&logical_drawer_id(key))
+}
+
+/// Fixtures shared by this module's children's unit tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::db::schema::Database;
+
+    /// A migrated database on disk. `Database::open_read_only` refuses to
+    /// create a file, so a test of a read-only read needs a real one.
+    pub(crate) fn on_disk_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite3");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        (dir, path)
+    }
 }
 
 #[cfg(test)]

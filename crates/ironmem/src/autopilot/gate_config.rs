@@ -407,6 +407,7 @@ pub fn is_gate_config_approved(db: &Database, repo: &str) -> Result<bool, Memory
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::testing::on_disk_db;
 
     // ── rung 7: the per-repo wall-clock bound ───────────────────────────
 
@@ -792,16 +793,6 @@ mod tests {
 
     // ── #420: the read-only read ────────────────────────────────────────
 
-    /// A migrated on-disk database. `open_read_only` needs a real file: it
-    /// refuses to create one, which is the property under test.
-    fn on_disk_db() -> (tempfile::TempDir, std::path::PathBuf) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memory.sqlite3");
-        let db = Database::open(&path).unwrap();
-        db.migrate().unwrap();
-        (dir, path)
-    }
-
     #[test]
     fn the_read_only_read_returns_exactly_what_the_writer_stored() {
         let (_dir, path) = on_disk_db();
@@ -851,5 +842,6 @@ mod tests {
         let err = get_gate_config_read_only(&ro, "owner/repo").unwrap_err();
 
         assert!(matches!(err, MemoryError::Json(_)), "{err}");
+        assert!(err.to_string().contains(EMPTY_GATE_COMMANDS_MSG), "{err}");
     }
 }
