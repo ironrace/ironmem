@@ -11,13 +11,12 @@
 //!
 //! The gate config is read through [`ReadOnlyDb`], a type with no write or
 //! migrate method, over a connection opened `SQLITE_OPEN_READ_ONLY`. The
-//! labels are read with one `gh label list`. Nothing here can create a
-//! drawer, a label or a database file.
+//! labels are read with one `gh label list`. Nothing here writes the
+//! database file or creates a drawer or a label, though a read-only
+//! connection to a WAL-mode database may create the `-wal`/`-shm` side files.
 //!
 //! The label half is read-only because this module only ever builds a
-//! `label list` argv, not because a type forbids more. A read-only connection
-//! to a WAL-mode database may create the `-wal`/`-shm` side files next to it;
-//! the database file itself is never written.
+//! `label list` argv, not because a type forbids more.
 //!
 //! # A failed read is never a missing label
 //!
@@ -134,7 +133,7 @@ impl LabelStatus {
             .filter(|name| super::queue::risk_class_of(name).is_some())
             .cloned()
             .collect();
-        risk.sort_by_key(|name| (name.to_ascii_lowercase(), name.clone()));
+        risk.sort_by_cached_key(|name| (name.to_ascii_lowercase(), name.clone()));
         Self::Ok { agent, risk }
     }
 }
@@ -153,15 +152,16 @@ pub fn gate_config_status(
     if config.repo != repo {
         return Err(MemoryError::Validation(format!(
             "the gate config stored under this key belongs to '{}', not '{repo}' — two repo \
-             names that differ only in `/` versus `-` share one key, so this status cannot be \
-             reported",
+             names that reduce to the same storage key share one config, so this status cannot \
+             be reported",
             config.repo
         )));
     }
+    let gate_commands = config.gate_commands().to_vec();
     Ok(Some(GateConfigStatus {
         state: config.state,
-        gate_commands: config.gate_commands().to_vec(),
-        manifest_warnings: config.manifest_warnings.clone(),
+        gate_commands,
+        manifest_warnings: config.manifest_warnings,
         proposed_at: config.proposed_at,
         approved_at: config.approved_at,
     }))
@@ -172,9 +172,9 @@ pub fn gate_config_status(
 /// with each `'` written as `'\''`.
 fn shell_quote(arg: &str) -> String {
     let plain = !arg.is_empty()
-        && arg.chars().all(|c| {
-            c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '@' | '=' | '-')
-        });
+        && arg
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '@' | '-'));
     if plain {
         arg.to_string()
     } else {
@@ -195,7 +195,7 @@ pub fn render_text(status: &RepoStatus, db: Option<&str>) -> String {
     match &status.gate_config {
         None => out.push_str(&format!(
             "{repo}: not onboarded — no gate config. Run `ironmem autopilot onboard \
-             {quoted_repo} --path <checkout>{db_flag}` first.\n"
+             {quoted_repo} --path .{db_flag}` from the repo's checkout first.\n"
         )),
         Some(config) => {
             let state = match config.state {
@@ -207,7 +207,10 @@ pub fn render_text(status: &RepoStatus, db: Option<&str>) -> String {
                 out.push_str(&format!("  - {command}\n"));
             }
             if !config.manifest_warnings.is_empty() {
-                out.push_str("  warnings (read these before approving):\n");
+                out.push_str(match config.state {
+                    GateConfigState::Pending => "  warnings (read these before approving):\n",
+                    GateConfigState::Approved => "  warnings recorded on the proposal:\n",
+                });
                 for warning in &config.manifest_warnings {
                     out.push_str(&format!("    - {warning}\n"));
                 }
@@ -489,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn risk_labels_sort_case_insensitively_not_by_byte() {
+    fn risk_labels_sort_case_insensitively_where_a_byte_sort_would_differ() {
         // A byte sort would put the capital `Z` first.
         let status = read_labels(&["Risk:Zeta", "risk:alpha"]);
         assert_eq!(
@@ -497,18 +500,6 @@ mod tests {
             LabelStatus::Ok {
                 agent: agent_map(false, false, false),
                 risk: vec!["risk:alpha".into(), "Risk:Zeta".into()],
-            }
-        );
-    }
-
-    #[test]
-    fn risk_labels_sort_case_insensitively() {
-        let status = read_labels(&["risk:logic", "Risk:Documentation"]);
-        assert_eq!(
-            status,
-            LabelStatus::Ok {
-                agent: agent_map(false, false, false),
-                risk: vec!["Risk:Documentation".into(), "risk:logic".into()],
             }
         );
     }
@@ -555,7 +546,9 @@ mod tests {
         );
         assert!(text.contains("owner/repo: not onboarded"), "{text}");
         assert!(
-            text.contains("ironmem autopilot onboard owner/repo"),
+            text.contains(
+                "Run `ironmem autopilot onboard owner/repo --path .` from the repo's checkout first."
+            ),
             "{text}"
         );
         assert!(
@@ -652,6 +645,29 @@ mod tests {
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn an_approved_config_labels_its_warnings_as_recorded_not_as_pre_approval() {
+        let text = render_text(
+            &RepoStatus::new(
+                "owner/repo",
+                Some(config_status(
+                    GateConfigState::Approved,
+                    vec!["manifest X could not be read".into()],
+                    Some("2026-02-02T00:00:00+00:00"),
+                )),
+                read_labels(&[]),
+            ),
+            None,
+        );
+        assert!(
+            text.contains(
+                "  warnings recorded on the proposal:\n    - manifest X could not be read\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("before approving"), "{text}");
     }
 
     #[test]
@@ -791,10 +807,11 @@ mod tests {
         let text = render_text(&not_onboarded, Some("/tmp/x y.sqlite3"));
         assert!(
             text.contains(
-                "ironmem autopilot onboard owner/repo --path <checkout> --db '/tmp/x y.sqlite3'"
+                "ironmem autopilot onboard owner/repo --path . --db '/tmp/x y.sqlite3'` from the repo's checkout first."
             ),
             "{text}"
         );
+        assert!(!text.contains('<') && !text.contains('>'), "{text}");
     }
 
     #[test]
@@ -802,7 +819,7 @@ mod tests {
         let status = RepoStatus::new("owner/it's", None, read_labels(&[]));
         let text = render_text(&status, None);
         assert!(
-            text.contains(r"ironmem autopilot onboard 'owner/it'\''s' --path"),
+            text.contains(r"ironmem autopilot onboard 'owner/it'\''s' --path ."),
             "{text}"
         );
     }
@@ -852,5 +869,8 @@ mod tests {
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
         assert_eq!(shell_quote(""), "''");
+        // zsh expands a leading `=word` to a command path.
+        assert_eq!(shell_quote("=x"), "'=x'");
+        assert_eq!(shell_quote("a=b"), "'a=b'");
     }
 }
