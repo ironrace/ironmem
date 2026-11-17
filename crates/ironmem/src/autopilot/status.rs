@@ -28,10 +28,12 @@
 //! missing key read as false) can still be fooled, which is why `read` exists.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use serde::Serialize;
 
 use crate::db::read_only::ReadOnlyDb;
+use crate::db::schema::Database;
 use crate::error::MemoryError;
 
 use super::gate_config::{get_gate_config_read_only, GateConfigState};
@@ -45,6 +47,8 @@ use super::validate_repo;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepoStatus {
     pub repo: String,
+    /// The database file the gate config was read from.
+    pub db: String,
     /// Whether a gate config exists at all, in any state. Always equal to
     /// `gate_config.is_some()`; stated so a reader need not infer it.
     pub onboarded: bool,
@@ -56,9 +60,15 @@ pub struct RepoStatus {
 impl RepoStatus {
     /// The one place `onboarded` is derived, so it cannot disagree with
     /// `gate_config`.
-    pub fn new(repo: &str, gate_config: Option<GateConfigStatus>, labels: LabelStatus) -> Self {
+    pub fn new(
+        repo: &str,
+        db: &Path,
+        gate_config: Option<GateConfigStatus>,
+        labels: LabelStatus,
+    ) -> Self {
         Self {
             repo: repo.to_string(),
+            db: db.display().to_string(),
             onboarded: gate_config.is_some(),
             gate_config,
             labels,
@@ -138,6 +148,47 @@ impl LabelStatus {
     }
 }
 
+/// Refuse a repo string `gh --repo` would not accept: it must be `owner/name`
+/// or `host/owner/name`, with no empty segment and no whitespace. Letter case
+/// cannot be checked here, so `OWNER/REPO` is simply not onboarded.
+fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
+    validate_repo(repo)?;
+    let segments: Vec<&str> = repo.split('/').collect();
+    let shaped = (2..=3).contains(&segments.len())
+        && segments.iter().all(|segment| !segment.is_empty())
+        && !repo.chars().any(char::is_whitespace);
+    if shaped {
+        Ok(())
+    } else {
+        Err(MemoryError::Validation(format!(
+            "'{repo}' is not a repo name — expected `owner/name` (or `host/owner/name`)"
+        )))
+    }
+}
+
+/// Read `repo`'s gate config from the database at `db_path`, opening it
+/// read-only. The repo is checked before the database is touched, so a bad
+/// repo is reported even when the database is missing, and a SQLite failure
+/// is explained rather than passed through bare.
+pub fn read_gate_config_status(
+    db_path: &Path,
+    repo: &str,
+) -> Result<Option<GateConfigStatus>, MemoryError> {
+    check_repo_shape(repo)?;
+    let explain = |err: MemoryError| match err {
+        MemoryError::Db(e) => MemoryError::Validation(format!(
+            "could not read the database at {}: {e}. `status` opens it read-only and never \
+             writes it; if this is not an ironmem database, pass the right one with --db. A \
+             WAL-mode database whose -wal/-shm side files are missing can only be read from a \
+             directory SQLite can create them in",
+            db_path.display()
+        )),
+        other => other,
+    };
+    let db = Database::open_read_only(db_path).map_err(explain)?;
+    gate_config_status(&db, repo).map_err(explain)
+}
+
 /// Read `repo`'s gate config, whatever state it is in. `Ok(None)` is a repo
 /// that was never onboarded; an `Err` is a status that could not be read (an
 /// invalid repo string, or a stored config that does not parse).
@@ -145,7 +196,7 @@ pub fn gate_config_status(
     db: &ReadOnlyDb,
     repo: &str,
 ) -> Result<Option<GateConfigStatus>, MemoryError> {
-    validate_repo(repo)?;
+    check_repo_shape(repo)?;
     let Some(config) = get_gate_config_read_only(db, repo)? else {
         return Ok(None);
     };
@@ -247,11 +298,14 @@ pub fn render_text(status: &RepoStatus, db: Option<&str>) -> String {
             }
         }
     }
+    out.push_str(&format!("Database: {}\n", status.db));
     out
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
     use crate::autopilot::gate_config::{approve_gate_config, propose_gate_config};
     use crate::autopilot::gh::testing::ScriptedGh;
@@ -472,6 +526,105 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_repo_name_is_refused_not_reported_as_not_onboarded() {
+        let (_dir, path) = on_disk_db();
+        let ro = Database::open_read_only(&path).unwrap();
+        for bad in [
+            "not a repo",
+            "ironmem",
+            "owner/",
+            "/name",
+            "a/b/c/d",
+            "owner /name",
+        ] {
+            let err = gate_config_status(&ro, bad).unwrap_err();
+            match err {
+                MemoryError::Validation(message) => {
+                    assert!(message.contains("is not a repo name"), "{bad}: {message}")
+                }
+                other => panic!("{bad}: expected Validation, got {other:?}"),
+            }
+        }
+        for good in ["owner/repo", "ghe.example.com/owner/repo"] {
+            assert_eq!(gate_config_status(&ro, good).unwrap(), None, "{good}");
+        }
+    }
+
+    #[test]
+    fn reading_by_path_explains_a_file_that_is_not_a_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite3");
+        std::fs::write(
+            &path,
+            "this is not sqlite, it is a text file of some length\n".repeat(50),
+        )
+        .unwrap();
+        let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
+        match err {
+            MemoryError::Validation(message) => {
+                assert!(
+                    message.contains("could not read the database at"),
+                    "{message}"
+                );
+                assert!(message.contains(&path.display().to_string()), "{message}");
+            }
+            other => panic!("expected the mapped Validation error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reading_by_path_keeps_not_found_for_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.sqlite3");
+        let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
+        match err {
+            MemoryError::NotFound(message) => {
+                assert!(message.contains("db not found at"), "{message}")
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn reading_by_path_checks_the_repo_before_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("absent.sqlite3");
+        let err = read_gate_config_status(&path, "not a repo").unwrap_err();
+        match err {
+            MemoryError::Validation(message) => {
+                assert!(message.contains("is not a repo name"), "{message}")
+            }
+            other => panic!("expected the repo error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reading_by_path_reports_a_stored_config() {
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(&db, "owner/repo", vec!["cargo test".into()], vec![]).unwrap();
+        }
+        let status = read_gate_config_status(&path, "owner/repo")
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.gate_commands, vec!["cargo test".to_string()]);
+    }
+
+    #[test]
+    fn the_text_report_ends_with_the_database_that_answered() {
+        let status = RepoStatus::new(
+            "owner/repo",
+            Path::new("/tmp/mem.db"),
+            None,
+            read_labels(&[]),
+        );
+        let text = render_text(&status, None);
+        assert!(text.ends_with("Database: /tmp/mem.db\n"), "{text}");
+    }
+
+    #[test]
     fn a_config_stored_under_a_colliding_key_is_refused() {
         let (_dir, path) = on_disk_db();
         {
@@ -509,7 +662,10 @@ mod tests {
     #[test]
     fn onboarded_follows_the_gate_config() {
         let labels = LabelStatus::failed("boom");
-        assert!(!RepoStatus::new("owner/repo", None, labels.clone()).onboarded);
+        assert!(
+            !RepoStatus::new("owner/repo", Path::new("/tmp/mem.db"), None, labels.clone())
+                .onboarded
+        );
         let config = GateConfigStatus {
             state: GateConfigState::Pending,
             gate_commands: vec!["cargo test".into()],
@@ -517,16 +673,24 @@ mod tests {
             proposed_at: "2026-01-01T00:00:00+00:00".into(),
             approved_at: None,
         };
-        assert!(RepoStatus::new("owner/repo", Some(config), labels).onboarded);
+        assert!(
+            RepoStatus::new("owner/repo", Path::new("/tmp/mem.db"), Some(config), labels).onboarded
+        );
     }
 
     #[test]
     fn a_repo_that_is_not_onboarded_serializes_a_null_gate_config() {
-        let status = RepoStatus::new("owner/repo", None, LabelStatus::failed("boom"));
+        let status = RepoStatus::new(
+            "owner/repo",
+            Path::new("/tmp/mem.db"),
+            None,
+            LabelStatus::failed("boom"),
+        );
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
             serde_json::json!({
                 "repo": "owner/repo",
+                "db": "/tmp/mem.db",
                 "onboarded": false,
                 "gate_config": null,
                 "labels": { "read": "failed", "error": "boom" },
@@ -539,6 +703,7 @@ mod tests {
         let text = render_text(
             &RepoStatus::new(
                 "owner/repo",
+                Path::new("/tmp/mem.db"),
                 None,
                 LabelStatus::failed("gh label list on owner/repo failed (exit Some(1)): HTTP 401"),
             ),
@@ -566,6 +731,7 @@ mod tests {
         let text = render_text(
             &RepoStatus::new(
                 "owner/repo",
+                Path::new("/tmp/mem.db"),
                 Some(GateConfigStatus {
                     state: GateConfigState::Pending,
                     gate_commands: vec!["cargo test".into()],
@@ -630,6 +796,7 @@ mod tests {
         let text = render_text(
             &RepoStatus::new(
                 "owner/repo",
+                Path::new("/tmp/mem.db"),
                 Some(config_status(
                     GateConfigState::Pending,
                     vec!["manifest X could not be read".into()],
@@ -652,6 +819,7 @@ mod tests {
         let text = render_text(
             &RepoStatus::new(
                 "owner/repo",
+                Path::new("/tmp/mem.db"),
                 Some(config_status(
                     GateConfigState::Approved,
                     vec!["manifest X could not be read".into()],
@@ -675,6 +843,7 @@ mod tests {
         let text = render_text(
             &RepoStatus::new(
                 "owner/repo",
+                Path::new("/tmp/mem.db"),
                 Some(config_status(GateConfigState::Pending, vec![], None)),
                 read_labels(&[]),
             ),
@@ -706,6 +875,7 @@ mod tests {
     fn a_full_repo_status_serializes_the_pinned_shape() {
         let status = RepoStatus::new(
             "owner/repo",
+            Path::new("/tmp/mem.db"),
             Some(config_status(GateConfigState::Pending, vec![], None)),
             read_labels(&["agent:ready", "risk:logic"]),
         );
@@ -713,6 +883,7 @@ mod tests {
             serde_json::to_value(&status).unwrap(),
             serde_json::json!({
                 "repo": "owner/repo",
+                "db": "/tmp/mem.db",
                 "onboarded": true,
                 "gate_config": {
                     "state": "pending",
@@ -739,6 +910,7 @@ mod tests {
         let text = render_text(
             &RepoStatus::new(
                 "owner/repo",
+                Path::new("/tmp/mem.db"),
                 Some(config_status(
                     GateConfigState::Approved,
                     vec![],
@@ -766,7 +938,10 @@ mod tests {
                 risk: vec![],
             }
         );
-        let text = render_text(&RepoStatus::new("owner/repo", None, status), None);
+        let text = render_text(
+            &RepoStatus::new("owner/repo", Path::new("/tmp/mem.db"), None, status),
+            None,
+        );
         assert!(text.contains("  risk:* — none"), "{text}");
         assert!(text.contains("  agent:ready — MISSING"), "{text}");
     }
@@ -794,6 +969,7 @@ mod tests {
     fn hints_carry_the_db_the_command_was_run_with_quoted() {
         let status = RepoStatus::new(
             "owner/repo",
+            Path::new("/tmp/mem.db"),
             Some(config_status(GateConfigState::Pending, vec![], None)),
             read_labels(&[]),
         );
@@ -803,7 +979,12 @@ mod tests {
             "{text}"
         );
 
-        let not_onboarded = RepoStatus::new("owner/repo", None, read_labels(&[]));
+        let not_onboarded = RepoStatus::new(
+            "owner/repo",
+            Path::new("/tmp/mem.db"),
+            None,
+            read_labels(&[]),
+        );
         let text = render_text(&not_onboarded, Some("/tmp/x y.sqlite3"));
         assert!(
             text.contains(
@@ -816,7 +997,12 @@ mod tests {
 
     #[test]
     fn hints_quote_the_repo() {
-        let status = RepoStatus::new("owner/it's", None, read_labels(&[]));
+        let status = RepoStatus::new(
+            "owner/it's",
+            Path::new("/tmp/mem.db"),
+            None,
+            read_labels(&[]),
+        );
         let text = render_text(&status, None);
         assert!(
             text.contains(r"ironmem autopilot onboard 'owner/it'\''s' --path ."),
@@ -826,7 +1012,12 @@ mod tests {
 
     #[test]
     fn a_missing_agent_label_gets_a_create_hint_without_a_db() {
-        let status = RepoStatus::new("owner/repo", None, read_labels(&["agent:ready"]));
+        let status = RepoStatus::new(
+            "owner/repo",
+            Path::new("/tmp/mem.db"),
+            None,
+            read_labels(&["agent:ready"]),
+        );
         let text = render_text(&status, Some("/tmp/db"));
         assert!(
             text.contains(
@@ -840,11 +1031,17 @@ mod tests {
     fn no_create_hint_when_no_label_is_missing_or_the_read_failed() {
         let all = RepoStatus::new(
             "owner/repo",
+            Path::new("/tmp/mem.db"),
             None,
             read_labels(&["agent:ready", "agent:blocked", "agent:exhausted"]),
         );
         assert!(!render_text(&all, None).contains("create the missing"));
-        let failed = RepoStatus::new("owner/repo", None, LabelStatus::failed("boom"));
+        let failed = RepoStatus::new(
+            "owner/repo",
+            Path::new("/tmp/mem.db"),
+            None,
+            LabelStatus::failed("boom"),
+        );
         assert!(!render_text(&failed, None).contains("create the missing"));
     }
 
@@ -852,6 +1049,7 @@ mod tests {
     fn the_label_lines_follow_the_map_and_never_invent_a_missing_entry() {
         let status = RepoStatus::new(
             "owner/repo",
+            Path::new("/tmp/mem.db"),
             None,
             LabelStatus::Ok {
                 agent: BTreeMap::from([("agent:ready", true)]),

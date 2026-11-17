@@ -8,7 +8,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Output;
+use std::process::{Command, Output};
 
 use ironmem::autopilot::gate_config::{self, GateConfig};
 use ironmem::db::schema::Database;
@@ -20,6 +20,7 @@ use autopilot_support::{executable, ironmem, isolated_path, REPO};
 /// Bash builtins only, so it runs on a PATH that holds nothing else.
 const GH_STUB: &str = r#"#!/bin/bash
 echo "gh $*" >> "$GH_LOG"
+pwd > "$GH_LOG.cwd"
 if [ "$1 $2" != "label list" ]; then
   echo "status may only list labels, got: gh $*" >&2
   exit 97
@@ -84,24 +85,44 @@ impl Fixture {
             .unwrap()
     }
 
-    /// `ironmem autopilot status owner/repo --json` against `db`, with the
-    /// stub answering `labels`, or failing with `fail` on stderr.
-    fn status_at(&self, db: &Path, path_var: &Path, labels: &str, fail: Option<&str>) -> Output {
+    /// `ironmem autopilot status <repo> --json --db <db> --path <path_arg>`
+    /// with the stub answering `labels`, or failing with `fail` on stderr.
+    /// Ambient `IRONMEM_*` settings are removed so a developer's shell cannot
+    /// change the result.
+    fn command(
+        &self,
+        repo: &str,
+        db: &Path,
+        path_arg: &Path,
+        path_var: &Path,
+        labels: &str,
+        fail: Option<&str>,
+    ) -> Command {
         let mut command = ironmem();
         command
-            .args(["autopilot", "status", REPO, "--json", "--db"])
+            .args(["autopilot", "status", repo, "--json", "--db"])
             .arg(db)
             .arg("--path")
-            .arg(self.root.path())
+            .arg(path_arg)
             .env("PATH", path_var)
             .env("GH_LOG", self.log_path())
-            .env("GH_LABELS", labels);
+            .env("GH_LABELS", labels)
+            .env_remove("IRONMEM_DB_PATH")
+            .env_remove("IRONMEM_MCP_MODE")
+            .env_remove("IRONMEM_EMBED_MODE");
         if let Some(message) = fail {
             command.env("GH_FAIL", message);
         } else {
             command.env_remove("GH_FAIL");
         }
-        command.output().unwrap()
+        command
+    }
+
+    /// `ironmem autopilot status owner/repo --json` against `db`.
+    fn status_at(&self, db: &Path, path_var: &Path, labels: &str, fail: Option<&str>) -> Output {
+        self.command(REPO, db, self.root.path(), path_var, labels, fail)
+            .output()
+            .unwrap()
     }
 
     fn status(&self, labels: &str, fail: Option<&str>) -> Output {
@@ -149,6 +170,7 @@ fn an_approved_repo_with_every_label_reports_the_pinned_json() {
         report(&output),
         json!({
             "repo": "owner/repo",
+            "db": fixture.db_path().display().to_string(),
             "onboarded": true,
             "gate_config": {
                 "state": "approved",
@@ -187,6 +209,7 @@ fn a_pending_repo_missing_a_label_reports_pending_and_the_missing_label() {
         report(&output),
         json!({
             "repo": "owner/repo",
+            "db": fixture.db_path().display().to_string(),
             "onboarded": true,
             "gate_config": {
                 "state": "pending",
@@ -275,6 +298,8 @@ fn status_changes_nothing_in_the_database() {
     fixture.propose(REPO, &["cargo test"]);
     fixture.approve(REPO);
     let db = fixture.db_path();
+    // SQLite may create `-wal`/`-shm` side files next to a WAL database; they
+    // are not asserted on here, only the database file itself.
     // `Database::open`, the read-write opener, re-chmods the file to 0600.
     // A mode it would not leave alone shows which opener ran.
     std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -349,6 +374,9 @@ fn the_text_report_is_the_default() {
         .env("GH_LOG", fixture.log_path())
         .env("GH_LABELS", ALL_LABELS)
         .env_remove("GH_FAIL")
+        .env_remove("IRONMEM_DB_PATH")
+        .env_remove("IRONMEM_MCP_MODE")
+        .env_remove("IRONMEM_EMBED_MODE")
         .output()
         .unwrap();
 
@@ -359,10 +387,163 @@ fn the_text_report_is_the_default() {
         "{stdout}"
     );
     assert!(stdout.contains("  agent:ready — present"), "{stdout}");
+    assert!(
+        stdout.ends_with(&format!("Database: {}\n", fixture.db_path().display())),
+        "{stdout}"
+    );
     // The hinted command names the database this run read, not the default.
     let hint = format!(
         "ironmem autopilot approve owner/repo --db {}",
         fixture.db_path().display()
     );
     assert!(stdout.contains(&hint), "{stdout}");
+}
+
+/// Assert the run failed the way an unreadable gate config does: exit 1,
+/// nothing on stdout, and `needles` on stderr. No `gh` ran.
+fn assert_unreadable(fixture: &Fixture, output: &Output, needles: &[&str]) {
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "no report on stdout");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for needle in needles {
+        assert!(stderr.contains(needle), "{needle:?} not in: {stderr}");
+    }
+    assert_eq!(
+        fixture.gh_log(),
+        "",
+        "gh is not asked once the status is unreadable"
+    );
+}
+
+#[test]
+fn a_malformed_repo_name_exits_one_instead_of_reporting_not_onboarded() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+
+    let output = fixture
+        .command(
+            "not a repo",
+            &fixture.db_path(),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    assert_unreadable(&fixture, &output, &["is not a repo name"]);
+}
+
+#[test]
+fn a_config_stored_under_a_colliding_key_exits_one() {
+    let fixture = Fixture::new();
+    // `foo-bar/baz` and `foo/bar-baz` reduce to the same storage key.
+    fixture.propose("foo-bar/baz", &["cargo test"]);
+
+    let output = fixture
+        .command(
+            "foo/bar-baz",
+            &fixture.db_path(),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    assert_unreadable(&fixture, &output, &["'foo-bar/baz'", "'foo/bar-baz'"]);
+}
+
+#[test]
+fn a_file_that_is_not_a_database_exits_one_and_names_the_path() {
+    let fixture = Fixture::new();
+    let not_db = fixture.root.path().join("notes.txt");
+    std::fs::write(
+        &not_db,
+        "this is not sqlite, it is a text file\n".repeat(100),
+    )
+    .unwrap();
+
+    let output = fixture.status_at(&not_db, &isolated_path(&fixture.stubs()), ALL_LABELS, None);
+
+    let shown = not_db.display().to_string();
+    assert_unreadable(&fixture, &output, &["could not read the database", &shown]);
+}
+
+#[test]
+fn status_never_migrates_an_old_database() {
+    let fixture = Fixture::new();
+    let db = fixture.db_path();
+    {
+        // Only the first migration: `schema_version` reports 1, far behind
+        // the latest, so a migrating opener would visibly change it.
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch(include_str!("../migrations/001_init.sql"))
+            .unwrap();
+    }
+    let version_before = Database::open_read_only(&db)
+        .unwrap()
+        .schema_version()
+        .unwrap();
+    let bytes_before = std::fs::read(&db).unwrap();
+
+    let output = fixture.status(ALL_LABELS, None);
+
+    assert_eq!(report(&output)["onboarded"], json!(false));
+    assert_eq!(
+        Database::open_read_only(&db)
+            .unwrap()
+            .schema_version()
+            .unwrap(),
+        version_before
+    );
+    assert!(
+        std::fs::read(&db).unwrap() == bytes_before,
+        "status changed the old database's bytes"
+    );
+}
+
+#[test]
+fn path_is_the_directory_gh_runs_in() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+
+    let output = fixture.status(ALL_LABELS, None);
+
+    assert!(output.status.success());
+    let cwd = std::fs::read_to_string(format!("{}.cwd", fixture.log_path().display())).unwrap();
+    assert_eq!(
+        std::fs::canonicalize(cwd.trim()).unwrap(),
+        std::fs::canonicalize(fixture.root.path()).unwrap()
+    );
+}
+
+#[test]
+fn a_path_that_is_not_a_directory_is_a_failed_label_read_and_gh_does_not_run() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    fixture.approve(REPO);
+    let missing = fixture.root.path().join("no-such-dir");
+
+    let output = fixture
+        .command(
+            REPO,
+            &fixture.db_path(),
+            &missing,
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    let report = report(&output);
+    assert_eq!(report["gate_config"]["state"], json!("approved"));
+    assert_eq!(report["labels"]["read"], json!("failed"));
+    assert!(report["labels"].get("agent").is_none());
+    let error = report["labels"]["error"].as_str().unwrap();
+    assert!(error.contains("--path"), "{error}");
+    assert_eq!(fixture.gh_log(), "", "gh did not run");
 }

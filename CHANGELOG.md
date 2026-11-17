@@ -9,15 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`ironmem autopilot status <owner/repo>` (#420).** A read-only report of a
-  repo's gate config (state, gate commands, `proposed_at`, `approved_at`) and
-  of which `agent:*` and `risk:*` labels it has, as text or `--json`. It opens
-  the database read-only and never creates or migrates it, and it only asks
-  `gh` to list labels. It exits 0 whenever it prints a report, including for a
-  repo that is not onboarded, and 1 when the gate config cannot be read. A
-  `gh` failure is reported as a failed label read, not as missing labels.
-  `/evaluate-issue` now reads the gate config from this command instead of
-  from Autopilot's drawer.
+- **`ironmem autopilot status <owner/repo>` (#420).** A report of a repo's
+  gate config (state, gate commands, `proposed_at`, `approved_at`) and of
+  which `agent:*` and `risk:*` labels it has, as text or `--json`, naming the
+  database that answered. It never creates, migrates or writes the database
+  file (SQLite may leave its `-wal`/`-shm` side files) and only asks `gh` to
+  list labels. It exits 0 whenever it prints a report, including for a repo
+  that is not onboarded, and 1 for an unreadable gate config or a malformed
+  repo name. A `gh` failure is reported as a failed label read, not as missing
+  labels. `/evaluate-issue` now reads the gate config from this command
+  instead of from Autopilot's drawer.
 
 ### Changed
 

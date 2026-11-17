@@ -871,22 +871,27 @@ ironmem autopilot status owner/repo [--json] [--db <path>] [--path <dir>]
 (`pending` or `approved`), its gate commands and its `proposed_at` /
 `approved_at` times, and which of the three `agent:*` labels and which
 `risk:*` labels the repo has. `--path` is the directory `gh` runs in.
+`--db` defaults to `IRONMEM_DB_PATH`, then `~/.ironrace-memory/memory.sqlite3`;
+the report's `db` says which database answered.
 
-It changes nothing. The database is opened read-only and is never created or
-migrated, and `gh` is only asked to list the repo's labels. Labels are
-matched by exact name on that list, not with `gh label list --search`, which
-also matches descriptions.
+It never creates, migrates or writes the database file, and it only asks `gh`
+to list the repo's labels. It may leave SQLite's `-wal`/`-shm` side files next
+to a WAL database. Labels are matched by name on that list (trimmed,
+case-insensitive), not with `gh label list --search`, which also matches
+descriptions.
 
 | Exit status | Meaning |
 |---|---|
 | `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
-| `1` | The gate config could not be read: no database at the path, an invalid repo, a stored config that does not parse, or a config stored for a different repo name under the same key (two names that differ only in `/` versus `-` share one). Nothing is printed on stdout. |
+| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one). Reading a WAL database from a read-only directory fails this way, because SQLite cannot create the side files. Nothing is printed on stdout. |
+| `2` | A usage error. An `ironmem` too old to know `status` also exits 2. |
 
 `--json` prints this shape:
 
 ```json
 {
   "repo": "owner/repo",
+  "db": "/home/me/.ironrace-memory/memory.sqlite3",
   "onboarded": true,
   "gate_config": {
     "state": "approved",
@@ -903,15 +908,22 @@ also matches descriptions.
 }
 ```
 
+- `db` is the database file the gate config was read from.
 - A repo that was never onboarded has `"onboarded": false` and
   `"gate_config": null`.
+- A repo name is matched as written, so a name that differs only in letter
+  case from the onboarded one is reported as not onboarded.
 - A pending config has `"approved_at": null`.
 - `manifest_warnings` lists the problems recorded on the proposal; read them
   before running `approve`. It is empty when there are none.
 - When `gh` is missing, exits non-zero (authentication, a rate limit, an
-  unknown repo) or returns a list long enough to have been cut off, `labels`
-  is `{"read": "failed", "error": "<what failed>"}` with no `agent` or
-  `risk` key. A failed read says nothing about which labels exist.
+  unknown repo), prints something that is not the expected JSON, returns a
+  list long enough to have been cut off, or `--path` is not a directory,
+  `labels` is `{"read": "failed", "error": "<what failed>"}` with no `agent`
+  or `risk` key. A failed read says nothing about which labels exist.
+
+The text report ends its hints with the same `--db` it was run with, and its
+last line names the database.
 
 `/evaluate-issue` reads the gate config from this command
 (`docs/EVALUATE_ISSUE.md`, Step 2).

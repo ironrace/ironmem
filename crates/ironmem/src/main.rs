@@ -982,15 +982,17 @@ enum AutopilotCmd {
     /// Report a repo's gate config and its `agent:*` / `risk:*` labels,
     /// changing nothing
     ///
-    /// Read-only: the database is opened read-only and is never created or
-    /// migrated, and `gh` is only asked to list labels.
+    /// Read-only: the database file is never created, migrated or written,
+    /// though SQLite may create its `-wal`/`-shm` side files next to it; `gh`
+    /// is only asked to list labels.
     ///
     /// Exit status: 0 when a report was printed. That includes a repo that
     /// is not onboarded (`"onboarded": false`, `"gate_config": null`) and
     /// labels that could not be read (`"labels": {"read": "failed", ...}`).
-    /// 1 when the gate config could not be read at all: no database at the
-    /// path, an invalid repo, a stored config that does not parse, or one
-    /// stored for a different repo name under the same key.
+    /// 1 when the gate config could not be read: the repo is not an
+    /// `owner/name`, the database is missing, not an ironmem database or not
+    /// readable, or the stored config does not parse or belongs to another
+    /// repo name. 2 for a usage error.
     Status {
         /// Path to the database
         #[arg(long)]
@@ -3575,21 +3577,26 @@ after {n} attempt(s)",
                 json,
             } => {
                 use ironmem::autopilot::status::{
-                    gate_config_status, render_text, LabelStatus, RepoStatus,
+                    read_gate_config_status, render_text, LabelStatus, RepoStatus,
                 };
 
                 // `open_read_only`, never `open_migrated_db`: this command
                 // must not create a missing database or migrate an old one.
                 let cfg = config::Config::load(db.clone())?;
-                let database = ironmem::db::schema::Database::open_read_only(&cfg.db_path)?;
-                let gate_config = gate_config_status(&database, &repo)?;
+                let gate_config = read_gate_config_status(&cfg.db_path, &repo)?;
                 // A `gh` that cannot be found is a failed label read, like
                 // one that exits non-zero: the gate config is still reported.
-                let labels = match ironmem::autopilot::gh::GhCli::resolve(&path) {
-                    Ok(mut gh) => LabelStatus::read(&mut gh, &repo),
-                    Err(err) => LabelStatus::failed(err.to_string()),
+                let labels = if !std::path::Path::new(&path).is_dir() {
+                    LabelStatus::failed(format!(
+                        "--path '{path}' is not a directory, so gh was not run"
+                    ))
+                } else {
+                    match ironmem::autopilot::gh::GhCli::resolve(&path) {
+                        Ok(mut gh) => LabelStatus::read(&mut gh, &repo),
+                        Err(err) => LabelStatus::failed(err.to_string()),
+                    }
                 };
-                let status = RepoStatus::new(&repo, gate_config, labels);
+                let status = RepoStatus::new(&repo, &cfg.db_path, gate_config, labels);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
