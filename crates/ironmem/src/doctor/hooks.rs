@@ -159,10 +159,8 @@ pub(super) fn claude_hook_checks(
                 .map(|(event, name)| (*event, vec![format!("{PLUGIN_HOOK_COMMAND} {name}")]))
                 .collect();
             let env = settings_env_mode.as_deref();
-            let mut failures = startup_failures(&wired, env, process_env_mode);
-            failures.extend(hand_wired_failures(&hand_wired, env, process_env_mode));
-            let duplicated: Vec<&str> = hand_wired.iter().map(|(event, _)| *event).collect();
-            // A hand-wired copy runs as well as the plugin's, so it can mine too.
+            // A hand-wired copy runs as well as the plugin's, so it can start,
+            // recall and mine in the plugin copy's place.
             let candidates: WiredHooks = wired
                 .iter()
                 .map(|(event, commands)| {
@@ -171,10 +169,14 @@ pub(super) fn claude_hook_checks(
                     (*event, all.collect())
                 })
                 .collect();
-            vec![
-                plugin_hooks_check(&duplicated, &failures),
-                mining_check(&candidates, env, process_env_mode, true),
-            ]
+            let mut failures = startup_failures(&candidates, env, process_env_mode);
+            failures.extend(hand_wired_failures(&hand_wired, env, process_env_mode));
+            let duplicated: Vec<&str> = hand_wired.iter().map(|(event, _)| *event).collect();
+            let mut mining = mining_check(&candidates, env, process_env_mode, true);
+            if mined_only_by_hand_wired(&wired, &candidates, env, process_env_mode) {
+                add_hint(&mut mining, PLUGIN_OVERRIDE_HINT);
+            }
+            vec![plugin_hooks_check(&duplicated, &failures), mining]
         }
         HookWiring::Manual {
             wired,
@@ -193,6 +195,39 @@ pub(super) fn claude_hook_checks(
             ]
         }
     }
+}
+
+/// True when some plugin miner mines only through a hand-wired copy: the
+/// plugin's own command doesn't run trusted (an override wins over the
+/// wrapper's default), so removing the copies, as the `hooks` hint says,
+/// would stop mining.
+fn mined_only_by_hand_wired(
+    wired: &WiredHooks,
+    candidates: &WiredHooks,
+    settings_env: Option<&str>,
+    process_env: Option<&str>,
+) -> bool {
+    let trusted = |hooks: &WiredHooks, event: &str| {
+        hooks
+            .iter()
+            .filter(|(e, _)| *e == event)
+            .any(|(e, commands)| {
+                let ((result, _), _) = event_mode(e, commands, settings_env, process_env);
+                result == Ok(McpAccessMode::Trusted)
+            })
+    };
+    MINING_EVENTS
+        .iter()
+        .any(|event| !trusted(wired, event) && trusted(candidates, event))
+}
+
+/// Append `hint` to `check`'s hint unless it is already there.
+fn add_hint(check: &mut Check, hint: &str) {
+    check.hint = match check.hint.take() {
+        Some(h) if h.split(HINT_JOINER).any(|part| part == hint) => Some(h),
+        Some(h) => Some(format!("{h}{HINT_JOINER}{hint}")),
+        None => Some(hint.to_owned()),
+    };
 }
 
 fn skipped(hooks_summary: &str, mining_summary: &str) -> Vec<Check> {
@@ -497,8 +532,9 @@ impl NoMineCause {
                 } else {
                     "commands themselves set"
                 };
+                let it = if events.len() == 1 { "it" } else { "them" };
                 format!(
-                    "the {} {sets} IRONMEM_MCP_MODE={raw:?}; change it to trusted to mine",
+                    "the {} {sets} IRONMEM_MCP_MODE={raw:?}; change {it} to trusted to mine",
                     events.join(" and ")
                 )
             }
@@ -1440,10 +1476,14 @@ mod tests {
     fn a_manual_shell_read_only_points_at_the_shell() {
         let c = mining_of(
             &miners("ironmem hook stop", "ironmem hook precompact"),
-            Some("read-only"),
+            Some("ReadOnly"),
         );
         let hint = c.hint.as_deref().unwrap();
         assert!(hint.contains("launch"), "{hint}");
+        assert!(
+            hint.contains(r#"inherits IRONMEM_MCP_MODE="ReadOnly""#),
+            "{hint}"
+        );
         assert!(!hint.contains("prefix"), "{hint}");
     }
 
@@ -1581,7 +1621,7 @@ mod tests {
             c.hint.as_deref(),
             Some(concat!(
                 "the Stop and PreCompact commands themselves set ",
-                r#"IRONMEM_MCP_MODE="restricted"; change it to trusted to mine"#
+                r#"IRONMEM_MCP_MODE="restricted"; change them to trusted to mine"#
             ))
         );
 
@@ -1606,6 +1646,36 @@ mod tests {
             "Stop's hint comes first: {hint}"
         );
         assert!(hint.ends_with(&format!(" | {INVALID_MODE_HINT}")), "{hint}");
+    }
+
+    #[test]
+    fn plugin_startup_check_counts_a_valid_hand_wired_copy() {
+        let mut doc: Value = serde_json::from_str(&settings_with(&[(
+            "UserPromptSubmit",
+            "IRONMEM_MCP_MODE=trusted ironmem hook user-prompt-submit",
+        )]))
+        .unwrap();
+        doc["enabledPlugins"] = serde_json::json!({"ironmem@ironrace": true});
+        doc["env"] = serde_json::json!({"IRONMEM_MCP_MODE": "bogus"});
+        let home = home_with_settings(&doc.to_string());
+        let s = &claude_hook_checks(Some(home.path()), None)[0].summary;
+        assert!(!s.contains("UserPromptSubmit fails to start"), "{s}");
+        assert!(!s.contains("prompt recall is off"), "{s}");
+        // The plugin's SessionStart has no valid copy, so it still fails.
+        assert!(s.contains("SessionStart fails to start"), "{s}");
+    }
+
+    #[test]
+    fn hand_wired_copies_that_alone_mine_get_the_override_hint() {
+        let mut doc: Value =
+            serde_json::from_str(&miners(TRUSTED_STOP, TRUSTED_PRECOMPACT)).unwrap();
+        doc["enabledPlugins"] = serde_json::json!({"ironmem@ironrace": true});
+        let c = mining_of(&doc.to_string(), Some("read-only"));
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+        assert_eq!(c.hint.as_deref(), Some(PLUGIN_OVERRIDE_HINT));
+        // Without the override the plugin's copies mine by themselves.
+        let c = mining_of(&doc.to_string(), None);
+        assert_eq!(c.hint, None);
     }
 
     #[test]

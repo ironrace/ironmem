@@ -3,7 +3,7 @@
 //! Answers two questions about a hook command string: does it run
 //! `ironmem hook <name>`, and in which `IRONMEM_MCP_MODE` does it run. It is
 //! a simple-command reader, not a shell; the limits are documented on
-//! [`runs_hook`] and [`hook_mode`]. Diagnose-only: it parses strings and never
+//! [`runs_hook`] and [`hook_mode_with_raw`]. Diagnose-only: it parses strings and never
 //! runs anything or touches the filesystem.
 
 use crate::config::McpAccessMode;
@@ -442,23 +442,8 @@ pub(super) fn runs_hook(command: &str, hook: &str) -> bool {
     invocations(command, None).iter().any(|i| i.hook == hook)
 }
 
-/// The mode the `hook` run(s) in `command` get, and where that came from.
-///
-/// Only the same simple command counts: the mode comes from the assignment
-/// words (or `env` assignments) of the command that runs the hook, or from an
-/// earlier `export IRONMEM_MCP_MODE=v` in the same string, and the command's
-/// own assignment wins. It never comes from a later or a different simple
-/// command, so `ironmem hook stop; IRONMEM_MCP_MODE=trusted true` runs
-/// read-only and `IRONMEM_MCP_MODE=bogus true || ironmem hook stop` runs
-/// in the default mode. When the command holds several runs of `hook`, one is
-/// picked by [`best_result`].
-///
-/// With no inline value the order is settings.json `env`, then the inherited
-/// environment, then the plugin wrapper's trusted default (an empty value
-/// counts as unset to the wrapper, but `Config::load` rejects it), then
-/// read-only. A value containing `$` or a backtick is [`ModeError::Unknown`].
-/// Doctor itself calls [`hook_mode_with_raw`]; this form keeps the tests'
-/// tuple comparisons short.
+/// The mode of `command` with the raw value dropped: test shorthand for
+/// [`hook_mode_with_raw`], which doctor itself calls.
 #[cfg(test)]
 pub(super) fn hook_mode(
     command: &str,
@@ -473,7 +458,23 @@ pub(super) fn hook_mode(
 /// (`None` for the wrapper's default and the read-only default).
 pub(super) type RawModeResult = (ModeResult, Option<String>);
 
-/// [`hook_mode`], keeping the raw value so hints can quote what the file says.
+/// The mode the `hook` run(s) in `command` get, where that came from, and
+/// the raw value it was read from, so hints can quote what the file says.
+///
+/// Only the same simple command counts: the mode comes from the assignment
+/// words (or `env` assignments) of the command that runs the hook, or from an
+/// earlier `export IRONMEM_MCP_MODE=v` in the same string, and the command's
+/// own assignment wins. It never comes from a later or a different simple
+/// command, so `ironmem hook stop; IRONMEM_MCP_MODE=trusted true` runs
+/// read-only and `IRONMEM_MCP_MODE=bogus true || ironmem hook stop` runs
+/// in the default mode. When the command holds several runs of `hook`, one is
+/// picked by [`best_result`].
+///
+/// With no inline value the order is settings.json `env`, then the inherited
+/// environment, then the plugin wrapper's trusted default (an empty value
+/// counts as unset to the wrapper, but `Config::load` rejects it), then
+/// read-only. A value containing `$` or a backtick is [`ModeError::Unknown`].
+/// The command-reading limits are listed on [`runs_hook`].
 pub(super) fn hook_mode_with_raw(
     command: &str,
     hook: &str,
