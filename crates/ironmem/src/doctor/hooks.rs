@@ -11,8 +11,8 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::hook_command::{
-    best_result, hook_mode_with_raw, mode_label, runs_hook, source_label, ModeError, ModeSource,
-    RawModeResult,
+    best_result, hook_mode_with_raw, hook_modes_with_raw, mode_label, runs_hook, source_label,
+    ModeError, ModeSource, RawModeResult,
 };
 use super::{Check, CheckStatus};
 use crate::config::McpAccessMode;
@@ -385,19 +385,20 @@ fn startup_failures(
 }
 
 /// Whether any of an event's copies starts at all.
+#[derive(Debug, PartialEq, Eq)]
 enum Starts {
-    /// Some copy has a valid mode.
+    /// Some run of the hook has a valid mode.
     Yes,
-    /// No copy surely starts, but one's mode is built by the shell: this raw
+    /// No run surely starts, but one's mode is built by the shell: this raw
     /// value, from this source.
     Maybe(String, ModeSource),
-    /// Every copy's mode is invalid; the first one's raw value and source.
+    /// Every run's mode is invalid; the first one's raw value and source.
     No(String, ModeSource),
 }
 
 /// Whether `commands`, the copies of `event`, start: [`Starts::Yes`] when
-/// any copy's mode is valid, so one dynamic or invalid copy never hides a
-/// working one.
+/// any run of the hook has a valid mode, across commands and within one, so a
+/// dynamic or invalid run never hides a working one.
 fn starts(
     event: &str,
     commands: &[String],
@@ -407,7 +408,8 @@ fn starts(
     let hook = plugin_hook_name(event);
     let results: Vec<_> = commands
         .iter()
-        .map(|c| hook_mode_with_raw(c, hook, settings_env, process_env).0)
+        .flat_map(|c| hook_modes_with_raw(c, hook, settings_env, process_env))
+        .map(|(result, _)| result)
         .collect();
     // No runs at all reads as the read-only default, which starts.
     if results.is_empty() || results.iter().any(|(r, _)| r.is_ok()) {
@@ -429,7 +431,8 @@ fn starts(
 struct HandWired {
     /// Events where both copies start, so the hook runs twice.
     duplicated: Vec<&'static str>,
-    /// One entry for each other hand-wired event, in settings order.
+    /// One entry for each other hand-wired event, in PLUGIN_HOOKS (hooks.json)
+    /// order, the order `detect_hook_wiring` collects them in.
     entries: Vec<String>,
     /// The hints those entries need, in entry order (repeats allowed).
     hints: Vec<&'static str>,
@@ -437,13 +440,14 @@ struct HandWired {
 
 /// Sort the hand-wired plugin hooks by whether each copy starts. A hook runs
 /// twice only when both copies surely start. Otherwise the entry says which
-/// copy runs (or may run). A broken hand-wired copy beside a working plugin
-/// copy gets the remove-the-copies hint, because the plugin covers the
-/// event. A working hand-wired copy beside a failing plugin copy never gets
-/// it, because removing that copy would turn the hook off. When every copy
-/// fails, `startup_failures` (or `hook_mining`, for a miner) names the effect.
-/// The plugin's copy never has a dynamic mode (its command sets none, and
-/// env values are literal), so only `Yes` and `No` are expected for it.
+/// copy runs (or may run). A broken or dynamic hand-wired copy beside a
+/// working plugin copy gets only the remove-the-copies hint: the plugin covers
+/// the event, and fixing the copy's mode would make the hook run twice (or,
+/// for an empty settings.json `env` value, which the wrapper reads as trusted,
+/// could make the plugin's copies read-only). A working hand-wired copy beside
+/// a failing plugin copy never gets that hint, because removing it would turn
+/// the hook off. When every copy fails, `startup_failures` (or `hook_mining`,
+/// for a miner) names the effect.
 fn split_hand_wired(
     wired: &WiredHooks,
     hand_wired: &WiredHooks,
@@ -457,8 +461,13 @@ fn split_hand_wired(
     };
     for (event, commands) in hand_wired {
         let plugin_copy = wired.iter().find(|(e, _)| e == event).map(|(_, c)| c);
+        // Never `None`: `wired` holds all of PLUGIN_HOOKS and `hand_wired`
+        // only events from it. Doctor stays total, so no `expect`.
         let plugin =
             plugin_copy.map_or(Starts::Yes, |c| starts(event, c, settings_env, process_env));
+        // `plugin` is never `Starts::Maybe` (pinned by
+        // `a_plugin_copy_never_has_a_dynamic_mode`), so the `_` arms below
+        // stand for `Starts::Yes`.
         let copy = starts(event, commands, settings_env, process_env);
         let (entry, hints): (String, &[&'static str]) = match (plugin, copy) {
             (Starts::No(raw, source), Starts::Yes) => (
@@ -496,10 +505,11 @@ fn split_hand_wired(
             (_, Starts::Maybe(raw, source)) => (
                 format!(
                     "the hand-wired {event}'s mode cannot be determined statically \
-                     (IRONMEM_MCP_MODE={raw}, {}), so the plugin's copy runs and it may run too",
+                     (IRONMEM_MCP_MODE={raw}, {}), so the plugin's copy runs and the \
+                     hand-wired copy may run too",
                     source_label(source)
                 ),
-                &[DUPLICATE_HINT, DYNAMIC_MODE_HINT],
+                &[DUPLICATE_HINT],
             ),
             (_, Starts::No(raw, source)) => (
                 format!(
@@ -508,7 +518,7 @@ fn split_hand_wired(
                     invalid_reason(&raw),
                     source_label(source)
                 ),
-                &[DUPLICATE_HINT, INVALID_MODE_HINT],
+                &[DUPLICATE_HINT],
             ),
         };
         out.entries.push(entry);
@@ -1660,9 +1670,31 @@ mod tests {
         );
         assert!(!s.contains("run twice"), "{s}");
         assert!(!s.contains("also"), "the plugin's copy starts fine: {s}");
-        // The broken copy can go: the plugin covers the event.
-        let hint = c[0].hint.as_deref().unwrap();
-        assert_eq!(hint, format!("{DUPLICATE_HINT} | {INVALID_MODE_HINT}"));
+        // The broken copy can go: the plugin covers the event. Fixing its mode
+        // instead would make the hook run twice, so no fix-the-mode hint.
+        assert_eq!(c[0].hint.as_deref(), Some(DUPLICATE_HINT));
+    }
+
+    #[test]
+    fn an_empty_settings_env_mode_breaks_only_a_bare_hand_wired_copy() {
+        // The wrapper reads "" as unset (trusted); Config::load rejects it.
+        let home = home_with_settings(&plugin_with(
+            "",
+            &[("UserPromptSubmit", "ironmem hook user-prompt-submit")],
+        ));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Warn, "{}", c[0].summary);
+        assert_eq!(
+            c[0].summary,
+            "Claude Code hooks: the hand-wired UserPromptSubmit fails to start: \
+             IRONMEM_MCP_MODE=\"\" is not trusted, read-only or restricted (set by env in \
+             settings.json), so only the plugin's copy runs"
+        );
+        // Setting env to read-only, as the fix-the-mode hint would allow,
+        // would stop the plugin's copies mining, so only the remove hint.
+        assert_eq!(c[0].hint.as_deref(), Some(DUPLICATE_HINT));
+        assert_eq!(c[1].status, CheckStatus::Ok, "{}", c[1].summary);
+        assert_eq!(c[1].hint, None);
     }
 
     #[test]
@@ -1680,12 +1712,9 @@ mod tests {
             c[0].summary,
             "Claude Code hooks: the hand-wired UserPromptSubmit's mode cannot be determined \
              statically (IRONMEM_MCP_MODE=$M, set in the hook command), so the plugin's copy \
-             runs and it may run too"
+             runs and the hand-wired copy may run too"
         );
-        assert_eq!(
-            c[0].hint.as_deref(),
-            Some(format!("{DUPLICATE_HINT} | {DYNAMIC_MODE_HINT}").as_str())
-        );
+        assert_eq!(c[0].hint.as_deref(), Some(DUPLICATE_HINT));
     }
 
     #[test]
@@ -1844,7 +1873,8 @@ mod tests {
         let home = home_with_settings(&doc.to_string());
         let s = &claude_hook_checks(Some(home.path()), None)[0].summary;
         // Only the plugin's copy of UserPromptSubmit fails; the hand-wired copy
-        // runs, so the hook is not reported as failed and recall stays on.
+        // runs, so the event is not reported as failed: recall is not reported
+        // as off.
         assert_eq!(
             *s,
             format!(
@@ -1856,6 +1886,97 @@ mod tests {
         assert!(!s.contains("prompt recall is off"), "{s}");
         // The plugin's SessionStart has no valid copy, so it still fails.
         assert!(s.contains("SessionStart fails to start"), "{s}");
+    }
+
+    #[test]
+    fn a_plugin_copy_never_has_a_dynamic_mode() {
+        // split_hand_wired relies on this: env values are literal and the
+        // plugin's command sets no mode, so its `Starts::Maybe` case never runs.
+        for (event, name) in PLUGIN_HOOKS {
+            let plugin = [format!("{PLUGIN_HOOK_COMMAND} {name}")];
+            assert_eq!(
+                starts(event, &plugin, Some("$M"), None),
+                Starts::No("$M".to_owned(), ModeSource::SettingsEnv),
+                "{event}"
+            );
+            assert_eq!(
+                starts(event, &plugin, None, Some("$(cat /m)")),
+                Starts::No("$(cat /m)".to_owned(), ModeSource::Environment),
+                "{event}"
+            );
+        }
+    }
+
+    const UPS: &str = "/x/ironmem hook user-prompt-submit";
+
+    /// One command that runs UserPromptSubmit twice, as `first; second`
+    /// and as `second; first`.
+    fn both_orders(first: &str, second: &str) -> [String; 2] {
+        [
+            format!("{first} {UPS}; {second} {UPS}"),
+            format!("{second} {UPS}; {first} {UPS}"),
+        ]
+    }
+
+    /// Plugin settings without an env mode, plus a hand-wired UserPromptSubmit.
+    fn plugin_and_ups(command: &str) -> String {
+        let mut doc: Value =
+            serde_json::from_str(&settings_with(&[("UserPromptSubmit", command)])).unwrap();
+        doc["enabledPlugins"] = serde_json::json!({"ironmem@ironrace": true});
+        doc.to_string()
+    }
+
+    const UPS_RUNS_TWICE: &str = "Claude Code hooks: the enabled ironmem plugin supplies them \
+         and settings.json wires UserPromptSubmit by hand too, so those hooks run twice";
+
+    fn assert_runs_twice(command: &str) {
+        let home = home_with_settings(&plugin_and_ups(command));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].summary, UPS_RUNS_TWICE, "{command}");
+        assert_eq!(c[0].hint.as_deref(), Some(DUPLICATE_HINT), "{command}");
+    }
+
+    fn assert_only_hand_wired_runs(command: &str) {
+        let home = home_with_settings(&plugin_with("bogus", &[("UserPromptSubmit", command)]));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: {}; SessionStart fails to start: {BOGUS_REASON} (set by \
+                 env in settings.json), so no memory context at session start",
+                only_hand_wired_runs("UserPromptSubmit")
+            ),
+            "{command}"
+        );
+        assert_eq!(c[0].hint.as_deref(), Some(INVALID_MODE_HINT), "{command}");
+    }
+
+    #[test]
+    fn a_hand_wired_command_with_an_invalid_and_a_valid_run_starts_beside_the_plugin() {
+        for cmd in both_orders("IRONMEM_MCP_MODE=bogus", "IRONMEM_MCP_MODE=trusted") {
+            assert_runs_twice(&cmd);
+        }
+    }
+
+    #[test]
+    fn a_hand_wired_command_with_an_invalid_and_a_valid_run_replaces_a_failing_plugin() {
+        for cmd in both_orders("IRONMEM_MCP_MODE=bogus", "IRONMEM_MCP_MODE=trusted") {
+            assert_only_hand_wired_runs(&cmd);
+        }
+    }
+
+    #[test]
+    fn a_hand_wired_command_with_a_dynamic_and_a_valid_run_starts_beside_the_plugin() {
+        for cmd in both_orders("IRONMEM_MCP_MODE=$M", "IRONMEM_MCP_MODE=read-only") {
+            assert_runs_twice(&cmd);
+        }
+    }
+
+    #[test]
+    fn a_hand_wired_command_with_a_dynamic_and_a_valid_run_replaces_a_failing_plugin() {
+        for cmd in both_orders("IRONMEM_MCP_MODE=$M", "IRONMEM_MCP_MODE=read-only") {
+            assert_only_hand_wired_runs(&cmd);
+        }
     }
 
     /// Plugin settings with `env.IRONMEM_MCP_MODE` set to `env_mode` and

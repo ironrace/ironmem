@@ -481,7 +481,23 @@ pub(super) fn hook_mode_with_raw(
     settings_env: Option<&str>,
     process_env: Option<&str>,
 ) -> RawModeResult {
-    let results = invocations(command, None)
+    best_result(hook_modes_with_raw(
+        command,
+        hook,
+        settings_env,
+        process_env,
+    ))
+}
+
+/// The [`hook_mode_with_raw`] result of every run of `hook` in `command`, in
+/// order and unreduced, for callers that need to know whether any run starts.
+pub(super) fn hook_modes_with_raw(
+    command: &str,
+    hook: &str,
+    settings_env: Option<&str>,
+    process_env: Option<&str>,
+) -> Vec<RawModeResult> {
+    invocations(command, None)
         .iter()
         .filter(|i| i.hook == hook)
         .map(|i| {
@@ -494,8 +510,7 @@ pub(super) fn hook_mode_with_raw(
             };
             (result, raw)
         })
-        .collect();
-    best_result(results)
+        .collect()
 }
 
 /// How good a result is for mining, lowest first: trusted without doctor's
