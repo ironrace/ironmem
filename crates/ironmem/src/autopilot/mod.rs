@@ -276,6 +276,7 @@ pub mod turn_prompt;
 pub mod worktree;
 
 use crate::db::drawers::{generate_id, Drawer};
+use crate::db::read_only::ReadOnlyDb;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 // Imported (not duplicated) from `crate::mcp::tools`, which re-exports them
@@ -544,6 +545,19 @@ pub(crate) fn write_current_tx(
 pub(crate) fn read_current(db: &Database, key: &str) -> Result<Option<Drawer>, MemoryError> {
     let id = logical_drawer_id(key);
     db.get_drawer(&id)
+}
+
+/// [`read_current`] over a read-only handle (#420).
+///
+/// Same id, same lookup. It exists as a separate function rather than a
+/// generic one because [`ReadOnlyDb`] is the guarantee: a caller holding
+/// only that type cannot reach a write or a migration, so `ironmem autopilot
+/// status` is read-only by construction instead of by review.
+pub(crate) fn read_current_read_only(
+    db: &ReadOnlyDb,
+    key: &str,
+) -> Result<Option<Drawer>, MemoryError> {
+    db.get_drawer(&logical_drawer_id(key))
 }
 
 #[cfg(test)]

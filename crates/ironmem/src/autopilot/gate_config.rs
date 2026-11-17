@@ -8,10 +8,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::read_only::ReadOnlyDb;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::{read_current, repo_slug, validate_repo, write_current, EMPTY_GATE_COMMANDS_MSG};
+use super::{
+    read_current, read_current_read_only, repo_slug, validate_repo, write_current,
+    EMPTY_GATE_COMMANDS_MSG,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -369,6 +373,21 @@ pub fn wall_clock_timeout(db: &Database, repo: &str) -> Result<Option<u64>, Memo
 /// Read `repo`'s current gate config, whatever state it's in.
 pub fn get_gate_config(db: &Database, repo: &str) -> Result<Option<GateConfig>, MemoryError> {
     match read_current(db, &gate_config_key(repo))? {
+        None => Ok(None),
+        Some(drawer) => Ok(Some(serde_json::from_str(&drawer.content)?)),
+    }
+}
+
+/// [`get_gate_config`] over a read-only handle (#420), for
+/// `ironmem autopilot status`.
+///
+/// Goes through the same `GateConfig` deserialize guard as every other read:
+/// a stored row with no real gate is an `Err`, never a config.
+pub fn get_gate_config_read_only(
+    db: &ReadOnlyDb,
+    repo: &str,
+) -> Result<Option<GateConfig>, MemoryError> {
+    match read_current_read_only(db, &gate_config_key(repo))? {
         None => Ok(None),
         Some(drawer) => Ok(Some(serde_json::from_str(&drawer.content)?)),
     }
@@ -769,5 +788,68 @@ mod tests {
         propose_gate_config(&db, "ironrace/ironmem", vec!["cargo test".into()], vec![]).unwrap();
         let config = get_gate_config(&db, "ironrace/ironmem").unwrap().unwrap();
         assert_eq!(config.repo, "ironrace/ironmem");
+    }
+
+    // ── #420: the read-only read ────────────────────────────────────────
+
+    /// A migrated on-disk database. `open_read_only` needs a real file: it
+    /// refuses to create one, which is the property under test.
+    fn on_disk_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite3");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        (dir, path)
+    }
+
+    #[test]
+    fn the_read_only_read_returns_exactly_what_the_writer_stored() {
+        let (_dir, path) = on_disk_db();
+        let stored = {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(&db, "owner/repo", vec!["cargo test".into()], vec![]).unwrap();
+            approve_gate_config(&db, "owner/repo").unwrap()
+        };
+
+        let ro = Database::open_read_only(&path).unwrap();
+
+        assert_eq!(
+            get_gate_config_read_only(&ro, "owner/repo").unwrap(),
+            Some(stored)
+        );
+    }
+
+    #[test]
+    fn the_read_only_read_reports_a_repo_never_onboarded_as_none() {
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(&db, "other/repo", vec!["cargo test".into()], vec![]).unwrap();
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+
+        assert_eq!(get_gate_config_read_only(&ro, "owner/repo").unwrap(), None);
+    }
+
+    #[test]
+    fn the_read_only_read_refuses_a_stored_config_with_no_gate() {
+        // The same deserialize guard every other read path goes through: a
+        // row with no gate commands is an error, never an approved config.
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            write_current(
+                &db,
+                &gate_config_key("owner/repo"),
+                r#"{"repo":"owner/repo","state":"approved","gate_commands":[],"proposed_at":"2026-01-01T00:00:00+00:00","approved_at":null}"#,
+            )
+            .unwrap();
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let err = get_gate_config_read_only(&ro, "owner/repo").unwrap_err();
+
+        assert!(matches!(err, MemoryError::Json(_)), "{err}");
     }
 }
