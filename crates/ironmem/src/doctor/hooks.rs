@@ -83,8 +83,9 @@ enum HookWiring {
     Unreadable(String),
     /// The ironmem plugin is enabled; its hooks.json supplies the hooks.
     Plugin {
-        /// Plugin hooks that settings.json also wires by hand (they would
-        /// run twice), with their commands.
+        /// Plugin hooks that settings.json also wires by hand (they run
+        /// twice unless the plugin's copy fails at startup), with their
+        /// commands.
         hand_wired: WiredHooks,
         /// `env.IRONMEM_MCP_MODE` from settings.json, if set.
         settings_env_mode: Option<String>,
@@ -169,14 +170,18 @@ pub(super) fn claude_hook_checks(
                     (*event, all.collect())
                 })
                 .collect();
+            let (duplicated, replaced) =
+                split_hand_wired(&wired, &hand_wired, env, process_env_mode);
             let mut failures = startup_failures(&candidates, env, process_env_mode);
             failures.extend(hand_wired_failures(&hand_wired, env, process_env_mode));
-            let duplicated: Vec<&str> = hand_wired.iter().map(|(event, _)| *event).collect();
             let mut mining = mining_check(&candidates, env, process_env_mode, true);
             if mined_only_by_hand_wired(&wired, &candidates, env, process_env_mode) {
                 add_hint(&mut mining, PLUGIN_OVERRIDE_HINT);
             }
-            vec![plugin_hooks_check(&duplicated, &failures), mining]
+            vec![
+                plugin_hooks_check(&duplicated, &replaced, &failures),
+                mining,
+            ]
         }
         HookWiring::Manual {
             wired,
@@ -384,9 +389,10 @@ fn startup_failures(
         .collect()
 }
 
-/// Hand-wired copies of plugin hooks whose mode is invalid. The plugin's own
-/// copy still starts, so no effect is named and the copy is not said to fail
-/// "also": only the copy fails at startup.
+/// Hand-wired copies of plugin hooks whose mode is invalid. No effect is
+/// named and the copy is not said to fail "also": when the plugin's own copy
+/// starts, only the hand-wired copy fails; when it fails too, `startup_failures`
+/// (or `hook_mining`, for a miner) names the effect.
 fn hand_wired_failures(
     hand_wired: &WiredHooks,
     settings_env: Option<&str>,
@@ -407,8 +413,44 @@ fn hand_wired_failures(
         .collect()
 }
 
-fn plugin_hooks_check(hand_wired: &[&str], failures: &[String]) -> Check {
-    if hand_wired.is_empty() && failures.is_empty() {
+/// Sort the hand-wired plugin hooks by whether the plugin's own copy starts.
+/// Returns the events that run twice (the plugin's copy starts too), and an
+/// entry for each event whose plugin copy fails at startup while a hand-wired
+/// copy does not, so that copy is the only one running and must stay. An event
+/// whose copies all fail is in neither: `startup_failures` and
+/// `hand_wired_failures` report it.
+fn split_hand_wired(
+    wired: &WiredHooks,
+    hand_wired: &WiredHooks,
+    settings_env: Option<&str>,
+    process_env: Option<&str>,
+) -> (Vec<&'static str>, Vec<String>) {
+    let mut duplicated = Vec::new();
+    let mut replaced = Vec::new();
+    for (event, commands) in hand_wired {
+        let plugin_copy = wired.iter().find(|(e, _)| e == event).map(|(_, c)| c);
+        let plugin_mode = plugin_copy.map(|c| event_mode(event, c, settings_env, process_env));
+        let Some(((Err(ModeError::Invalid(raw)), source), _)) = plugin_mode else {
+            duplicated.push(*event);
+            continue;
+        };
+        let ((copy, _), _) = event_mode(event, commands, settings_env, process_env);
+        if !matches!(copy, Err(ModeError::Invalid(_))) {
+            replaced.push(format!(
+                "the plugin's {event} fails to start: {} ({}), so only the hand-wired copy runs",
+                invalid_reason(&raw),
+                source_label(source)
+            ));
+        }
+    }
+    (duplicated, replaced)
+}
+
+/// The plugin path's `hooks` check. `hand_wired` are the events that run
+/// twice, `replaced` the entries from [`split_hand_wired`] for plugin copies
+/// that fail while a hand-wired copy runs, and `failures` the startup failures.
+fn plugin_hooks_check(hand_wired: &[&str], replaced: &[String], failures: &[String]) -> Check {
+    if hand_wired.is_empty() && replaced.is_empty() && failures.is_empty() {
         return Check::new(
             "hooks",
             CheckStatus::Ok,
@@ -425,8 +467,15 @@ fn plugin_hooks_check(hand_wired: &[&str], failures: &[String]) -> Check {
         ));
         hints.push(DUPLICATE_HINT);
     }
+    // Removing a copy that replaces a failing plugin copy would turn its hook
+    // off, so these get the fix-the-mode hint, never the duplicate one.
+    if !replaced.is_empty() {
+        problems.push(replaced.join("; "));
+    }
     if !failures.is_empty() {
         problems.push(failures.join("; "));
+    }
+    if !replaced.is_empty() || !failures.is_empty() {
         hints.push(INVALID_MODE_HINT);
     }
     Check::new(
@@ -1659,10 +1708,125 @@ mod tests {
         doc["env"] = serde_json::json!({"IRONMEM_MCP_MODE": "bogus"});
         let home = home_with_settings(&doc.to_string());
         let s = &claude_hook_checks(Some(home.path()), None)[0].summary;
-        assert!(!s.contains("UserPromptSubmit fails to start"), "{s}");
+        // Only the plugin's copy of UserPromptSubmit fails; the hand-wired copy
+        // runs, so the hook is not reported as failed and recall stays on.
+        assert_eq!(
+            *s,
+            format!(
+                "Claude Code hooks: {}; SessionStart fails to start: {BOGUS_REASON} (set by \
+                 env in settings.json), so no memory context at session start",
+                only_hand_wired_runs("UserPromptSubmit")
+            )
+        );
         assert!(!s.contains("prompt recall is off"), "{s}");
         // The plugin's SessionStart has no valid copy, so it still fails.
         assert!(s.contains("SessionStart fails to start"), "{s}");
+    }
+
+    /// Plugin settings with `env.IRONMEM_MCP_MODE` set to `env_mode` and
+    /// `hand_wired` copies of plugin hooks.
+    fn plugin_with(env_mode: &str, hand_wired: &[(&str, &str)]) -> String {
+        let mut doc: Value = serde_json::from_str(&settings_with(hand_wired)).unwrap();
+        doc["enabledPlugins"] = serde_json::json!({"ironmem@ironrace": true});
+        doc["env"] = serde_json::json!({"IRONMEM_MCP_MODE": env_mode});
+        doc.to_string()
+    }
+
+    const BOGUS_REASON: &str =
+        r#"IRONMEM_MCP_MODE="bogus" is not trusted, read-only or restricted"#;
+
+    /// The entry for a plugin copy that fails at startup on `env.IRONMEM_MCP_MODE`
+    /// = "bogus" while a hand-wired copy of `event` runs.
+    fn only_hand_wired_runs(event: &str) -> String {
+        format!(
+            "the plugin's {event} fails to start: {BOGUS_REASON} (set by env in \
+             settings.json), so only the hand-wired copy runs"
+        )
+    }
+
+    #[test]
+    fn a_failing_plugin_copy_with_a_valid_hand_wired_copy_does_not_run_twice() {
+        let home = home_with_settings(&plugin_with(
+            "bogus",
+            &[
+                (
+                    "SessionStart",
+                    "IRONMEM_MCP_MODE=trusted /x/ironmem hook session-start",
+                ),
+                (
+                    "UserPromptSubmit",
+                    "IRONMEM_MCP_MODE=trusted /x/ironmem hook user-prompt-submit",
+                ),
+            ],
+        ));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Warn, "{}", c[0].summary);
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: {}; {}",
+                only_hand_wired_runs("SessionStart"),
+                only_hand_wired_runs("UserPromptSubmit")
+            )
+        );
+        assert!(!c[0].summary.contains("run twice"), "{}", c[0].summary);
+        // Removing the hand-wired copies would turn context and recall off.
+        assert_eq!(c[0].hint.as_deref(), Some(INVALID_MODE_HINT));
+    }
+
+    #[test]
+    fn a_failing_plugin_miner_with_a_trusted_hand_wired_copy_agrees_across_checks() {
+        let home = home_with_settings(&plugin_with("bogus", &[("Stop", TRUSTED_STOP)]));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let fails = |event: &str, effect: &str| {
+            format!(
+                "{event} fails to start: {BOGUS_REASON} (set by env in settings.json), \
+                 so {effect}"
+            )
+        };
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: {}; {}; {}",
+                only_hand_wired_runs("Stop"),
+                fails("SessionStart", "no memory context at session start"),
+                fails("UserPromptSubmit", "prompt recall is off"),
+            )
+        );
+        assert_eq!(c[0].hint.as_deref(), Some(INVALID_MODE_HINT));
+        // hook_mining agrees: the hand-wired Stop mines and must stay, and
+        // removing the override lets the plugin's own PreCompact mine too.
+        assert_eq!(
+            c[1].summary,
+            format!(
+                "Stop is mined; PreCompact is not — Stop: trusted (set in the hook command) \
+                 -> mined; PreCompact: \"bogus\" (set by env in settings.json) -> fails to \
+                 start: {BOGUS_REASON}"
+            )
+        );
+        assert_eq!(
+            c[1].hint.as_deref(),
+            Some(format!("{INVALID_MODE_HINT} | {PLUGIN_OVERRIDE_HINT}").as_str())
+        );
+        assert!(!c[1].hint.as_deref().unwrap().contains(DUPLICATE_HINT));
+    }
+
+    #[test]
+    fn a_failing_plugin_copy_and_a_failing_hand_wired_copy_do_not_run_twice() {
+        let home = home_with_settings(&plugin_with(
+            "bogus",
+            &[("UserPromptSubmit", "ironmem hook user-prompt-submit")],
+        ));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let s = &c[0].summary;
+        assert!(!s.contains("run twice"), "{s}");
+        assert!(s.contains("UserPromptSubmit fails to start"), "{s}");
+        assert!(s.contains("prompt recall is off"), "{s}");
+        assert!(
+            s.contains("the hand-wired UserPromptSubmit fails to start"),
+            "{s}"
+        );
+        assert_eq!(c[0].hint.as_deref(), Some(INVALID_MODE_HINT));
     }
 
     #[test]
