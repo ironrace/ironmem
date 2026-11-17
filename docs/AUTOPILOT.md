@@ -883,7 +883,7 @@ descriptions.
 | Exit status | Meaning |
 |---|---|
 | `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
-| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one). Reading a WAL database from a read-only directory fails this way, because SQLite cannot create the side files. Nothing is printed on stdout. |
+| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
 | `2` | A usage error. An `ironmem` too old to know `status` also exits 2. |
 
 `--json` prints this shape:
@@ -908,11 +908,13 @@ descriptions.
 }
 ```
 
-- `db` is the database file the gate config was read from.
+- `db` is the absolute path of the database that answered.
 - A repo that was never onboarded has `"onboarded": false` and
   `"gate_config": null`.
-- A repo name is matched as written, so a name that differs only in letter
-  case from the onboarded one is reported as not onboarded.
+- A repo name is matched as written: `github.com/owner/repo` and `owner/repo`
+  are different names, and so are names that differ in letter case, so ask
+  with the name the repo was onboarded under. A three-part name is read as
+  `host/owner/name`. A name that is not `owner/name` or `host/owner/name` exits 1.
 - A pending config has `"approved_at": null`.
 - `manifest_warnings` lists the problems recorded on the proposal; read them
   before running `approve`. It is empty when there are none.

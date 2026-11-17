@@ -547,3 +547,63 @@ fn a_path_that_is_not_a_directory_is_a_failed_label_read_and_gh_does_not_run() {
     assert!(error.contains("--path"), "{error}");
     assert_eq!(fixture.gh_log(), "", "gh did not run");
 }
+
+#[test]
+fn a_path_that_is_a_regular_file_is_a_failed_label_read_and_gh_does_not_run() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    let file = fixture.root.path().join("a-file.txt");
+    std::fs::write(&file, "not a directory\n").unwrap();
+
+    let output = fixture
+        .command(
+            REPO,
+            &fixture.db_path(),
+            &file,
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    let report = report(&output);
+    assert_eq!(report["labels"]["read"], json!("failed"));
+    let error = report["labels"]["error"].as_str().unwrap();
+    assert!(error.contains("--path"), "{error}");
+    assert_eq!(fixture.gh_log(), "", "gh did not run");
+}
+
+#[test]
+fn a_wal_database_in_a_read_only_directory_exits_one_and_explains_the_side_files() {
+    let fixture = Fixture::new();
+    let dir = fixture.root.path().join("ro");
+    std::fs::create_dir_all(&dir).unwrap();
+    let db_path = dir.join("memory.sqlite3");
+    {
+        let db = Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        gate_config::propose_gate_config(&db, REPO, vec!["cargo test".into()], Vec::new()).unwrap();
+    }
+    for suffix in ["-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", db_path.display()));
+    }
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // As root the directory is still writable and the case cannot arise.
+    let probe = dir.join("probe");
+    if std::fs::write(&probe, "x").is_ok() {
+        let _ = std::fs::remove_file(&probe);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+
+    let output = fixture.status_at(&db_path, &isolated_path(&fixture.stubs()), ALL_LABELS, None);
+    // Restore before asserting, so a failure still lets the tempdir drop.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &["could not read the database", "-wal/-shm"],
+    );
+}

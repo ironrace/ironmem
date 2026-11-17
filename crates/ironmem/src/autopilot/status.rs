@@ -68,7 +68,11 @@ impl RepoStatus {
     ) -> Self {
         Self {
             repo: repo.to_string(),
-            db: db.display().to_string(),
+            // Absolute, so the report names one file whatever the cwd.
+            db: std::path::absolute(db)
+                .unwrap_or_else(|_| db.to_path_buf())
+                .display()
+                .to_string(),
             onboarded: gate_config.is_some(),
             gate_config,
             labels,
@@ -176,17 +180,51 @@ pub fn read_gate_config_status(
 ) -> Result<Option<GateConfigStatus>, MemoryError> {
     check_repo_shape(repo)?;
     let explain = |err: MemoryError| match err {
-        MemoryError::Db(e) => MemoryError::Validation(format!(
-            "could not read the database at {}: {e}. `status` opens it read-only and never \
-             writes it; if this is not an ironmem database, pass the right one with --db. A \
-             WAL-mode database whose -wal/-shm side files are missing can only be read from a \
-             directory SQLite can create them in",
-            db_path.display()
-        )),
+        MemoryError::Db(e) => explain_db_error(db_path, &e),
         other => other,
     };
-    let db = Database::open_read_only(db_path).map_err(explain)?;
+    let db = match Database::open_read_only(db_path) {
+        // `open_read_only` calls every `CannotOpen` "not found"; a file that
+        // is there but cannot be opened is a different problem.
+        Err(MemoryError::NotFound(_)) if db_path.exists() => {
+            return Err(MemoryError::Io(std::io::Error::other(format!(
+                "could not open the database at {}: the file exists but could not be opened — \
+                 check its permissions and that it is a file",
+                db_path.display()
+            ))));
+        }
+        other => other.map_err(explain)?,
+    };
     gate_config_status(&db, repo).map_err(explain)
+}
+
+/// An I/O failure naming `db_path`, with a hint only for the SQLite errors the
+/// hint is true of. A busy or locked database gets neither hint.
+fn explain_db_error(db_path: &Path, e: &rusqlite::Error) -> MemoryError {
+    let mut message = format!(
+        "could not read the database at {}: {e}. `status` opens it read-only and never \
+         writes it.",
+        db_path.display()
+    );
+    if let rusqlite::Error::SqliteFailure(failure, detail) = e {
+        // A foreign or empty SQLite file arrives as a generic `SQLITE_ERROR`
+        // (code `Unknown`) whose message is "no such table: drawers".
+        let no_such_table = detail
+            .as_deref()
+            .is_some_and(|text| text.starts_with("no such table"));
+        match failure.code {
+            rusqlite::ErrorCode::ReadOnly => message.push_str(
+                " A WAL-mode database whose -wal/-shm side files are missing can only be read \
+                 from a directory SQLite can create them in.",
+            ),
+            rusqlite::ErrorCode::NotADatabase => message
+                .push_str(" If this is not an ironmem database, pass the right one with --db."),
+            _ if no_such_table => message
+                .push_str(" If this is not an ironmem database, pass the right one with --db."),
+            _ => {}
+        }
+    }
+    MemoryError::Io(std::io::Error::other(message))
 }
 
 /// Read `repo`'s gate config, whatever state it is in. `Ok(None)` is a repo
@@ -561,14 +599,118 @@ mod tests {
         .unwrap();
         let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
         match err {
-            MemoryError::Validation(message) => {
+            MemoryError::Io(io) => {
+                let message = io.to_string();
                 assert!(
                     message.contains("could not read the database at"),
                     "{message}"
                 );
                 assert!(message.contains(&path.display().to_string()), "{message}");
+                assert!(message.contains("never writes it"), "{message}");
+                assert!(
+                    message.contains("pass the right one with --db"),
+                    "{message}"
+                );
+                assert!(!message.contains("-wal/-shm"), "{message}");
             }
-            other => panic!("expected the mapped Validation error, got {other:?}"),
+            other => panic!("expected the mapped Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_empty_sqlite_file_is_explained_as_not_an_ironmem_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.sqlite3");
+        rusqlite::Connection::open(&path).unwrap();
+        let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
+        match err {
+            MemoryError::Io(io) => {
+                let message = io.to_string();
+                assert!(message.contains("no such table"), "{message}");
+                assert!(
+                    message.contains("pass the right one with --db"),
+                    "{message}"
+                );
+                assert!(!message.contains("-wal/-shm"), "{message}");
+            }
+            other => panic!("expected the mapped Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_database_file_that_cannot_be_opened_is_not_reported_as_missing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, path) = on_disk_db();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root, the file opens anyway and the case cannot arise.
+        if std::fs::File::open(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            return;
+        }
+        let result = read_gate_config_status(&path, "owner/repo");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        match result.unwrap_err() {
+            MemoryError::Io(io) => {
+                let message = io.to_string();
+                assert!(
+                    message.contains("could not open the database at"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("the file exists but could not be opened"),
+                    "{message}"
+                );
+                assert!(!message.contains("db not found"), "{message}");
+            }
+            other => panic!("expected the Io error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_read_only_failure_gets_the_wal_sentence_and_a_locked_one_gets_neither() {
+        let readonly = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
+            Some("attempt to write a readonly database".into()),
+        );
+        let message = explain_db_error(Path::new("/x/m.db"), &readonly).to_string();
+        assert!(message.contains("-wal/-shm"), "{message}");
+        assert!(!message.contains("pass the right one"), "{message}");
+
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        );
+        let message = explain_db_error(Path::new("/x/m.db"), &busy).to_string();
+        assert!(message.contains("database is locked"), "{message}");
+        assert!(!message.contains("-wal/-shm"), "{message}");
+        assert!(!message.contains("pass the right one"), "{message}");
+    }
+
+    #[test]
+    fn a_relative_database_path_is_reported_as_an_absolute_one() {
+        let status = RepoStatus::new(
+            "owner/repo",
+            Path::new("m.db"),
+            None,
+            LabelStatus::failed("x"),
+        );
+        assert!(Path::new(&status.db).is_absolute(), "{}", status.db);
+        assert!(status.db.ends_with("m.db"), "{}", status.db);
+    }
+
+    #[test]
+    fn a_repo_padded_with_whitespace_is_refused() {
+        let (_dir, path) = on_disk_db();
+        let ro = Database::open_read_only(&path).unwrap();
+        for bad in [" owner/repo", "owner/repo "] {
+            assert!(
+                matches!(
+                    gate_config_status(&ro, bad),
+                    Err(MemoryError::Validation(_))
+                ),
+                "{bad:?}"
+            );
         }
     }
 
