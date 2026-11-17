@@ -736,8 +736,9 @@ fn events_with_verb(events: &[&str]) -> String {
 }
 
 /// A headline that holds in every mix of mined, not-mined (including fails to
-/// start) and unknown miners, naming each group. "<Event> is not" leans on an
-/// earlier "mined", so when nothing mines it comes after "may not be mined".
+/// start) and unknown miners, naming each group. The not-mined group comes
+/// last: "<Event> is not" right after "is mined", "<Event> is not mined" after
+/// "may not be mined".
 fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> String {
     if mined.is_empty() && unknown.is_empty() {
         return "no wired hook mines".to_owned();
@@ -752,7 +753,13 @@ fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> Stri
         parts.push(format!("{} may not be mined", unknown.join(" and ")));
     }
     if !not_mined.is_empty() {
-        parts.push(format!("{} not", events_with_verb(not_mined)));
+        // After "may not be mined", a bare "is not" reads ambiguously.
+        let tail = if unknown.is_empty() {
+            "not"
+        } else {
+            "not mined"
+        };
+        parts.push(format!("{} {tail}", events_with_verb(not_mined)));
     }
     parts.join("; ")
 }
@@ -960,10 +967,6 @@ mod tests {
         let checks = claude_hook_checks(Some(home.path()), None);
         assert_eq!(checks[0].status, CheckStatus::Warn);
         let s = &checks[0].summary;
-        assert!(
-            s.contains("missing SessionStart, UserPromptSubmit, PreCompact"),
-            "{s}"
-        );
         let path = home.path().join(".claude").join("settings.json");
         assert_eq!(
             *s,
@@ -1676,7 +1679,8 @@ mod tests {
         let c = mining_of(&doc.to_string(), None);
         assert!(
             c.summary.starts_with(
-                "no wired hook is known to mine; PreCompact may not be mined; Stop is not — "
+                "no wired hook is known to mine; PreCompact may not be mined; Stop is not \
+                 mined — "
             ),
             "{}",
             c.summary
@@ -1794,7 +1798,8 @@ mod tests {
             c[0].hint.as_deref(),
             Some(format!("{INVALID_MODE_HINT} | {DYNAMIC_MODE_HINT}").as_str())
         );
-        // hook_mining reports the hand-wired copies, the best runs for each.
+        // hook_mining reports, for each miner, the best of its runs (the
+        // hand-wired `$M` copy).
         assert_eq!(c[1].status, CheckStatus::Warn, "{}", c[1].summary);
         assert_eq!(
             c[1].summary,
@@ -1841,7 +1846,7 @@ mod tests {
                 &[],
                 &["PreCompact"],
                 &["Stop"],
-                "no wired hook is known to mine; Stop may not be mined; PreCompact is not",
+                "no wired hook is known to mine; Stop may not be mined; PreCompact is not mined",
             ),
             (
                 &[],
@@ -1877,10 +1882,10 @@ mod tests {
         assert_eq!(c.status, CheckStatus::Warn, "{}", c.summary);
         assert_eq!(
             c.summary,
-            "no wired hook is known to mine; PreCompact may not be mined; Stop is not — Stop: \
-             \"bogus\" (set in the hook command) -> fails to start: IRONMEM_MCP_MODE=\"bogus\" \
-             is not trusted, read-only or restricted; PreCompact: $M (set in the hook \
-             command) -> mode cannot be determined statically"
+            "no wired hook is known to mine; PreCompact may not be mined; Stop is not mined — \
+             Stop: \"bogus\" (set in the hook command) -> fails to start: \
+             IRONMEM_MCP_MODE=\"bogus\" is not trusted, read-only or restricted; PreCompact: $M \
+             (set in the hook command) -> mode cannot be determined statically"
         );
         assert_eq!(
             c.hint.as_deref(),
@@ -2308,9 +2313,9 @@ mod tests {
         assert_eq!(c[1].status, CheckStatus::Warn, "{}", c[1].summary);
         assert_eq!(
             c[1].summary,
-            "no wired hook is known to mine; Stop may not be mined; PreCompact is not — Stop: \
-             $M (set in the hook command) -> mode cannot be determined statically; PreCompact: \
-             read-only (IRONMEM_MCP_MODE unset, so the default) -> not mined"
+            "no wired hook is known to mine; Stop may not be mined; PreCompact is not mined — \
+             Stop: $M (set in the hook command) -> mode cannot be determined statically; \
+             PreCompact: read-only (IRONMEM_MCP_MODE unset, so the default) -> not mined"
         );
         assert_eq!(
             c[1].hint.as_deref(),
