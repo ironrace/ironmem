@@ -171,7 +171,9 @@ pub(super) fn claude_hook_checks(
                 })
                 .collect();
             let split = split_hand_wired(&wired, &hand_wired, env, process_env_mode);
-            let failures = startup_failures(&candidates, env, process_env_mode);
+            // A `Maybe` here needs a dynamic hand-wired copy (the plugin's copy
+            // never has one), which `split_hand_wired` already reports.
+            let (failures, _) = startup_failures(&candidates, env, process_env_mode);
             let mut mining = mining_check(&candidates, env, process_env_mode, true);
             if mined_only_by_hand_wired(&wired, &candidates, env, process_env_mode) {
                 add_hint(&mut mining, PLUGIN_OVERRIDE_HINT);
@@ -183,9 +185,10 @@ pub(super) fn claude_hook_checks(
             missing,
             settings_env_mode,
         } => {
-            let failures = startup_failures(&wired, settings_env_mode.as_deref(), process_env_mode);
+            let (failures, may_fail) =
+                startup_failures(&wired, settings_env_mode.as_deref(), process_env_mode);
             vec![
-                hooks_check(&path, &missing, &failures),
+                hooks_check(&path, &missing, &failures, &may_fail),
                 mining_check(
                     &wired,
                     settings_env_mode.as_deref(),
@@ -361,26 +364,43 @@ fn startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
     )
 }
 
-/// Non-mining hooks (SessionStart, UserPromptSubmit) where no run of the hook
-/// has a valid or dynamic mode ([`starts`] is `No`): `Config::load` fails, so
-/// they exit at startup. Each entry names its own effect: no memory context
-/// at session start for SessionStart, prompt recall off for UserPromptSubmit.
+/// `event` may exit at startup: its mode `raw` is built by the shell.
+fn possible_startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
+    format!(
+        "{event}'s mode cannot be determined statically (IRONMEM_MCP_MODE={raw}, {}), so it \
+         may fail to start, and then {}",
+        source_label(source),
+        event_effect(event)
+    )
+}
+
+/// The startup outcome of the non-mining hooks (SessionStart,
+/// UserPromptSubmit), by [`starts`]: entries for those that surely fail
+/// (`No`: `Config::load` rejects every run's mode, so they exit at startup),
+/// then entries for those that may fail (`Maybe`: no run is surely valid and
+/// one's mode is built by the shell). Each entry names its own effect: no
+/// memory context at session start for SessionStart, prompt recall off for
+/// UserPromptSubmit. Miners are left to `hook_mining`, which reports both
+/// outcomes for them.
 fn startup_failures(
     wired: &WiredHooks,
     settings_env: Option<&str>,
     process_env: Option<&str>,
-) -> Vec<String> {
-    wired
-        .iter()
-        .filter(|(event, _)| !MINING_EVENTS.contains(event))
-        .filter_map(
-            |(event, commands)| match starts(event, commands, settings_env, process_env) {
-                Starts::No(raw, source) => Some(startup_failure(event, &raw, source)),
-                // A valid run surely starts; a dynamic one may.
-                Starts::Yes | Starts::Maybe(..) => None,
-            },
-        )
-        .collect()
+) -> (Vec<String>, Vec<String>) {
+    let (mut fail, mut may_fail) = (Vec::new(), Vec::new());
+    for (event, commands) in wired {
+        if MINING_EVENTS.contains(event) {
+            continue;
+        }
+        match starts(event, commands, settings_env, process_env) {
+            Starts::No(raw, source) => fail.push(startup_failure(event, &raw, source)),
+            Starts::Maybe(raw, source) => {
+                may_fail.push(possible_startup_failure(event, &raw, source))
+            }
+            Starts::Yes => {}
+        }
+    }
+    (fail, may_fail)
 }
 
 /// Whether any of an event's copies starts at all.
@@ -572,8 +592,10 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[String]) -> Check {
     .with_hint(unique.join(HINT_JOINER))
 }
 
-fn hooks_check(path: &Path, missing: &[&str], failures: &[String]) -> Check {
-    if missing.is_empty() && failures.is_empty() {
+/// The manual install's `hooks` check: missing hooks, then hooks that fail to
+/// start (`failures`), then hooks that may (`may_fail`), each with one hint.
+fn hooks_check(path: &Path, missing: &[&str], failures: &[String], may_fail: &[String]) -> Check {
+    if missing.is_empty() && failures.is_empty() && may_fail.is_empty() {
         return Check::new(
             "hooks",
             CheckStatus::Ok,
@@ -599,6 +621,11 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String]) -> Check {
     if !failures.is_empty() {
         problems.push(failures.join("; "));
         hints.push(INVALID_MODE_HINT);
+    }
+    // Warn, as hook_mining does for a mode it cannot determine.
+    if !may_fail.is_empty() {
+        problems.push(may_fail.join("; "));
+        hints.push(DYNAMIC_MODE_HINT);
     }
     Check::new(
         "hooks",
@@ -2032,14 +2059,83 @@ mod tests {
              is off"
         );
         assert_eq!(c[0].hint.as_deref(), Some(INVALID_MODE_HINT));
-        // A dynamic run may start, so it is not reported as a failure.
+        // A dynamic run may start or fail, so neither "fails" nor Ok.
         for cmd in both_orders("IRONMEM_MCP_MODE=$M", "IRONMEM_MCP_MODE=bogus") {
             let home = home_with_settings(&manual_with_ups(&cmd));
             let c = claude_hook_checks(Some(home.path()), None);
-            assert_eq!(c[0].status, CheckStatus::Ok, "{cmd}: {}", c[0].summary);
-            assert_eq!(c[0].summary, all_four_wired(home.path()), "{cmd}");
-            assert_eq!(c[0].hint, None, "{cmd}");
+            assert_eq!(c[0].status, CheckStatus::Warn, "{cmd}: {}", c[0].summary);
+            assert_eq!(
+                c[0].summary,
+                "Claude Code hooks: UserPromptSubmit's mode cannot be determined statically \
+                 (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and \
+                 then prompt recall is off",
+                "{cmd}"
+            );
+            assert_eq!(c[0].hint.as_deref(), Some(DYNAMIC_MODE_HINT), "{cmd}");
         }
+    }
+
+    #[test]
+    fn a_dynamic_manual_session_start_may_fail_to_start() {
+        let home = home_with_settings(&all_four_with("SessionStart", "IRONMEM_MCP_MODE=$M"));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Warn, "{}", c[0].summary);
+        assert_eq!(
+            c[0].summary,
+            "Claude Code hooks: SessionStart's mode cannot be determined statically \
+             (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and then \
+             no memory context at session start"
+        );
+        assert_eq!(c[0].hint.as_deref(), Some(DYNAMIC_MODE_HINT));
+    }
+
+    #[test]
+    fn manual_hook_problems_are_grouped_by_cause_with_one_hint_each() {
+        let home = home_with_settings(&settings_with(&[
+            (
+                "SessionStart",
+                "IRONMEM_MCP_MODE=bogus ironmem hook session-start",
+            ),
+            (
+                "UserPromptSubmit",
+                "IRONMEM_MCP_MODE=$M ironmem hook user-prompt-submit",
+            ),
+            ("Stop", "ironmem hook stop"),
+        ]));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let path = home.path().join(".claude").join("settings.json");
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: missing PreCompact in {} (no mining before compaction); \
+                 SessionStart fails to start: IRONMEM_MCP_MODE=\"bogus\" is not trusted, \
+                 read-only or restricted (set in the hook command), so no memory context at \
+                 session start; UserPromptSubmit's mode cannot be determined statically \
+                 (IRONMEM_MCP_MODE=$M, set in the hook command), so it may fail to start, and \
+                 then prompt recall is off",
+                path.display()
+            )
+        );
+        assert_eq!(
+            c[0].hint.as_deref(),
+            Some(format!("{INSTALL_HINT} | {INVALID_MODE_HINT} | {DYNAMIC_MODE_HINT}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_dynamic_manual_miner_is_left_to_hook_mining() {
+        // Miner startup outcomes (invalid or dynamic) belong to hook_mining.
+        let home = home_with_settings(&all_four_with("Stop", "IRONMEM_MCP_MODE=$M"));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Ok, "{}", c[0].summary);
+        assert_eq!(c[0].summary, all_four_wired(home.path()));
+        assert_eq!(c[0].hint, None);
+        assert!(
+            c[1].summary
+                .contains("Stop: $M (set in the hook command) -> mode cannot be determined"),
+            "{}",
+            c[1].summary
+        );
     }
 
     #[test]
