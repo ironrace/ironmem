@@ -726,11 +726,24 @@ pub fn label_list_argv(repo: &str) -> Vec<String> {
 }
 
 /// Parse `gh label list --json name` into bare label names, in `gh`'s order.
+///
+/// A row with no name (or a blank one) is an error: see below.
 pub fn parse_label_list(stdout: &str) -> Result<Vec<String>, MemoryError> {
     let raw: Vec<LabelJson> = serde_json::from_str(stdout.trim()).map_err(|e| {
         MemoryError::Validation(format!("could not parse `gh label list --json name`: {e}"))
     })?;
-    Ok(raw.into_iter().map(|label| label.name).collect())
+    let names: Vec<String> = raw.into_iter().map(|label| label.name).collect();
+    // `LabelJson` defaults a missing `name` to "", and GitHub label names
+    // cannot be empty: a blank one is output this parser does not
+    // understand, not a label.
+    if names.iter().any(|name| name.trim().is_empty()) {
+        return Err(MemoryError::Validation(
+            "`gh label list --json name` returned a label with no name — the output is not \
+             the expected shape, so no label can be reported missing from it"
+                .into(),
+        ));
+    }
+    Ok(names)
 }
 
 /// Read every label name defined in `repo`. A read, never a write.
@@ -747,7 +760,7 @@ pub fn repo_labels(gh: &mut dyn GhRunner, repo: &str) -> Result<Vec<String>, Mem
     )?;
     if names.len() >= LABEL_LIST_LIMIT {
         return Err(MemoryError::Validation(format!(
-            "gh label list on {repo} returned {} labels, the limit it was asked for — the list \
+            "gh label list on {repo} returned {} labels, at least the limit it was asked for — the list \
              may be truncated, so no label can be reported missing from it",
             names.len()
         )));
@@ -2891,5 +2904,53 @@ mod tests {
             repo_labels(&mut gh, "owner/repo").unwrap(),
             vec!["agent:ready", "agent:blocked"]
         );
+    }
+
+    #[test]
+    fn a_label_row_with_no_name_is_an_error_not_a_blank_label() {
+        // GitHub label names cannot be empty, so a row without one is output
+        // this parser does not understand. Returning it as "" (or dropping
+        // it) would report real labels as missing.
+        let err = parse_label_list(r#"[{"name":"bug"},{}]"#).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+        assert!(err.to_string().contains("no name"), "{err}");
+
+        let err = parse_label_list(r#"[{"name":""}]"#).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn a_label_list_one_short_of_the_limit_is_returned_whole() {
+        // With the at-limit test above, this pins the boundary exactly: a
+        // smaller hardcoded threshold would refuse this list.
+        let rows: Vec<String> = (0..LABEL_LIST_LIMIT - 1)
+            .map(|i| format!(r#"{{"name":"label-{i}"}}"#))
+            .collect();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(&format!("[{}]", rows.join(","))))]);
+
+        let names = repo_labels(&mut gh, "owner/repo").unwrap();
+
+        assert_eq!(names.len(), LABEL_LIST_LIMIT - 1);
+    }
+
+    #[test]
+    fn a_repo_with_no_labels_reads_as_an_empty_list_not_a_failure() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("[]\n"))]);
+        assert_eq!(
+            repo_labels(&mut gh, "owner/repo").unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_label_list_over_the_limit_is_refused_too() {
+        let rows: Vec<String> = (0..LABEL_LIST_LIMIT + 1)
+            .map(|i| format!(r#"{{"name":"label-{i}"}}"#))
+            .collect();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(&format!("[{}]", rows.join(","))))]);
+
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+
+        assert!(err.to_string().contains("at least the limit"), "{err}");
     }
 }
