@@ -979,6 +979,31 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Report a repo's gate config and its `agent:*` / `risk:*` labels,
+    /// changing nothing
+    ///
+    /// Read-only: the database is opened read-only and is never created or
+    /// migrated, and `gh` is only asked to list labels.
+    ///
+    /// Exit status: 0 when a report was printed. That includes a repo that
+    /// is not onboarded (`"onboarded": false`, `"gate_config": null`) and
+    /// labels that could not be read (`"labels": {"read": "failed", ...}`).
+    /// 1 when the gate config could not be read at all: no database at the
+    /// path, an invalid repo, a stored config that does not parse, or one
+    /// stored for a different repo name under the same key.
+    Status {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse one `--repo owner/repo=/path/to/checkout` argument.
@@ -3543,6 +3568,37 @@ after {n} attempt(s)",
                 }
                 Ok(())
             }
+            AutopilotCmd::Status {
+                db,
+                repo,
+                path,
+                json,
+            } => {
+                use ironmem::autopilot::status::{
+                    gate_config_status, render_text, LabelStatus, RepoStatus,
+                };
+
+                // `open_read_only`, never `open_migrated_db`: this command
+                // must not create a missing database or migrate an old one.
+                let cfg = config::Config::load(db.clone())?;
+                let database = ironmem::db::schema::Database::open_read_only(&cfg.db_path)?;
+                let gate_config = gate_config_status(&database, &repo)?;
+                // A `gh` that cannot be found is a failed label read, like
+                // one that exits non-zero: the gate config is still reported.
+                let labels = match ironmem::autopilot::gh::GhCli::resolve(&path) {
+                    Ok(mut gh) => LabelStatus::read(&mut gh, &repo),
+                    Err(err) => LabelStatus::failed(err.to_string()),
+                };
+                let status = RepoStatus::new(&repo, gate_config, labels);
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&status)?);
+                } else {
+                    // The `--db` this ran with, so the hinted commands
+                    // act on the database that was read.
+                    print!("{}", render_text(&status, db.as_deref()));
+                }
+                Ok(())
+            }
         },
         Commands::Harnesses { format } => {
             match format.as_str() {
@@ -4107,6 +4163,29 @@ mod tests {
                 assert!(!json);
             }
             _ => panic!("expected Commands::Autopilot(Labels), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_status_takes_a_repo_and_defaults_to_text_in_the_current_directory() {
+        let cli = Cli::try_parse_from(["ironmem", "autopilot", "status", "owner/repo"])
+            .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Status {
+                        db,
+                        repo,
+                        path,
+                        json,
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(path, ".");
+                assert_eq!(db, None);
+                assert!(!json);
+            }
+            _ => panic!("expected Commands::Autopilot(Status), got a different variant"),
         }
     }
 

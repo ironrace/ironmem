@@ -861,6 +861,61 @@ means no lint coverage — not that CI declined to require it.
 `agent:exhausted`) in the repo if they don't already exist. It is safe to
 run more than once; an existing label is left untouched.
 
+### Check what a repo has: `status`
+
+```
+ironmem autopilot status owner/repo [--json] [--db <path>] [--path <dir>]
+```
+
+`status` reports whether the repo has a gate config, the config's state
+(`pending` or `approved`), its gate commands and its `proposed_at` /
+`approved_at` times, and which of the three `agent:*` labels and which
+`risk:*` labels the repo has. `--path` is the directory `gh` runs in.
+
+It changes nothing. The database is opened read-only and is never created or
+migrated, and `gh` is only asked to list the repo's labels. Labels are
+matched by exact name on that list, not with `gh label list --search`, which
+also matches descriptions.
+
+| Exit status | Meaning |
+|---|---|
+| `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
+| `1` | The gate config could not be read: no database at the path, an invalid repo, a stored config that does not parse, or a config stored for a different repo name under the same key (two names that differ only in `/` versus `-` share one). Nothing is printed on stdout. |
+
+`--json` prints this shape:
+
+```json
+{
+  "repo": "owner/repo",
+  "onboarded": true,
+  "gate_config": {
+    "state": "approved",
+    "gate_commands": ["cargo test --workspace"],
+    "manifest_warnings": [],
+    "proposed_at": "2026-09-12T18:14:25.139202+00:00",
+    "approved_at": "2026-09-12T19:53:43.871249+00:00"
+  },
+  "labels": {
+    "read": "ok",
+    "agent": { "agent:blocked": true, "agent:exhausted": true, "agent:ready": true },
+    "risk": ["risk:documentation", "risk:logic"]
+  }
+}
+```
+
+- A repo that was never onboarded has `"onboarded": false` and
+  `"gate_config": null`.
+- A pending config has `"approved_at": null`.
+- `manifest_warnings` lists the problems recorded on the proposal; read them
+  before running `approve`. It is empty when there are none.
+- When `gh` is missing, exits non-zero (authentication, a rate limit, an
+  unknown repo) or returns a list long enough to have been cut off, `labels`
+  is `{"read": "failed", "error": "<what failed>"}` with no `agent` or
+  `risk` key. A failed read says nothing about which labels exist.
+
+`/evaluate-issue` reads the gate config from this command
+(`docs/EVALUATE_ISSUE.md`, Step 2).
+
 ## The label taxonomy
 
 ### `agent:*` — who may dispatch this issue
