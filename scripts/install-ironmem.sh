@@ -699,8 +699,8 @@ register_json_mcpservers() {
 # instead of being moved over, so a settings.json symlinked into a dotfiles
 # repo stays a symlink. The matcher expects the hook name directly after
 # `hook`; a hand-wired command in another shape (say `hook --harness
-# claude-code stop`) gets a second copy appended. Keep CLAUDE_HOOK_EVENTS in step with PLUGIN_HOOKS in
-# crates/ironmem/src/doctor/hooks.rs; the unit test
+# claude-code stop`) gets a second copy appended. Keep CLAUDE_HOOK_EVENTS in
+# step with PLUGIN_HOOKS in crates/ironmem/src/doctor/hooks.rs; the unit test
 # plugin_hooks_table_matches_the_plugin_hooks_json pins that table to
 # hooks.json, and scripts/test_install_ironmem.py pins this one to it.
 CLAUDE_HOOK_EVENTS=(
@@ -736,7 +736,7 @@ wire_claude_hooks() {
     name="${pair#*:}"
     if jq -e --arg ev "$event" --arg name "$name" '
         [(.hooks[$ev] // [])[] | (.hooks // [])[] | (.command // "")]
-        | any(test("(^|[/\\s])ironmem(-mcp\\.sh)?[\"\u0027]?\\s+hook\\s+" + $name + "([\\s;&|)\"\u0027]|$)")
+        | any(test("(^|[/\\s\"\u0027])ironmem(-mcp\\.sh)?[\"\u0027]?\\s+hook\\s+" + $name + "([\\s;&|)\"\u0027]|$)")
               or test("ironmem-hook\\.sh[\"\u0027]?\\s+" + $name + "([\\s;&|)\"\u0027]|$)"))' \
       "$settings" >/dev/null 2>&1; then
       kept+="$event "

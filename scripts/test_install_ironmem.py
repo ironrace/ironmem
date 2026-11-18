@@ -938,22 +938,28 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertFalse((home / ".claude" / "settings.json").exists())
 
 
-    def stop_commands_after_install(self, existing: str, *, event: str = "Stop") -> list[str]:
+    def stop_commands_after_install(self, existing: str) -> list[str]:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
             settings_path = home / ".claude" / "settings.json"
             settings_path.parent.mkdir(parents=True)
             settings_path.write_text(
-                json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": existing}]}]}}),
+                json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": existing}]}]}}),
                 encoding="utf-8",
             )
             self.run_installer(home, home / ".claude.json")
-            return self.ironmem_hook_commands(self.claude_settings(home), event)
+            target = str(home / ".ironrace" / "bin" / "ironmem")
+            commands = self.ironmem_hook_commands(self.claude_settings(home), "Stop")
+            return [command.replace(target, "<target>") for command in commands]
 
     def test_quoted_program_path_counts_as_wired(self) -> None:
         for command in (
             '"$HOME/.ironrace/bin/ironmem" hook stop --harness claude-code',
             "'/opt/ironmem' hook stop --harness claude-code",
+            '"ironmem" hook stop --harness claude-code',
+            "'ironmem' hook stop --harness claude-code",
+            'bash -c "ironmem hook stop"',
+            "bash -c 'ironmem hook stop'",
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.stop_commands_after_install(command), [command])
@@ -970,11 +976,12 @@ class InstallIronmemSelfTest(unittest.TestCase):
         for command in (
             "~/.ironrace/bin/ironmem hook stopx --harness claude-code",
             "~/.ironrace/bin/ironmem hook stop-foo --harness claude-code",
+            "notironmem hook stop",
+            "my-ironmem hook stop",
         ):
             with self.subTest(command=command):
-                commands = self.stop_commands_after_install(command)
-                self.assertEqual(len(commands), 2, commands)
-                self.assertEqual(commands[0], command)
+                own = "<target> hook stop --harness claude-code"
+                self.assertEqual(self.stop_commands_after_install(command), [command, own])
 
 
 if __name__ == "__main__":
