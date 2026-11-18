@@ -390,3 +390,34 @@ fn plugin_install_and_trusted_hooks_report_mining_on() {
         "{stdout}"
     );
 }
+
+/// `Config::load` parses `IRONMEM_MCP_MODE` before doctor runs any check, so
+/// an invalid value in doctor's own environment ends the run with a config
+/// error and no report. The unit cases that feed doctor's hook checks an
+/// invalid process-env mode cover a branch this CLI cannot reach today.
+#[test]
+fn an_invalid_mcp_mode_in_the_environment_is_a_config_error_with_no_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    init_db(&home, &db_path);
+
+    for value in ["bogus", ""] {
+        let out = doctor_command(&home, &db_path)
+            .env("IRONMEM_EMBED_MODE", "noop")
+            .env("IRONMEM_MCP_MODE", value)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{value:?}: {out:?}");
+        assert!(out.stdout.is_empty(), "{value:?}: {out:?}");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!(
+                "Error: Config error: IRONMEM_MCP_MODE must be one of trusted, read-only, \
+                 restricted; got {value}\n"
+            ),
+            "{value:?}"
+        );
+    }
+}

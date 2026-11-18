@@ -2007,6 +2007,9 @@ mod tests {
 
     #[test]
     fn an_empty_mode_is_quoted_in_every_invalid_message() {
+        // A defensive branch: the CLI's `Config::load` rejects an invalid
+        // IRONMEM_MCP_MODE in doctor's own environment before doctor runs
+        // (pinned by tests/doctor.rs), so only a library caller reaches this.
         let home = home_with_settings(&settings_with(&ALL_FOUR_BARE));
         let c = claude_hook_checks(Some(home.path()), Some(""));
         for check in &c {
@@ -2156,6 +2159,8 @@ mod tests {
                 Starts::No("$M".to_owned(), ModeSource::SettingsEnv),
                 "{event}"
             );
+            // A defensive case: the CLI's `Config::load` rejects this value
+            // in doctor's own environment before doctor runs.
             assert_eq!(
                 starts(event, &plugin, None, Some("$(cat /m)")),
                 Starts::No("$(cat /m)".to_owned(), ModeSource::Environment),

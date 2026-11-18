@@ -832,6 +832,8 @@ mod tests {
             hook_mode("IRONMEM_MCP_MODE= ironmem hook stop", "stop", None, None),
             (Err(ModeError::Invalid(String::new())), ModeSource::Inline)
         );
+        // A defensive case: the CLI's `Config::load` rejects an invalid
+        // IRONMEM_MCP_MODE in doctor's own environment before doctor runs.
         assert_eq!(
             hook_mode("ironmem hook stop", "stop", None, Some("Bogus")),
             (
