@@ -213,45 +213,108 @@ fn validate_wall_clock_timeout(secs: Option<u64>) -> Result<(), String> {
 /// The logical-key prefix every gate config's key starts with.
 const GATE_CONFIG_KEY_PREFIX: &str = "gate-config:";
 
-/// How many stored gate configs [`stored_gate_config_repos_read_only`] will
-/// list. A listing that fills it may be incomplete, so it is an error.
+/// How many stored gate configs [`stored_gate_configs_read_only`] will list.
+/// A listing that fills it may be incomplete, so it is an error.
 const STORED_GATE_CONFIG_LIMIT: usize = 1000;
 
 fn gate_config_key(repo: &str) -> String {
     format!("{GATE_CONFIG_KEY_PREFIX}{}", repo_slug(repo))
 }
 
-/// The `repo` of every stored gate config, read-only (#420). A row that does
-/// not parse is skipped: its repo name cannot be read, and a read of the name
-/// it is stored under reports it. A row marked superseded is listed, because
-/// the read by name ([`get_gate_config_read_only`]) is a lookup by id that
-/// returns such a row too. An error when the listing reaches
-/// [`STORED_GATE_CONFIG_LIMIT`], since a possibly incomplete list cannot show
-/// that no near-match exists.
-pub(super) fn stored_gate_config_repos_read_only(
+/// One stored gate config, as [`stored_gate_configs_read_only`] lists it.
+#[derive(Debug)]
+pub(super) enum StoredGateConfig {
+    /// A row that parses, by its `repo`.
+    Parsed(String),
+    /// A row that does not parse.
+    Broken(BrokenGateConfig),
+}
+
+/// A stored gate config row that does not parse as a [`GateConfig`].
+#[derive(Debug)]
+pub struct BrokenGateConfig {
+    /// The logical key the row is stored under: `gate-config:` followed by
+    /// the slug of the repo name it was written for.
+    pub(super) storage_key: String,
+    /// The row's own `repo`, when its content is a JSON object that holds one
+    /// as a string. `None` for content that is not JSON, or has no such field.
+    pub(super) repo: Option<String>,
+    /// Why the row does not parse.
+    pub(super) error: serde_json::Error,
+}
+
+impl BrokenGateConfig {
+    /// The slug in the row's storage key: the repo name the row was written
+    /// for with every character outside `[A-Za-z0-9_.-]` replaced by `-`, so
+    /// the name cannot be read back from it exactly.
+    pub(super) fn slug(&self) -> &str {
+        self.storage_key
+            .strip_prefix(GATE_CONFIG_KEY_PREFIX)
+            .unwrap_or(&self.storage_key)
+    }
+}
+
+/// Why [`stored_gate_configs_read_only`] could not list the stored configs.
+#[derive(Debug)]
+pub(super) enum StoredGateConfigsError {
+    /// The read failed.
+    Read(MemoryError),
+    /// The listing reached [`STORED_GATE_CONFIG_LIMIT`] rows, so it may be
+    /// incomplete, and an incomplete list cannot show that no near-match
+    /// exists.
+    LimitReached { limit: usize },
+}
+
+/// Every stored gate config, read-only (#420): the `repo` of each row that
+/// parses, and for each row that does not, the key it is stored under, the
+/// parse error and the `repo` its content still holds. A row marked
+/// superseded is listed, because the read by name
+/// ([`get_gate_config_read_only`]) is a lookup by id that returns such a row
+/// too.
+pub(super) fn stored_gate_configs_read_only(
     db: &ReadOnlyDb,
-) -> Result<Vec<String>, MemoryError> {
-    let prefix = format!(
-        "{}{GATE_CONFIG_KEY_PREFIX}",
-        crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX
-    );
-    let drawers = db.get_drawers_by_source_prefix(
-        super::WING,
-        super::ROOM,
-        &prefix,
-        STORED_GATE_CONFIG_LIMIT,
-    )?;
+) -> Result<Vec<StoredGateConfig>, StoredGateConfigsError> {
+    let source_prefix = crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX;
+    let drawers = db
+        .get_drawers_by_source_prefix(
+            super::WING,
+            super::ROOM,
+            &format!("{source_prefix}{GATE_CONFIG_KEY_PREFIX}"),
+            STORED_GATE_CONFIG_LIMIT,
+        )
+        .map_err(StoredGateConfigsError::Read)?;
     if drawers.len() >= STORED_GATE_CONFIG_LIMIT {
-        return Err(MemoryError::Validation(format!(
-            "{STORED_GATE_CONFIG_LIMIT} or more gate configs are stored, so they cannot all be \
-             compared against the repo asked about"
-        )));
+        return Err(StoredGateConfigsError::LimitReached {
+            limit: STORED_GATE_CONFIG_LIMIT,
+        });
     }
     Ok(drawers
-        .iter()
-        .filter_map(|drawer| serde_json::from_str::<GateConfig>(&drawer.content).ok())
-        .map(|config| config.repo)
+        .into_iter()
+        .map(
+            |drawer| match serde_json::from_str::<GateConfig>(&drawer.content) {
+                Ok(config) => StoredGateConfig::Parsed(config.repo),
+                Err(error) => StoredGateConfig::Broken(BrokenGateConfig {
+                    storage_key: drawer
+                        .source_file
+                        .strip_prefix(source_prefix)
+                        .unwrap_or(&drawer.source_file)
+                        .to_string(),
+                    repo: held_repo(&drawer.content),
+                    error,
+                }),
+            },
+        )
         .collect())
+}
+
+/// The `repo` that row content holds, read without [`GateConfig`]'s guard:
+/// `Some` when the content is a JSON object whose `repo` is a string.
+fn held_repo(content: &str) -> Option<String> {
+    serde_json::from_str::<serde_json::Value>(content)
+        .ok()?
+        .get("repo")?
+        .as_str()
+        .map(str::to_string)
 }
 
 /// Write a fresh `pending` proposal for `repo`, as the Onboarder would after
@@ -464,6 +527,28 @@ pub(super) mod testing {
     /// writer would produce.
     pub(in crate::autopilot) fn store_raw_gate_config(db: &Database, repo: &str, content: &str) {
         write_current(db, &gate_config_key(repo), content).unwrap();
+    }
+
+    /// Store a parseable gate config for each of `count` repos, named
+    /// `many/repo-<n>`, in one transaction.
+    pub(in crate::autopilot) fn store_gate_configs(db: &Database, count: usize) {
+        db.with_transaction(|tx| {
+            for n in 0..count {
+                let repo = format!("many/repo-{n}");
+                let content = serde_json::json!({
+                    "repo": repo,
+                    "state": "pending",
+                    "gate_commands": ["cargo test"],
+                    "manifest_warnings": [],
+                    "proposed_at": "2026-01-01T00:00:00+00:00",
+                    "approved_at": null,
+                })
+                .to_string();
+                crate::autopilot::write_current_tx(tx, &gate_config_key(&repo), &content)?;
+            }
+            Ok(())
+        })
+        .unwrap();
     }
 }
 
@@ -918,33 +1003,135 @@ mod tests {
         assert!(err.to_string().contains(EMPTY_GATE_COMMANDS_MSG), "{err}");
     }
 
+    /// The parsed repo names in `listing`, sorted, and its broken rows by
+    /// storage key.
+    fn split(listing: Vec<StoredGateConfig>) -> (Vec<String>, Vec<BrokenGateConfig>) {
+        let mut parsed = Vec::new();
+        let mut broken = Vec::new();
+        for row in listing {
+            match row {
+                StoredGateConfig::Parsed(repo) => parsed.push(repo),
+                StoredGateConfig::Broken(row) => broken.push(row),
+            }
+        }
+        parsed.sort();
+        broken.sort_by(|a, b| a.storage_key.cmp(&b.storage_key));
+        (parsed, broken)
+    }
+
     #[test]
-    fn stored_repos_lists_each_parseable_config_and_skips_a_broken_row() {
+    fn stored_configs_lists_a_broken_row_with_its_key_its_error_and_the_name_it_holds() {
         let (_dir, path) = on_disk_db();
         {
             let db = Database::open(&path).unwrap();
             propose_gate_config(&db, "owner/one", vec!["cargo test".into()], vec![]).unwrap();
             propose_gate_config(&db, "owner/two", vec!["cargo test".into()], vec![]).unwrap();
+            // Not JSON at all: no name can be read from the content.
             write_current(&db, &gate_config_key("owner/broken"), "not json").unwrap();
+            // JSON that fails the guard: the content still names its repo.
+            write_current(
+                &db,
+                &gate_config_key("Owner/Guarded"),
+                r#"{"repo":"Owner/Guarded","state":"approved","gate_commands":[],"proposed_at":"2026-01-01T00:00:00+00:00","approved_at":null}"#,
+            )
+            .unwrap();
         }
 
         let ro = Database::open_read_only(&path).unwrap();
-        let mut repos = stored_gate_config_repos_read_only(&ro).unwrap();
-        repos.sort();
+        let (parsed, broken) = split(stored_gate_configs_read_only(&ro).unwrap());
 
         assert_eq!(
-            repos,
+            parsed,
             vec!["owner/one".to_string(), "owner/two".to_string()]
+        );
+        assert_eq!(broken.len(), 2, "{broken:?}");
+        let guarded = &broken[0];
+        assert_eq!(guarded.storage_key, "gate-config:Owner-Guarded");
+        assert_eq!(guarded.slug(), "Owner-Guarded");
+        assert_eq!(guarded.repo.as_deref(), Some("Owner/Guarded"));
+        assert!(
+            guarded.error.to_string().contains(EMPTY_GATE_COMMANDS_MSG),
+            "{}",
+            guarded.error
+        );
+        let not_json = &broken[1];
+        assert_eq!(not_json.storage_key, "gate-config:owner-broken");
+        assert_eq!(not_json.slug(), "owner-broken");
+        assert_eq!(not_json.repo, None);
+        assert!(
+            not_json.error.to_string().contains("expected"),
+            "{}",
+            not_json.error
         );
     }
 
     #[test]
-    fn stored_repos_is_empty_for_a_database_with_no_gate_config() {
+    fn a_broken_row_holds_no_name_when_its_repo_is_not_a_string() {
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            write_current(&db, &gate_config_key("a/number"), r#"{"repo":7}"#).unwrap();
+            write_current(&db, &gate_config_key("a/list"), r#"["repo","a/list"]"#).unwrap();
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let (parsed, broken) = split(stored_gate_configs_read_only(&ro).unwrap());
+
+        assert_eq!(parsed, Vec::<String>::new());
+        assert_eq!(broken.len(), 2, "{broken:?}");
+        assert!(broken.iter().all(|row| row.repo.is_none()), "{broken:?}");
+    }
+
+    #[test]
+    fn stored_configs_is_empty_for_a_database_with_no_gate_config() {
         let (_dir, path) = on_disk_db();
         let ro = Database::open_read_only(&path).unwrap();
-        assert_eq!(
-            stored_gate_config_repos_read_only(&ro).unwrap(),
-            Vec::<String>::new()
+        let (parsed, broken) = split(stored_gate_configs_read_only(&ro).unwrap());
+        assert_eq!(parsed, Vec::<String>::new());
+        assert!(broken.is_empty(), "{broken:?}");
+    }
+
+    #[test]
+    fn a_listing_one_short_of_the_limit_is_returned_whole() {
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            testing::store_gate_configs(&db, STORED_GATE_CONFIG_LIMIT - 1);
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let (parsed, broken) = split(stored_gate_configs_read_only(&ro).unwrap());
+
+        assert_eq!(parsed.len(), STORED_GATE_CONFIG_LIMIT - 1);
+        assert!(broken.is_empty(), "{broken:?}");
+    }
+
+    #[test]
+    fn a_listing_that_fills_the_limit_is_refused() {
+        // A listing cut off at the limit cannot show that no near-match
+        // exists, and the query asks for no more rows than the limit, so the
+        // count can reach it and never pass it.
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            testing::store_gate_configs(&db, STORED_GATE_CONFIG_LIMIT);
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let listed = stored_gate_configs_read_only(&ro);
+
+        assert!(
+            matches!(
+                listed,
+                Err(StoredGateConfigsError::LimitReached {
+                    limit: STORED_GATE_CONFIG_LIMIT
+                })
+            ),
+            "expected the limit, got {}",
+            match &listed {
+                Ok(rows) => format!("a listing of {} rows", rows.len()),
+                Err(err) => format!("{err:?}"),
+            }
         );
     }
 }

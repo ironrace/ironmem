@@ -3583,9 +3583,7 @@ after {n} attempt(s)",
                 path,
                 json,
             } => {
-                use ironmem::autopilot::status::{
-                    read_gate_config_status, render_text, LabelStatus, RepoName, RepoStatus,
-                };
+                use ironmem::autopilot::status::{read_gate_config_status, render_text, RepoName};
 
                 let cfg = config::Config::load(db.clone())?;
                 // Parsed here and not by clap, whose own parse failure exits
@@ -3596,8 +3594,7 @@ after {n} attempt(s)",
                 let read = read_gate_config_status(&cfg.db_path, &repo)?;
                 // Never an error: a label read that fails is part of the
                 // report, and the gate config is still reported.
-                let labels = LabelStatus::read_in(std::path::Path::new(&path), read.repo());
-                let status = RepoStatus::new(read, labels);
+                let status = read.with_labels_read_in(std::path::Path::new(&path));
                 if json {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
