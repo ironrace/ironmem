@@ -232,3 +232,154 @@ fn json_output_is_machine_readable() {
     // The model check is `info` under noop mode and serializes lowercase.
     assert!(stdout.contains("\"status\": \"info\"") || stdout.contains("\"status\":\"info\""));
 }
+
+/// Write `~/.claude/settings.json` under `home`.
+fn write_claude_settings(home: &Path, doc: serde_json::Value) {
+    std::fs::create_dir_all(home.join(".claude")).unwrap();
+    std::fs::write(home.join(".claude").join("settings.json"), doc.to_string()).unwrap();
+}
+
+/// A settings document with one hook group per `(event, command)`.
+fn hooks_doc(commands: &[(&str, &str)]) -> serde_json::Value {
+    let mut hooks = serde_json::Map::new();
+    for (event, cmd) in commands {
+        hooks.insert(
+            (*event).to_string(),
+            serde_json::json!([{ "hooks": [{ "type": "command", "command": cmd }] }]),
+        );
+    }
+    serde_json::json!({ "hooks": hooks })
+}
+
+const BARE_HOOKS: [(&str, &str); 4] = [
+    (
+        "SessionStart",
+        "/x/ironmem hook session-start --harness claude-code",
+    ),
+    (
+        "UserPromptSubmit",
+        "/x/ironmem hook user-prompt-submit --harness claude-code",
+    ),
+    ("Stop", "/x/ironmem hook stop --harness claude-code"),
+    (
+        "PreCompact",
+        "/x/ironmem hook precompact --harness claude-code",
+    ),
+];
+
+/// Insert one mined drawer filed at `filed_at` (UTC) into an initialized store.
+fn insert_mined_row(db_path: &Path, filed_at: &str) {
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT INTO drawers (id, content, embedding, wing, room, source_file, added_by, filed_at)
+         VALUES (?1, 'mined', x'', 'w', 'general', 'f.jsonl', 'mine', ?2)",
+        rusqlite::params!["d".repeat(32), filed_at],
+    )
+    .unwrap();
+}
+
+#[test]
+fn non_plugin_read_only_hooks_say_plainly_that_nothing_is_mined() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    init_db(&home, &db_path);
+    insert_mined_row(&db_path, "2026-01-01 00:00:00");
+    write_claude_settings(&home, hooks_doc(&BARE_HOOKS));
+
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env_remove("IRONMEM_MCP_MODE")
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "warnings must not fail doctor: {out:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("Claude Code hooks: all 4 wired"),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Stop: read-only (IRONMEM_MCP_MODE unset, so the default) -> not mined"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("no wired hook mines"), "{stdout}");
+    assert!(
+        stdout.contains("(2026-01-01 00:00:00 UTC): transcripts are not being mined"),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn missing_prompt_hook_is_named() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    init_db(&home, &db_path);
+    write_claude_settings(
+        &home,
+        hooks_doc(&[BARE_HOOKS[0], BARE_HOOKS[2], BARE_HOOKS[3]]),
+    );
+
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env_remove("IRONMEM_MCP_MODE")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("missing UserPromptSubmit"), "{stdout}");
+    assert!(stdout.contains("prompt recall is off"), "{stdout}");
+    assert!(stdout.contains("no mined rows yet"), "{stdout}");
+}
+
+#[test]
+fn plugin_install_and_trusted_hooks_report_mining_on() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    init_db(&home, &db_path);
+
+    write_claude_settings(
+        &home,
+        serde_json::json!({ "enabledPlugins": { "ironmem@ironrace": true } }),
+    );
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env_remove("IRONMEM_MCP_MODE")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("supplied by the enabled ironmem plugin"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("Stop and PreCompact are mined"), "{stdout}");
+
+    let trusted: Vec<(&str, String)> = BARE_HOOKS
+        .iter()
+        .map(|(e, c)| (*e, format!("IRONMEM_MCP_MODE=trusted {c}")))
+        .collect();
+    let refs: Vec<(&str, &str)> = trusted.iter().map(|(e, c)| (*e, c.as_str())).collect();
+    write_claude_settings(&home, hooks_doc(&refs));
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env_remove("IRONMEM_MCP_MODE")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(
+            "Stop and PreCompact are mined — Stop: trusted (set in the hook command) -> mined; \
+             PreCompact: trusted (set in the hook command) -> mined"
+        ),
+        "{stdout}"
+    );
+}
