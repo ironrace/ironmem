@@ -740,6 +740,23 @@ _shell_word() {
 # $TARGET as the first word of a hook command.
 HOOK_PROGRAM="$(_shell_word "$TARGET")"
 
+# Prints $1 escaped for the inside of a JSON string: each \ then each " gets
+# a backslash. Loops for the same reason as _shell_word.
+_json_string_body() {
+  local rest="$1" escaped=""
+  while [[ "$rest" == *\\* ]]; do
+    escaped+="${rest%%\\*}\\\\"
+    rest="${rest#*\\}"
+  done
+  rest="$escaped$rest"
+  escaped=""
+  while [[ "$rest" == *\"* ]]; do
+    escaped+="${rest%%\"*}\\\""
+    rest="${rest#*\"}"
+  done
+  printf '%s' "$escaped$rest"
+}
+
 # Prints the WARN every failed wiring attempt ends with; $1 says what failed.
 _wire_claude_hooks_warn() {
   echo "    WARN: $1; wired no Claude hooks." >&2
@@ -987,7 +1004,7 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     echo "          { \"schema_version\": 1, \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" }, \"mode\": \"optional\" } } }" >&2
     echo "          Claude Code hooks were not wired either. Add these four to $CLAUDE_SETTINGS_JSON" >&2
     echo "          under \"hooks\", one key each for SessionStart, UserPromptSubmit, Stop and PreCompact, shaped as" >&2
-    echo "          \"<Event>\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"$HOOK_PROGRAM hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] } ]" >&2
+    echo "          \"<Event>\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"$(_json_string_body "$HOOK_PROGRAM") hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] } ]" >&2
   else
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \

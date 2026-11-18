@@ -12,9 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`ironmem doctor` reports hooks that leave a store stale (#377).** Three
   new lines: `hooks` names any of the plugin's four Claude Code hooks missing
   from `~/.claude/settings.json` (or reports that the enabled plugin supplies
-  them) and warns when a hook fails or may fail to start; `hook_mining` says
-  whether Stop/PreCompact can mine, with each hook's effective
-  `IRONMEM_MCP_MODE` and where it came from; `mined_rows` shows how old the
+  them) and warns when a hook fails or may fail to start, and when the
+  enabled ironmem plugin and hand-wired entries in `settings.json` both supply
+  a hook ("so those hooks run twice"; the hint says to "remove the hand-wired
+  ironmem entries from settings.json"); `hook_mining` says whether
+  Stop/PreCompact can mine, with each hook's effective `IRONMEM_MCP_MODE` and
+  where it came from; `mined_rows` shows how old the
   newest mined row (a chunk of a workspace file) is and warns past 7 days,
   which an unchanged workspace also triggers. Problems are warnings and never
   fail `doctor` (exit 0). `scripts/install-ironmem.sh` now appends the four

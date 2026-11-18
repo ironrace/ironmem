@@ -905,20 +905,28 @@ class InstallIronmemSelfTest(unittest.TestCase):
         self.assert_hooks_run_from_an_unsafe_install_dir("it's here")
 
     def test_without_jq_the_printed_hook_command_is_quoted(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = pathlib.Path(directory)
-            path = self.path_without_jq(home / "no-jq-bin")
-            install_dir = home / "Jo Smith" / "bin"
-            env = {"PATH": path, "IRONMEM_INSTALL_DIR": str(install_dir)}
+        # A space needs shell quoting; a `"` or `\` also needs JSON escaping.
+        for dir_name in ("Jo Smith", 'Jo "JJ" \\ Smith'):
+            with self.subTest(dir_name=dir_name), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                path = self.path_without_jq(home / "no-jq-bin")
+                install_dir = home / dir_name / "bin"
+                env = {"PATH": path, "IRONMEM_INSTALL_DIR": str(install_dir)}
 
-            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+                result = self.run_installer(home, home / ".claude.json", extra_env=env)
 
-            program = shlex.quote(str(install_dir / "ironmem"))
-            self.assertTrue(program.startswith("'"), program)
-            self.assertIn(
-                f'"command": "{program} hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code"',
-                result.stderr,
-            )
+                [line] = [l for l in result.stderr.splitlines() if '"<Event>"' in l]
+                command = json.loads("{" + line.strip() + "}")["<Event>"][0]["hooks"][0]["command"]
+                self.assertEqual(
+                    shlex.split(command),
+                    [
+                        str(install_dir / "ironmem"),
+                        "hook",
+                        "<session-start|user-prompt-submit|stop|precompact>",
+                        "--harness",
+                        "claude-code",
+                    ],
+                )
 
     def test_existing_hooks_and_keys_are_kept(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
