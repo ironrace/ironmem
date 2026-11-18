@@ -695,12 +695,15 @@ register_json_mcpservers() {
 #
 # The merge only appends. An event that already runs `ironmem hook <name>`
 # (from any path, or through the plugin's ironmem-hook.sh) is left alone, and
-# so is every other hook and key. The file is rewritten in place (`cat >`)
-# instead of being moved over, so a settings.json symlinked into a dotfiles
-# repo stays a symlink. The matcher expects the hook name directly after
-# `hook`; a hand-wired command in another shape (say `hook --harness
-# claude-code stop`) gets a second copy appended. Keep CLAUDE_HOOK_EVENTS in
-# step with PLUGIN_HOOKS in crates/ironmem/src/doctor/hooks.rs; the unit test
+# so is every other hook and key. The result is built in a temp file and
+# written to settings.json once, after every event is decided; any failure
+# (unreadable or read-only file, dangling symlink, a jq error) prints a WARN,
+# writes nothing and lets the install go on. The write is `cat >` rather than
+# a move, so a settings.json symlinked into a dotfiles repo stays a symlink.
+# The matcher expects the hook name directly after `hook`; a hand-wired command
+# in another shape (say `hook --harness claude-code stop`) gets a second copy
+# appended. Keep CLAUDE_HOOK_EVENTS in step with PLUGIN_HOOKS in
+# crates/ironmem/src/doctor/hooks.rs; the unit test
 # plugin_hooks_table_matches_the_plugin_hooks_json pins that table to
 # hooks.json, and scripts/test_install_ironmem.py pins this one to it.
 CLAUDE_HOOK_EVENTS=(
@@ -710,23 +713,62 @@ CLAUDE_HOOK_EVENTS=(
   PreCompact:precompact
 )
 
-wire_claude_hooks() {
-  local settings="$1" pair event name tmp added="" kept=""
+# Reads the plugin-hook shapes it can read and warns about the rest. Never
+# fails the install: every problem prints a WARN and returns 0.
+_wire_claude_hooks_warn() {
+  echo "    WARN: $1; wired no Claude hooks." >&2
+  echo "          Fix that, then re-run this script. \`ironmem doctor\` shows what is missing." >&2
+}
 
-  if [[ ! -f "$settings" ]]; then
-    mkdir -p "$(dirname "$settings")"
-    printf '{}\n' > "$settings"
+# Does hooks.<event> already run `ironmem hook <name>`? Exit 0 yes, 1 no, 2+ a
+# jq error (the caller warns on that rather than reading it as "no").
+_claude_hook_is_wired() {
+  jq -e --arg ev "$2" --arg name "$3" '
+      [(.hooks[$ev] // [])[] | objects | (.hooks // []) | arrays | .[] | objects | .command | strings]
+      | any(test("(^|[/\\s\"\u0027])ironmem(-mcp\\.sh)?[\"\u0027]?\\s+hook\\s+" + $name + "([\\s;&|)<>\"\u0027]|$)")
+            or test("(^|[/\\s\"\u0027])ironmem-hook\\.sh[\"\u0027]?\\s+" + $name + "([\\s;&|)<>\"\u0027]|$)"))' \
+    "$1" >/dev/null 2>&1
+}
+
+wire_claude_hooks() {
+  local settings="$1" work next
+  work="$(mktemp)" || { _wire_claude_hooks_warn "could not create a temp file"; return 0; }
+  next="$work.next"
+  _wire_claude_hooks_into "$settings" "$work" "$next" || true
+  rm -f "$work" "$next"
+  return 0
+}
+
+# Builds the whole result in $work, then writes $settings once.
+_wire_claude_hooks_into() {
+  local settings="$1" work="$2" next="$3" pair event name rc added="" kept="" mining=""
+
+  if [[ -L "$settings" && ! -e "$settings" ]]; then
+    _wire_claude_hooks_warn "$settings is a dangling symlink"
+    return 0
+  fi
+  if [[ -e "$settings" ]]; then
+    if [[ ! -f "$settings" || ! -w "$settings" || ! -r "$settings" ]]; then
+      _wire_claude_hooks_warn "$settings is not a readable, writable file"
+      return 0
+    fi
+    cp "$settings" "$work" 2>/dev/null || { _wire_claude_hooks_warn "could not read $settings"; return 0; }
+  else
+    if ! mkdir -p "$(dirname "$settings")" 2>/dev/null || [[ ! -w "$(dirname "$settings")" ]]; then
+      _wire_claude_hooks_warn "cannot create $settings"
+      return 0
+    fi
+    printf '{}\n' > "$work"
   fi
 
   if ! jq -e 'type == "object" and ((.hooks // {}) | type == "object" and all(.[]; type == "array"))' \
-    "$settings" >/dev/null 2>&1; then
-    echo "    WARN: $settings is not a JSON object with array-valued hooks; wired no Claude hooks." >&2
-    echo "          Fix the file, then re-run this script. \`ironmem doctor\` shows what is missing." >&2
+    "$work" >/dev/null 2>&1; then
+    _wire_claude_hooks_warn "$settings is not a JSON object with array-valued hooks"
     return 0
   fi
 
   if jq -e '(.enabledPlugins // {}) | to_entries | any((.key == "ironmem" or (.key | startswith("ironmem@"))) and .value == true)' \
-    "$settings" >/dev/null 2>&1; then
+    "$work" >/dev/null 2>&1; then
     echo "    Claude hooks come from the enabled ironmem plugin; wired none in $settings"
     return 0
   fi
@@ -734,26 +776,39 @@ wire_claude_hooks() {
   for pair in "${CLAUDE_HOOK_EVENTS[@]}"; do
     event="${pair%%:*}"
     name="${pair#*:}"
-    if jq -e --arg ev "$event" --arg name "$name" '
-        [(.hooks[$ev] // [])[] | (.hooks // [])[] | (.command // "")]
-        | any(test("(^|[/\\s\"\u0027])ironmem(-mcp\\.sh)?[\"\u0027]?\\s+hook\\s+" + $name + "([\\s;&|)\"\u0027]|$)")
-              or test("ironmem-hook\\.sh[\"\u0027]?\\s+" + $name + "([\\s;&|)\"\u0027]|$)"))' \
-      "$settings" >/dev/null 2>&1; then
+    _claude_hook_is_wired "$work" "$event" "$name" && rc=0 || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
       kept+="$event "
       continue
+    elif [[ "$rc" -ne 1 ]]; then
+      _wire_claude_hooks_warn "jq failed reading the $event hooks in $settings"
+      return 0
     fi
-    tmp="$(mktemp)"
-    jq --arg ev "$event" --arg cmd "$TARGET hook $name --harness claude-code" \
+    if ! jq --arg ev "$event" --arg cmd "$TARGET hook $name --harness claude-code" \
       '.hooks = (.hooks // {}) | .hooks[$ev] = ((.hooks[$ev] // []) + [{hooks: [{type: "command", command: $cmd}]}])' \
-      "$settings" > "$tmp"
-    cat "$tmp" > "$settings"
-    rm -f "$tmp"
+      "$work" > "$next" 2>/dev/null || [[ ! -s "$next" ]]; then
+      _wire_claude_hooks_warn "jq failed adding the $event hook to $settings"
+      return 0
+    fi
+    mv -f "$next" "$work"
     added+="$event "
+    case "$event" in Stop | PreCompact) mining+="$event " ;; esac
   done
 
   if [[ -n "$added" ]]; then
+    if ! jq -e 'type == "object"' "$work" >/dev/null 2>&1 || [[ ! -s "$work" ]]; then
+      _wire_claude_hooks_warn "the merged $settings was not a JSON object"
+      return 0
+    fi
+    # In place, not mv: a settings.json symlinked into a dotfiles repo stays one.
+    if ! cat "$work" > "$settings" 2>/dev/null; then
+      _wire_claude_hooks_warn "could not write $settings"
+      return 0
+    fi
     echo "==> Wired Claude hooks in $settings: ${added% }"
-    echo "    They run read-only: prompt recall works; Stop and PreCompact skip mining (see \`ironmem doctor\`)."
+    if [[ -n "$mining" ]]; then
+      echo "    ${mining% } run read-only and skip mining (see \`ironmem doctor\`); prompt recall still works."
+    fi
   fi
   if [[ -n "$kept" ]]; then
     echo "    Claude hooks already wired, left as they are: ${kept% }"
@@ -878,8 +933,8 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     echo "          \"schema_version\": 1 alongside \"mcpServers\" if you are creating that file:" >&2
     echo "          { \"schema_version\": 1, \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" }, \"mode\": \"optional\" } } }" >&2
     echo "          Claude Code hooks were not wired either. Add these four to $CLAUDE_SETTINGS_JSON" >&2
-    echo "          under \"hooks\" (SessionStart, UserPromptSubmit, Stop, PreCompact), each as" >&2
-    echo "          { \"hooks\": [ { \"type\": \"command\", \"command\": \"$TARGET hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] }" >&2
+    echo "          under \"hooks\", one key each for SessionStart, UserPromptSubmit, Stop and PreCompact, shaped as" >&2
+    echo "          \"<Event>\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"$TARGET hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] } ]" >&2
   else
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \

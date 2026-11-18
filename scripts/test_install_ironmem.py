@@ -82,31 +82,37 @@ class InstallIronmemSelfTest(unittest.TestCase):
             command.append("--skip-skills")
         if skip_wiring:
             command.append("--skip-wiring")
+        env = {
+            **os.environ,
+            "HOME": str(home),
+            "IRONMEM_INSTALL_DIR": str(install_dir),
+            "CLAUDE_CONFIG_JSON": str(claude_config),
+            "CODEX_HOME": str(codex_home),
+            "CODEX_CONFIG_TOML": str(codex_home / "config.toml"),
+            # Pinned, not inherited: the installer now writes a Muse config,
+            # and an ambient XDG_CONFIG_HOME would send it to the developer's
+            # real ~/.config/muse instead of this temp home.
+            "XDG_CONFIG_HOME": str(home / ".config"),
+            # Pinned, not inherited: the installer now installs Muse skills
+            # through the `muse` CLI, and a developer machine with Muse on
+            # PATH would otherwise perform real managed-store installs on
+            # every full-install test. Tests that pin the Muse argv override
+            # MUSE_BIN with a recording shim.
+            "MUSE_BIN": str(home / ".no-muse-here"),
+            # Pinned, not inherited: the installer now writes Claude hooks
+            # into $CLAUDE_HOME/settings.json.
+            "CLAUDE_HOME": str(home / ".claude"),
+            **(extra_env or {}),
+        }
+        # Never inherited: a developer's own CLAUDE_SETTINGS_JSON would send the
+        # hook wiring outside the temp home. Defaults to $CLAUDE_HOME/settings.json;
+        # a test can still set it through extra_env.
+        if extra_env is None or "CLAUDE_SETTINGS_JSON" not in extra_env:
+            env.pop("CLAUDE_SETTINGS_JSON", None)
         result = subprocess.run(
             command,
             cwd=ROOT,
-            env={
-                **os.environ,
-                "HOME": str(home),
-                "IRONMEM_INSTALL_DIR": str(install_dir),
-                "CLAUDE_CONFIG_JSON": str(claude_config),
-                "CODEX_HOME": str(codex_home),
-                "CODEX_CONFIG_TOML": str(codex_home / "config.toml"),
-                # Pinned, not inherited: the installer now writes a Muse config,
-                # and an ambient XDG_CONFIG_HOME would send it to the developer's
-                # real ~/.config/muse instead of this temp home.
-                "XDG_CONFIG_HOME": str(home / ".config"),
-                # Pinned, not inherited: the installer now installs Muse skills
-                # through the `muse` CLI, and a developer machine with Muse on
-                # PATH would otherwise perform real managed-store installs on
-                # every full-install test. Tests that pin the Muse argv override
-                # MUSE_BIN with a recording shim.
-                "MUSE_BIN": str(home / ".no-muse-here"),
-                # Pinned, not inherited: the installer now writes Claude hooks
-                # into $CLAUDE_HOME/settings.json.
-                "CLAUDE_HOME": str(home / ".claude"),
-                **(extra_env or {}),
-            },
+            env=env,
             capture_output=True,
             text=True,
         )
@@ -808,7 +814,6 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 self.assertFalse((skills_dir / name).exists(), f"{name} survived on the Codex side")
             self.assertTrue((skills_dir / "pr-review-toolkit" / "SKILL.md").is_file())
 
-
     def claude_settings(self, home: pathlib.Path) -> dict[str, object]:
         return json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
 
@@ -937,7 +942,6 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.run_installer(home, home / ".claude.json", skip_wiring=True)
             self.assertFalse((home / ".claude" / "settings.json").exists())
 
-
     def stop_commands_after_install(self, existing: str) -> list[str]:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
@@ -960,12 +964,13 @@ class InstallIronmemSelfTest(unittest.TestCase):
             "'ironmem' hook stop --harness claude-code",
             'bash -c "ironmem hook stop"',
             "bash -c 'ironmem hook stop'",
+            'bash -c "ironmem-hook.sh stop"',
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.stop_commands_after_install(command), [command])
 
     def test_shell_terminator_after_the_hook_name_counts_as_wired(self) -> None:
-        for tail in ("; true", " && true", " || true", " | cat", " &", ")", '"', "'"):
+        for tail in ("; true", " && true", " || true", " | cat", " &", ")", '"', "'", ">/dev/null", "</dev/null"):
             command = f"~/.ironrace/bin/ironmem hook stop{tail}"
             with self.subTest(command=command):
                 self.assertEqual(self.stop_commands_after_install(command), [command])
@@ -978,10 +983,134 @@ class InstallIronmemSelfTest(unittest.TestCase):
             "~/.ironrace/bin/ironmem hook stop-foo --harness claude-code",
             "notironmem hook stop",
             "my-ironmem hook stop",
+            "bash /x/notironmem-hook.sh stop",
         ):
             with self.subTest(command=command):
                 own = "<target> hook stop --harness claude-code"
                 self.assertEqual(self.stop_commands_after_install(command), [command, own])
+
+
+    def settings_with_stop(self, home: pathlib.Path, stop: object) -> pathlib.Path:
+        path = home / ".claude" / "settings.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({"hooks": {"Stop": stop}}), encoding="utf-8")
+        return path
+
+    def jq_stub(self, home: pathlib.Path, fail_when: str) -> dict[str, str]:
+        """PATH env whose `jq` exits 5 when the joined argv contains every word in
+        `fail_when` and otherwise runs the real jq."""
+        bin_dir = home / "stub-bin"
+        bin_dir.mkdir()
+        checks = " && ".join(f'[[ "$*" == *{word}* ]]' for word in fail_when.split("|"))
+        stub = bin_dir / "jq"
+        stub.write_text(
+            f'#!/usr/bin/env bash\nif {checks}; then echo "stub jq failure" >&2; exit 5; fi\n'
+            f'exec {shutil.which("jq")} "$@"\n',
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        return {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
+
+    def test_read_only_settings_warns_and_the_install_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_text(encoding="utf-8")
+            path.chmod(0o444)
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+            self.assertIn("WARN", result.stderr)
+            self.assertIn("wired no Claude hooks", result.stderr)
+            self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
+
+    def test_a_jq_failure_while_appending_writes_nothing_and_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_text(encoding="utf-8")
+            env = self.jq_stub(home, "[{hooks|UserPromptSubmit")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before, "written at most once, after all events")
+            self.assertIn("wired no Claude hooks", result.stderr)
+            self.assertNotIn("Wired Claude hooks", result.stdout)
+            self.assertTrue((home / ".codex" / "config.toml").read_text(encoding="utf-8"))
+
+    def test_a_jq_error_in_the_matcher_is_not_read_as_not_wired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_text(encoding="utf-8")
+            env = self.jq_stub(home, "--arg|name")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+            self.assertIn("wired no Claude hooks", result.stderr)
+
+    def test_junk_entries_neither_abort_nor_multiply_hooks(self) -> None:
+        junk_shapes = (
+            "oops",
+            {"matcher": "x"},
+            {"hooks": [{"type": "command", "command": 5}]},
+        )
+        for junk in junk_shapes:
+            with self.subTest(junk=junk), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                self.settings_with_stop(home, [junk])
+
+                self.run_installer(home, home / ".claude.json")
+                self.run_installer(home, home / ".claude.json")
+
+                stop = self.claude_settings(home)["hooks"]["Stop"]
+                self.assertEqual(stop[0], junk, "junk left untouched")
+                self.assertEqual(len(stop), 2, stop)
+                self.assertIn("hook stop --harness claude-code", json.dumps(stop[1]))
+
+    def test_dangling_settings_symlink_warns_and_the_install_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            link = home / ".claude" / "settings.json"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(home / "no-such-dir" / "settings.json")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertIn("wired no Claude hooks", result.stderr)
+            self.assertFalse((home / "no-such-dir").exists())
+
+    def test_a_disabled_plugin_still_gets_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"enabledPlugins": {"ironmem@ironrace": False}}), encoding="utf-8")
+
+            self.run_installer(home, home / ".claude.json")
+
+            self.assertEqual(set(self.claude_settings(home)["hooks"]), set(self.plugin_hook_names()))
+
+    def test_skip_mining_note_only_when_a_mining_hook_was_added(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            path.parent.mkdir(parents=True)
+            wrapper = "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh"
+            hooks = {
+                event: [{"hooks": [{"type": "command", "command": f"{wrapper} {name}"}]}]
+                for event, name in self.plugin_hook_names().items()
+                if event != "SessionStart"
+            }
+            path.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertIn("Wired Claude hooks", result.stdout)
+            self.assertIn("SessionStart", result.stdout)
+            self.assertNotIn("skip mining", result.stdout)
 
 
 if __name__ == "__main__":
