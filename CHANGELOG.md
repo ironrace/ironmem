@@ -181,7 +181,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ironmem autopilot` commands are not known to start a process while
   another thread drops a lock. The lock is now unlocked explicitly before
   its file is closed, and an unlock that fails is logged as a warning.
-
 - **Search no longer drops its keyword leg for hyphenated queries.** A query
   containing `non-plugin`, `read-only` or an id like `handoff-issue-377` was
   rejected by FTS5, which read the `-` as a column filter, and the rejection was
