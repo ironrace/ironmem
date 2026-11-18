@@ -734,9 +734,7 @@ fn parse_label_list(stdout: &str) -> Result<Vec<String>, MemoryError> {
         MemoryError::Validation(format!("could not parse `gh label list --json name`: {e}"))
     })?;
     let names: Vec<String> = raw.into_iter().map(|label| label.name).collect();
-    // `LabelJson` defaults a missing `name` to "", and GitHub label names
-    // cannot be empty: a blank one is output this parser does not
-    // understand, not a label.
+    // `LabelJson` defaults a missing `name` to "".
     if names.iter().any(|name| name.trim().is_empty()) {
         return Err(MemoryError::Validation(
             "`gh label list --json name` returned a label with no name — the output is not \
@@ -2862,9 +2860,7 @@ mod tests {
                 "name"
             ]
         );
-        // `--search` matches names AND descriptions, fuzzily: on one repo
-        // `--search "risk:"` returned `sev:critical`. Matching is done on the
-        // returned names instead.
+        // See `label_list_argv`: `--search` is fuzzy.
         assert!(!argv.iter().any(|arg| arg == "--search" || arg == "-S"));
     }
 

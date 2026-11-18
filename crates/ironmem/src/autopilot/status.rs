@@ -1,11 +1,12 @@
 //! Read-only status of one repo's unattended-route prerequisites (#420).
 //!
-//! `ironmem autopilot status <owner/repo>` answers two questions the
-//! `/evaluate-issue` router asks before it recommends GOAL or AUTOPILOT: does
-//! the repo have an approved gate config, and does it have the labels
-//! Autopilot needs. Before this module the router answered the first by
-//! reading Autopilot's drawer directly, which tied prose instructions to a
-//! storage layout.
+//! `ironmem autopilot status <owner/repo>` reports a repo's gate config and
+//! its `agent:*` / `risk:*` labels. The `/evaluate-issue` router reads the
+//! exit status, `gate_config` and `db` from it before it recommends GOAL or
+//! AUTOPILOT; it reads labels with its own `gh label list` calls
+//! (`docs/EVALUATE_ISSUE.md`, Step 2; moving them onto this report is #428).
+//! The gate config is a command's output so that the router's prose does not
+//! depend on Autopilot's storage layout.
 //!
 //! # Read-only by how the database is opened
 //!
@@ -39,9 +40,10 @@
 //! [`LabelStatus`] is an enum, not a struct of optional fields: when `gh` is
 //! missing or could not be started, exited non-zero, printed output that is
 //! not the expected JSON, returned a label row with no name, returned a list
-//! long enough to have been cut off, or was never run because `--path` is not
-//! a directory it can run in, the status is [`LabelStatus::Failed`] and
-//! carries no label answers at all. Its JSON has no `agent` or `risk` key, so
+//! long enough to have been cut off, or was never run because `--path` is
+//! missing, is not a directory or cannot be examined, the status is
+//! [`LabelStatus::Failed`] and carries no label answers at all. Its JSON has
+//! no `agent` or `risk` key, so
 //! a consumer must check `read` first; a strict lookup finds nothing, though a
 //! loose one (a missing key read as false) can still be fooled, which is why
 //! `read` exists.
@@ -64,10 +66,11 @@ use super::gh::{repo_labels, GhCli, GhRunner};
 use super::labels::AgentLabel;
 use super::{repo_slug, validate_repo};
 
-/// A repo name that passed the shape check: `owner/name` or `host/owner/name`,
-/// each part non-empty, made only of ASCII letters, digits, `.`, `_` and `-`,
-/// not starting with `-` and not made only of `.`, and with a name that does
-/// not end in `.git`. The check does not know every name `gh` refuses.
+/// A repo name that passed the shape check: at most 200 characters,
+/// `owner/name` or `host/owner/name`, each part non-empty, made only of ASCII
+/// letters, digits, `.`, `_` and `-`, not starting with `-` and not made only
+/// of `.`, and with a name that does not end in `.git`. The check does not
+/// know every name `gh` refuses.
 ///
 /// Every character it lets through is one a POSIX shell reads literally, so
 /// the report's hints print a name without quoting it.
@@ -349,8 +352,8 @@ pub enum StatusError {
 
 impl StatusError {
     /// Classify a failure of the open or of a read: a SQLite error names
-    /// `db_path` and carries the hint that is true of it, anything else
-    /// passes through.
+    /// `db_path` and carries the hint its result code selects, if any;
+    /// anything else passes through.
     fn from_read(db_path: &Path, err: MemoryError) -> Self {
         match err {
             MemoryError::Db(source) => Self::Database {
@@ -418,18 +421,22 @@ fn broken_under_another_name(asked: &RepoName, db: &Path, rows: &[BrokenGateConf
     )
 }
 
-/// The extra sentence a [`StatusError::Database`] carries, for the SQLite
-/// errors it is true of.
+/// The extra sentence a [`StatusError::Database`] carries: one for a
+/// read-only failure, and one for a file that is not an ironmem database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbHint {
-    /// SQLite refused the read as read-only.
+    /// SQLite refused the read as read-only. The sentence describes one
+    /// cause: a WAL-mode database whose `-wal`/`-shm` files are missing, in
+    /// a directory SQLite cannot write. The match is on the primary result
+    /// code, so any other read-only failure gets the same sentence.
     WalSideFiles,
     /// The file is not a database, or is one without ironmem's tables.
     NotAnIronmemDatabase,
 }
 
 impl DbHint {
-    /// The hint that is true of `e`. A busy or locked database gets none.
+    /// The hint for `e`, chosen by its primary result code and, for a
+    /// missing table, its message. A busy or locked database gets none.
     fn for_error(e: &rusqlite::Error) -> Option<Self> {
         let rusqlite::Error::SqliteFailure(failure, detail) = e else {
             return None;
@@ -517,8 +524,8 @@ impl From<StatusError> for MemoryError {
 }
 
 /// Everything `ironmem autopilot status` reports for one repo. Its
-/// serialized form is the command's `--json` output, a contract the
-/// `/evaluate-issue` router reads.
+/// serialized form is the command's `--json` output. The `/evaluate-issue`
+/// router depends on `gate_config` and `db`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepoStatus {
     repo: RepoName,
@@ -659,8 +666,8 @@ impl LabelStatus {
     /// Read `repo`'s labels with the `gh` on `PATH`, run in `path`. Never an
     /// `Err`: a `path` that is not a directory or cannot be examined, a `gh`
     /// that cannot be found and every failure of the read itself are
-    /// [`LabelStatus::Failed`], so one unreadable half of the report does not
-    /// hide the other.
+    /// [`LabelStatus::Failed`], so an unreadable label list does not hide the
+    /// gate config.
     fn read_in(path: &Path, repo: &RepoName) -> Self {
         match std::fs::metadata(path) {
             Ok(found) if found.is_dir() => {}
@@ -2131,7 +2138,7 @@ mod tests {
 
     #[test]
     fn risk_labels_sort_case_insensitively_where_a_byte_sort_would_differ() {
-        // A byte sort would put the capital `Z` first.
+        // A byte sort would put `Risk:Zeta` first, on its capital `R`.
         let status = read_labels(&["Risk:Zeta", "risk:alpha"]);
         assert_eq!(
             status,

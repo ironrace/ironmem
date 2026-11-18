@@ -989,17 +989,28 @@ enum AutopilotCmd {
     /// Exit status: 0 when a report was printed. That includes a repo that
     /// is not onboarded (`"onboarded": false`, `"gate_config": null`) and
     /// labels that could not be read (`"labels": {"read": "failed", ...}`).
-    /// 1 when the gate config could not be read: the repo is not an
-    /// `owner/name` (or `host/owner/name`), each part made of letters, digits,
-    /// `.`, `_` and `-` and not starting with `-` (a `.git` suffix is
-    /// refused too), the database is missing, not an ironmem database or not
-    /// readable, its path cannot be made absolute (an empty `--db`) or is not
-    /// UTF-8, the stored config does not parse or belongs to another repo
-    /// name, a config is stored under a name that differs only in letter case
+    /// 2 for a usage error, which includes an argument that is not UTF-8.
+    /// 1 when there is no report, for one of the reasons below;
+    /// docs/AUTOPILOT.md describes each.
+    ///
+    /// The repo is not an `owner/name` (or `host/owner/name`) of at most 200
+    /// characters, each part made of letters, digits, `.`, `_` and `-`, not
+    /// starting with `-` and not made only of `.`; or it ends in `.git`.
+    ///
+    /// The database is missing, cannot be reached or opened, or is not an
+    /// ironmem database; its path cannot be made absolute (an empty `--db`);
+    /// or its absolute path is not UTF-8.
+    ///
+    /// The stored config does not parse, whether it is stored under this
+    /// name or under another spelling of it, or it belongs to another repo
+    /// name; a config is stored under a name that differs only in letter case
     /// or in whether it names a host (the error names it; two names with
-    /// different hosts never match), or an ironmem environment setting
-    /// is invalid (for example `IRONMEM_MCP_MODE`, as for every command).
-    /// 2 for a usage error.
+    /// different hosts never match); or 1000 or more configs are stored and
+    /// none is under this exact name.
+    ///
+    /// An ironmem environment setting is invalid (`IRONMEM_MCP_MODE` or
+    /// `IRONMEM_EMBED_MODE`, as for every command that loads the ironmem
+    /// config), or the report could not be written to stdout.
     Status {
         /// Path to the database
         #[arg(long)]
@@ -1627,7 +1638,8 @@ fn open_controller_db(db: Option<String>) -> Result<ironmem::db::schema::Databas
 }
 
 /// Load config, open, and migrate the database — the sequence every
-/// `Autopilot` subcommand handler needs before touching storage. Several
+/// `Autopilot` subcommand handler but `status` needs before touching storage
+/// (`status` reads through a read-only open and never migrates). Several
 /// other command handlers in this file repeat the same three-line sequence
 /// inline rather than through a shared helper; that pre-existing duplication
 /// is out of scope here, but the new `Autopilot` arms at least don't add
@@ -3591,8 +3603,10 @@ after {n} attempt(s)",
                 // Parsed here and not by clap, whose own parse failure exits
                 // 2: a malformed repo name is exit 1.
                 let repo = RepoName::parse(&repo)?;
-                // A read-only open, never `open_migrated_db`: this command
-                // must not create a missing database or migrate an old one.
+                // `read_gate_config_status` opens the database read-only.
+                // Not `open_migrated_db`, which opens read-write and
+                // migrates: this command must not create a missing database
+                // or migrate an old one.
                 let read = read_gate_config_status(&cfg.db_path, &repo)?;
                 // Never an error: a label read that fails is part of the
                 // report, and the gate config is still reported.
@@ -3601,7 +3615,8 @@ after {n} attempt(s)",
                     format!("{}\n", serde_json::to_string_pretty(&status)?)
                 } else {
                     // Hint `--db` only when one was given; the hint carries the
-                    // report's absolute path, so it works from any directory.
+                    // report's absolute path, so `--db` names the same file
+                    // from any directory.
                     render_text(&status, db.is_some())
                 };
                 // Not `print!`, which panics (exit 101) when stdout is a

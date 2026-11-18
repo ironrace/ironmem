@@ -16,14 +16,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database that answered. It never creates, migrates or writes the database
   file (SQLite may leave its `-wal`/`-shm` side files) and only asks `gh` to
   list labels. It exits 0 whenever it prints a report, including for a repo
-  that is not onboarded, and 1 for an unreadable gate config or a malformed
-  repo name; a name that differs from an onboarded repo's only in letter
-  case, or in whether it names a host, is an error naming the stored name,
-  not "not onboarded". A
-  `gh` failure is reported as a failed label read, not as missing
-  labels. `/evaluate-issue` now reads the gate config from this command
-  instead of from Autopilot's drawer, and when a phase-2 remainder is lost
-  to a missing prerequisite or a failed read, it says so under *Why*.
+  that is not onboarded, and 1, with no report, when the gate config could
+  not be read or the report could not be written to stdout. Exit 1 covers a
+  malformed repo name (a part made only of `.` is refused), an unreadable
+  database, a stored config that does not parse, whether it is stored under
+  the name asked about or under another spelling of it, and a database
+  holding 1000 or more gate configs when none is under the exact name
+  (#426). A name that differs from an onboarded repo's only in letter case,
+  or in whether it names a host, is an error naming the stored name, not
+  "not onboarded". A `gh` failure is reported as a failed label read, not as
+  missing labels.
+  This changes `/evaluate-issue`: it reads the gate config from this command
+  instead of from Autopilot's drawer, so it needs an `ironmem` on `PATH`
+  that has `status`, and reports a failed read without one. Its `onboard`
+  and `approve` fix lines carry `--db '<db>'`, the database the report
+  named; a pending config has a fix line of its own; a failed read gets
+  neither command; and the check before a phase-2 GOAL is
+  `ironmem autopilot status <owner>/<repo> --db '<db>'`, which the user
+  runs. When a phase-2 remainder is lost to a missing prerequisite or a
+  failed read, the router says so under *Why*.
 
 ### Changed
 

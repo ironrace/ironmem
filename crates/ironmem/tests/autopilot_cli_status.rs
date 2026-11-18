@@ -23,9 +23,8 @@ use serde_json::{json, Value};
 mod autopilot_support;
 use autopilot_support::{executable, ironmem, isolated_path, REPO};
 
-/// Bash builtins only, so it runs on a PATH that holds nothing else. The log
-/// holds one line per argument, so two arguments cannot read as one that has
-/// a space in it.
+/// Bash builtins only, so it needs nothing from PATH. The log holds one line
+/// per argument, so two arguments cannot read as one that has a space in it.
 const GH_STUB: &str = r#"#!/bin/bash
 printf '%s\n' gh "$@" >> "$GH_LOG"
 pwd > "$GH_LOG.cwd"
@@ -40,7 +39,9 @@ fi
 printf '%s\n' "$GH_LABELS"
 "#;
 
-/// Every label Autopilot needs, plus two that only resemble them.
+/// All three `agent:*` labels and two `risk:*` labels, plus two that are
+/// neither: `bug`, and `sev:critical`, which a fuzzy `--search "risk:"`
+/// returns.
 const ALL_LABELS: &str = r#"[{"name":"bug"},{"name":"agent:blocked"},{"name":"agent:ready"},{"name":"agent:exhausted"},{"name":"risk:logic"},{"name":"risk:documentation"},{"name":"sev:critical"}]"#;
 
 /// The one `gh` call a status run for [`REPO`] may make, one argument per
@@ -110,8 +111,10 @@ impl Fixture {
 
     /// The one place a run's environment is set: `path_var` as `PATH`, the
     /// fixture's empty directory as `HOME`, the stub answering `labels` (or
-    /// failing with `fail` on stderr), and the ambient `IRONMEM_*` settings
-    /// removed so a developer's shell cannot change the result.
+    /// failing with `fail` on stderr), and `IRONMEM_DB_PATH`,
+    /// `IRONMEM_MCP_MODE` and `IRONMEM_EMBED_MODE` removed: the settings that
+    /// redirect the database or fail config loading, so a developer's shell
+    /// cannot change the result.
     fn env(&self, command: &mut Command, path_var: &Path, labels: &str, fail: Option<&str>) {
         command
             .env("PATH", path_var)
@@ -483,6 +486,7 @@ fn status_changes_nothing_in_the_database() {
     let db = fixture.db_path();
     // SQLite may create `-wal`/`-shm` side files next to a WAL database; they
     // are not asserted on here, only the database file itself.
+    //
     // `Database::open`, the read-write opener, re-chmods the file to 0600.
     // A mode it would not leave alone shows which opener ran.
     std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o640)).unwrap();
@@ -952,7 +956,8 @@ fn a_stored_config_that_does_not_parse_exits_one_and_the_remedy_it_names_works()
 #[test]
 fn a_broken_config_under_another_spelling_exits_one_instead_of_reading_not_onboarded() {
     let fixture = Fixture::new();
-    // Onboarded as `Owner/Repo`, and the stored row no longer parses.
+    // Onboarded as `Owner/Repo`; the row is then overwritten with one that
+    // does not parse.
     fixture.propose("Owner/Repo", &["cargo test"]);
     overwrite_the_gate_config(&fixture.db_path(), &no_gate("Owner/Repo"));
 
@@ -1049,9 +1054,10 @@ fn a_git_suffix_exits_one() {
 
 #[test]
 fn a_host_with_a_port_and_a_full_url_exit_one() {
-    // Each ends in the onboarded `owner/repo`, so a status that stopped
-    // refusing the shape would answer with that repo's near-miss error
-    // instead; the message pins which rule refused it.
+    // Each ends in the onboarded `owner/repo`. A status that stopped refusing
+    // the shape would answer the first two with that repo's near-miss error
+    // and report the third as not onboarded (its owner part would be
+    // `git@github.com:owner`); the message pins which rule refused it.
     for name in [
         "ghe.example.com:8443/owner/repo",
         "https://github.com/owner/repo",

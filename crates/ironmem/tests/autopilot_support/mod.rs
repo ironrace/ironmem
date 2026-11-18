@@ -1,5 +1,6 @@
 //! Fixtures shared by the Autopilot public-CLI test binaries
-//! (`autopilot_cli_implementer.rs`, `autopilot_cli_muse.rs`).
+//! (`autopilot_cli_implementer.rs`, `autopilot_cli_muse.rs`,
+//! `autopilot_cli_status.rs`).
 //!
 //! Kept apart from `tests/common`, which is the collab and MCP fixture
 //! module. Rust compiles each file in `tests/` into its own binary, so each

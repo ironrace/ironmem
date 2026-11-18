@@ -213,8 +213,9 @@ fn validate_wall_clock_timeout(secs: Option<u64>) -> Result<(), String> {
 /// The logical-key prefix every gate config's key starts with.
 const GATE_CONFIG_KEY_PREFIX: &str = "gate-config:";
 
-/// How many stored gate configs [`stored_gate_configs_read_only`] will list.
-/// A listing that fills it may be incomplete, so it is an error.
+/// The row limit [`stored_gate_configs_read_only`] asks for. A listing that
+/// reaches it may be incomplete, so it is an error: the most that is ever
+/// listed is one fewer.
 const STORED_GATE_CONFIG_LIMIT: usize = 1000;
 
 fn gate_config_key(repo: &str) -> String {
@@ -260,7 +261,7 @@ pub(super) enum StoredGateConfigsError {
     /// The read failed.
     Read(MemoryError),
     /// The listing reached [`STORED_GATE_CONFIG_LIMIT`] rows, so it may be
-    /// incomplete, and an incomplete list cannot show that no near-match
+    /// incomplete, and an incomplete list cannot show that no near-miss
     /// exists.
     LimitReached { limit: usize },
 }
@@ -1108,7 +1109,7 @@ mod tests {
 
     #[test]
     fn a_listing_that_fills_the_limit_is_refused() {
-        // A listing cut off at the limit cannot show that no near-match
+        // A listing cut off at the limit cannot show that no near-miss
         // exists, and the query asks for no more rows than the limit, so the
         // count can reach it and never pass it.
         let (_dir, path) = on_disk_db();

@@ -868,11 +868,13 @@ ironmem autopilot status owner/repo [--json] [--db <path>] [--path <dir>]
 ```
 
 `status` reports whether the repo has a gate config, the config's state
-(`pending` or `approved`), its gate commands and its `proposed_at` /
-`approved_at` times, and which of the three `agent:*` labels and which
-`risk:*` labels the repo has. `--path` is the directory `gh` runs in.
+(`pending` or `approved`), its gate commands, the warnings recorded on its
+proposal (`manifest_warnings`) and its `proposed_at` / `approved_at` times,
+and which of the three `agent:*` labels and which `risk:*` labels the repo
+has. `--path` is the directory `gh` runs in.
 `--db` defaults to `IRONMEM_DB_PATH`, then `~/.ironrace-memory/memory.sqlite3`;
-the report's `db` says which database answered.
+the report's `db` says which database answered. An `IRONMEM_DB_PATH` that is
+not valid Unicode is passed over for the default without a message (#427).
 
 It never creates, migrates or writes the database file, and it only asks `gh`
 to list the repo's labels. It may leave SQLite's `-wal`/`-shm` side files next
@@ -883,8 +885,62 @@ descriptions.
 | Exit status | Meaning |
 |---|---|
 | `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
-| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), each part made of letters, digits, `.`, `_` and `-` and not starting with `-`, the database is missing, is not an ironmem database or is not readable, or its path cannot be made absolute (an empty `--db`) or is not UTF-8, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or a config is stored under a name that differs only in letter case or in whether it names a host (the error names it), or the name ends in `.git`, or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
-| `2` | A usage error. An `ironmem` too old to know `status` also exits 2. |
+| `1` | No report: the gate config could not be read, or the report could not be written. The error is on stderr; the causes are listed below. |
+| `2` | A usage error, which includes an argument that is not valid UTF-8. An `ironmem` too old to know `status` also exits 2. |
+
+Exit 1 has these causes. Every one but the last prints nothing on stdout.
+
+- **The name is not a repo name.** It must be `owner/name` or
+  `host/owner/name`. Each part holds only ASCII letters, digits, `.`, `_` and
+  `-`, does not start with `-`, and is not made only of `.`: `owner/..` is
+  refused, while `owner/.github`, `owner/a..b` and `owner/repo.` are accepted.
+  A name that ends in `.git`, a host with a port and a full URL are refused
+  (`gh` does not resolve the first two). So is a name longer than 200
+  characters or one holding a control character, each with its own message.
+  The name is checked before the database is opened.
+- **The database cannot be read.** A path with no file at it is
+  `db not found at <path>`, and the message points at `--db <path>` and
+  `IRONMEM_DB_PATH`. A path that cannot be examined (a parent directory this
+  user may not search, say) is `could not reach the database at <path>:
+  <os error>`. A file that is there and cannot be opened is
+  `could not open the database at <path>`. Any other SQLite failure is
+  `could not read the database at <path>: <SQLite's error>`: a file that is
+  not a database, and a database without ironmem's tables, fail this way.
+  Each of these names the database by its absolute path, even when `--db`
+  was relative. A `--db` that names a directory fails with whatever SQLite
+  says about it, which differs by platform. Reading a WAL database from a
+  read-only directory fails when its `-wal`/`-shm` side files are missing,
+  because SQLite cannot create them.
+- **The database path cannot be reported exactly.** An empty `--db` cannot be
+  made absolute. A path whose absolute form is not valid UTF-8 is refused
+  before it is opened: that is a default database under a home directory, or
+  a relative path under a working directory, whose own path is not UTF-8. A
+  `--db` argument that is itself not UTF-8 never gets this far: it is a usage
+  error, exit 2.
+- **The stored config does not parse.** Under the exact name, the error names
+  the repo and the database and gives the `onboard` and `approve` commands,
+  with `--db`, that replace the config. A config that does not parse and
+  could be this repo's under another spelling of its name is an error too,
+  naming the key it is stored under and the database. It is matched by the
+  `repo` the stored config still holds, under the letter-case and host rule
+  below. A config that holds no `repo` naming an owner is matched by the name
+  in its storage key instead, which can also match the name of an unrelated
+  repo: a config that is not JSON, stored for `foo-bar/baz`, makes
+  `status bar/baz` exit 1.
+- **A config is stored under another spelling of the name**: one that differs
+  only in letter case, or in whether it names a host. The error names the
+  stored name. When a config that parses and one that does not both match,
+  this is the error reported.
+- **The stored config belongs to another repo name.** Two names that differ
+  only in `/` versus `-` share one storage key.
+- **1000 or more gate configs are stored and none is under the exact name.**
+  `status` compares fewer than that with the name, so it cannot rule out a
+  config stored under another spelling (#426). A repo asked about by the exact
+  name it was onboarded under is still answered.
+- **An ironmem environment setting is invalid**: `IRONMEM_MCP_MODE` or
+  `IRONMEM_EMBED_MODE`, as for every command that loads the ironmem config.
+- **The report cannot be written to stdout** (a closed pipe, a full disk):
+  `could not write the report to stdout: <os error>`.
 
 `--json` prints this shape:
 
@@ -908,10 +964,11 @@ descriptions.
 }
 ```
 
-- `db` is the absolute path of the database that answered. A path that
-  cannot be made absolute, or that is not UTF-8, exits 1 instead of being
-  reported inexactly.
-- A repo that was never onboarded has `"onboarded": false` and
+- `db` is the absolute path of the database that answered.
+- `onboarded` is `true` as soon as a gate config is stored, a pending one
+  included: it is `true` exactly when `gate_config` is not `null`. It says
+  nothing about approval, which is `gate_config.state`, or about labels. A
+  repo that was never onboarded has `"onboarded": false` and
   `"gate_config": null`.
 - The name must be the one the repo was onboarded under. A name that differs
   from an onboarded one only in letter case, or in that only one of the two
@@ -922,10 +979,8 @@ descriptions.
   never confused, so a same-named repo on another host is asked about with
   its host. When the error is about a host on one side only and the repo
   asked about is on another host, it is not onboarded; the error says so.
-  A three-part name is read as `host/owner/name`.
-  Each part may hold only letters, digits, `.`, `_` and `-` and may not start
-  with `-`. A `.git` suffix and a host with a port are refused (`gh` does not
-  resolve them), and so is a full URL.
+  A three-part name is read as `host/owner/name`. The characters a name may
+  hold are listed under exit 1 above.
 - A pending config has `"approved_at": null`. Both fields are reported as
   stored, and only a row edited by hand can have them disagree. Go by `state`
   then, as the Lead does: the text report prints `approved: time not recorded`
@@ -933,11 +988,20 @@ descriptions.
   carries one.
 - `manifest_warnings` lists the problems recorded on the proposal; read them
   before running `approve`. It is empty when there are none.
-- When `gh` is missing, exits non-zero (authentication, a rate limit, an
-  unknown repo), prints something that is not the expected JSON, lists a
-  label with no name, returns a list long enough to have been cut off, or `--path` is not a directory,
-  `labels` is `{"read": "failed", "error": "<what failed>"}` with no `agent`
-  or `risk` key. A failed read says nothing about which labels exist.
+- When the labels could not be read, `labels` is
+  `{"read": "failed", "error": "<what failed>"}` with no `agent` or `risk`
+  key. A failed read says nothing about which labels exist. That is the
+  report when `gh` is missing, exits non-zero (authentication, a rate limit,
+  an unknown repo), is killed by a signal, prints something that is not the
+  expected JSON, lists a label with no name, or returns 1000 or more labels,
+  a list long enough to have been cut off (#426). It is also the report when
+  `--path` is missing, is not a directory or cannot be examined: `gh` is then
+  not run, and the error says so.
+- `labels.error` is a plain sentence, with no `Not found:` or
+  `Validation error:` in front. For a `gh` that exited non-zero it gives the
+  exit code and what `gh` printed on stderr, and points at `gh auth status`.
+  For a list that may have been cut off it gives the command that checks one
+  label, `gh label list --repo <repo> --search <label> --json name`.
 - `labels.agent` keys are always the three lowercase names. `labels.risk`
   entries are spelled as they are on GitHub, not lowercased: a repo's
   `Risk:Logic` label is listed as `Risk:Logic`. GitHub label names are
@@ -945,12 +1009,15 @@ descriptions.
   entry case-insensitively.
 
 When `--db` is given, the text report's `onboard` and `approve` hints end with
-`--db` and the absolute path of the database that answered, so they act on that
-file from any directory (the `labels` hint takes no `--db`). The report's last
-line names the database.
+`--db` and the absolute path of the database that answered, so they name that
+file from any directory (the `labels` hint takes no `--db`). The `onboard`
+hint passes `--path .`, so it is run from the repo's checkout. The report's
+last line names the database.
 
 `/evaluate-issue` reads the gate config from this command
-(`docs/EVALUATE_ISSUE.md`, Step 2).
+(`docs/EVALUATE_ISSUE.md`, Step 2). It uses the exit status, `gate_config` and
+`db`. It reads the labels with its own `gh label list` calls; moving those
+onto the `labels` section is #428.
 
 ## The label taxonomy
 
