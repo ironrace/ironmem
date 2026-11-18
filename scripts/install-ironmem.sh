@@ -695,12 +695,14 @@ register_json_mcpservers() {
 #
 # The merge only appends. An event that already runs `ironmem hook <name>`
 # (from any path, or through the plugin's ironmem-hook.sh) is left alone, and
-# so is every other hook and key. The result is built in a temp file and
-# written to settings.json once, after every event is decided; any failure
-# (unreadable or read-only file, dangling symlink, a jq error) prints a WARN,
-# writes nothing and lets the install go on. The write is `cat >` rather than
-# a move, so a settings.json symlinked into a dotfiles repo stays a symlink.
-# The matcher expects the hook name directly after `hook`; a hand-wired command
+# so is every other hook and key. The result is built in temp files and
+# written to settings.json once, after every event is decided. A failure before
+# that write (unreadable or read-only file, dangling symlink, a jq error, a
+# temp-file step) prints a WARN, leaves settings.json untouched and lets the
+# install go on. The write is `cat >` rather than a move, so a settings.json
+# symlinked into a dotfiles repo stays a symlink; `cat >` truncates first, so if
+# that one write fails partway (a full disk) the file can be left incomplete,
+# and its WARN says so and names the file. Every outcome returns 0. The matcher expects the hook name directly after `hook`; a hand-wired command
 # in another shape (say `hook --harness claude-code stop`) gets a second copy
 # appended. Keep CLAUDE_HOOK_EVENTS in step with PLUGIN_HOOKS in
 # crates/ironmem/src/doctor/hooks.rs; the unit test
@@ -713,8 +715,7 @@ CLAUDE_HOOK_EVENTS=(
   PreCompact:precompact
 )
 
-# Reads the plugin-hook shapes it can read and warns about the rest. Never
-# fails the install: every problem prints a WARN and returns 0.
+# Prints the WARN every failed wiring attempt ends with; $1 says what failed.
 _wire_claude_hooks_warn() {
   echo "    WARN: $1; wired no Claude hooks." >&2
   echo "          Fix that, then re-run this script. \`ironmem doctor\` shows what is missing." >&2
@@ -730,18 +731,30 @@ _claude_hook_is_wired() {
     "$1" >/dev/null 2>&1
 }
 
+# Appends the plugin hooks missing from settings file $1, reading the hook
+# shapes it can and warning about the rest. Never fails the install: every
+# problem prints a WARN and returns 0. The temp files live in a private
+# mktemp -d directory, so no other user can plant a file at their names.
 wire_claude_hooks() {
-  local settings="$1" work next
-  work="$(mktemp)" || { _wire_claude_hooks_warn "could not create a temp file"; return 0; }
-  next="$work.next"
-  _wire_claude_hooks_into "$settings" "$work" "$next" || true
-  rm -f "$work" "$next"
+  local settings="$1" tmp_dir
+  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ironmem-hooks.XXXXXX")" || {
+    _wire_claude_hooks_warn "could not create a temp directory"
+    return 0
+  }
+  _wire_claude_hooks_into "$settings" "$tmp_dir/settings.json" "$tmp_dir/next.json" || true
+  rm -rf "$tmp_dir" 2>/dev/null || echo "    WARN: could not remove the temp directory $tmp_dir" >&2
   return 0
 }
 
-# Builds the whole result in $work, then writes $settings once.
+# Builds the whole result in $work (each step via $next), then writes
+# $settings once.
+#
+# errexit is OFF in here: wire_claude_hooks calls this under `|| true`, which
+# disables `set -e` for this function and everything it calls. A failing
+# command does not stop it, so check the status of every command that can
+# fail, and on failure WARN and return 0.
 _wire_claude_hooks_into() {
-  local settings="$1" work="$2" next="$3" pair event name rc added="" kept="" mining=""
+  local settings="$1" work="$2" next="$3" dir pair event name rc added="" kept="" mining=""
 
   if [[ -L "$settings" && ! -e "$settings" ]]; then
     _wire_claude_hooks_warn "$settings is a dangling symlink"
@@ -754,11 +767,14 @@ _wire_claude_hooks_into() {
     fi
     cp "$settings" "$work" 2>/dev/null || { _wire_claude_hooks_warn "could not read $settings"; return 0; }
   else
-    if ! mkdir -p "$(dirname "$settings")" 2>/dev/null || [[ ! -w "$(dirname "$settings")" ]]; then
+    if ! dir="$(dirname "$settings")" || ! mkdir -p "$dir" 2>/dev/null || [[ ! -w "$dir" ]]; then
       _wire_claude_hooks_warn "cannot create $settings"
       return 0
     fi
-    printf '{}\n' > "$work"
+    if ! printf '{}\n' > "$work"; then
+      _wire_claude_hooks_warn "could not write a temp file for $settings"
+      return 0
+    fi
   fi
 
   if ! jq -e 'type == "object" and ((.hooks // {}) | type == "object" and all(.[]; type == "array"))' \
@@ -767,9 +783,16 @@ _wire_claude_hooks_into() {
     return 0
   fi
 
-  if jq -e '(.enabledPlugins // {}) | to_entries | any((.key == "ironmem" or (.key | startswith("ironmem@"))) and .value == true)' \
-    "$work" >/dev/null 2>&1; then
+  # Exit 0 enabled, 1 not (a non-object enabledPlugins counts as not), else a
+  # jq error, which must not be read as "not enabled" and wire a duplicate set.
+  jq -e '[(.enabledPlugins // {}) | objects | to_entries[]
+          | select((.key == "ironmem" or (.key | startswith("ironmem@"))) and .value == true)]
+         | length > 0' "$work" >/dev/null 2>&1 && rc=0 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
     echo "    Claude hooks come from the enabled ironmem plugin; wired none in $settings"
+    return 0
+  elif [[ "$rc" -ne 1 ]]; then
+    _wire_claude_hooks_warn "jq failed reading enabledPlugins in $settings"
     return 0
   fi
 
@@ -790,7 +813,10 @@ _wire_claude_hooks_into() {
       _wire_claude_hooks_warn "jq failed adding the $event hook to $settings"
       return 0
     fi
-    mv -f "$next" "$work"
+    if ! mv -f "$next" "$work" 2>/dev/null; then
+      _wire_claude_hooks_warn "could not stage the $event hook for $settings"
+      return 0
+    fi
     added+="$event "
     case "$event" in Stop | PreCompact) mining+="$event " ;; esac
   done
@@ -801,8 +827,9 @@ _wire_claude_hooks_into() {
       return 0
     fi
     # In place, not mv: a settings.json symlinked into a dotfiles repo stays one.
+    # `cat >` truncates before writing, so a failure here can cut the file short.
     if ! cat "$work" > "$settings" 2>/dev/null; then
-      _wire_claude_hooks_warn "could not write $settings"
+      _wire_claude_hooks_warn "could not finish writing $settings, so it may be incomplete"
       return 0
     fi
     echo "==> Wired Claude hooks in $settings: ${added% }"

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import shlex
 import shutil
 import stat
 import subprocess
@@ -989,28 +990,36 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 own = "<target> hook stop --harness claude-code"
                 self.assertEqual(self.stop_commands_after_install(command), [command, own])
 
-
     def settings_with_stop(self, home: pathlib.Path, stop: object) -> pathlib.Path:
         path = home / ".claude" / "settings.json"
         path.parent.mkdir(parents=True)
         path.write_text(json.dumps({"hooks": {"Stop": stop}}), encoding="utf-8")
         return path
 
-    def jq_stub(self, home: pathlib.Path, fail_when: str) -> dict[str, str]:
-        """PATH env whose `jq` exits 5 when the joined argv contains every word in
-        `fail_when` and otherwise runs the real jq."""
+    @staticmethod
+    def command_stub(home: pathlib.Path, name: str, fail_when: str, on_match: str) -> dict[str, str]:
+        """PATH env whose `name` runs `on_match` when the joined argv contains every
+        `|`-separated literal in `fail_when`, and otherwise runs the real `name`."""
         bin_dir = home / "stub-bin"
-        bin_dir.mkdir()
-        checks = " && ".join(f'[[ "$*" == *{word}* ]]' for word in fail_when.split("|"))
-        stub = bin_dir / "jq"
+        bin_dir.mkdir(exist_ok=True)
+        checks = " && ".join(f'[[ "$*" == *{shlex.quote(word)}* ]]' for word in fail_when.split("|"))
+        stub = bin_dir / name
         stub.write_text(
-            f'#!/usr/bin/env bash\nif {checks}; then echo "stub jq failure" >&2; exit 5; fi\n'
-            f'exec {shutil.which("jq")} "$@"\n',
+            f'#!/usr/bin/env bash\nif {checks}; then {on_match}; fi\nexec {shutil.which(name)} "$@"\n',
             encoding="utf-8",
         )
         stub.chmod(0o755)
         return {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}"}
 
+    def jq_stub(self, home: pathlib.Path, fail_when: str) -> dict[str, str]:
+        """PATH env whose `jq` exits 5 on the calls `fail_when` picks out (see
+        command_stub) and otherwise runs the real jq."""
+        return self.command_stub(home, "jq", fail_when, 'echo "stub jq failure" >&2; exit 5')
+
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "precondition: root writes through mode 0444, so a read-only file cannot be made here",
+    )
     def test_read_only_settings_warns_and_the_install_continues(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
@@ -1044,12 +1053,55 @@ class InstallIronmemSelfTest(unittest.TestCase):
             home = pathlib.Path(directory)
             path = self.settings_with_stop(home, [])
             before = path.read_text(encoding="utf-8")
-            env = self.jq_stub(home, "--arg|name")
+            # Only the Stop matcher fails, after SessionStart and UserPromptSubmit
+            # were already appended to the temp copy: nothing may reach the file.
+            env = self.jq_stub(home, "--arg ev Stop --arg name stop ")
 
             result = self.run_installer(home, home / ".claude.json", extra_env=env)
 
             self.assertEqual(path.read_text(encoding="utf-8"), before)
-            self.assertIn("wired no Claude hooks", result.stderr)
+            self.assertIn(f"WARN: jq failed reading the Stop hooks in {path}; wired no Claude hooks.", result.stderr)
+            self.assertNotIn("Wired Claude hooks", result.stdout)
+
+    def test_a_jq_error_reading_enabled_plugins_is_not_read_as_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_text(encoding="utf-8")
+            env = self.jq_stub(home, "enabledPlugins")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+            self.assertIn(f"WARN: jq failed reading enabledPlugins in {path}; wired no Claude hooks.", result.stderr)
+            self.assertNotIn("Wired Claude hooks", result.stdout)
+
+    def test_a_failed_temp_file_move_wires_nothing_and_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_text(encoding="utf-8")
+            env = self.command_stub(home, "mv", "ironmem-hooks", 'echo "stub mv failure" >&2; exit 1')
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+            self.assertIn(f"WARN: could not stage the SessionStart hook for {path}; wired no Claude hooks.", result.stderr)
+            self.assertNotIn("Wired Claude hooks", result.stdout)
+            self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
+
+    def test_a_failed_final_write_names_the_file_it_may_have_cut_short(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            # Writes three bytes of the merged file, then fails, like a full disk.
+            env = self.command_stub(home, "cat", "ironmem-hooks", 'head -c 3 "$1"; exit 1')
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertIn(f"WARN: could not finish writing {path}, so it may be incomplete;", result.stderr)
+            self.assertNotIn("Wired Claude hooks", result.stdout)
+            self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
 
     def test_junk_entries_neither_abort_nor_multiply_hooks(self) -> None:
         junk_shapes = (
@@ -1111,6 +1163,46 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertIn("Wired Claude hooks", result.stdout)
             self.assertIn("SessionStart", result.stdout)
             self.assertNotIn("skip mining", result.stdout)
+
+    @staticmethod
+    def path_without_jq(bin_dir: pathlib.Path) -> str:
+        """A PATH of one directory linking every executable on the real PATH but jq,
+        each name resolving to the same program it does now."""
+        bin_dir.mkdir()
+        for entry in os.environ["PATH"].split(os.pathsep):
+            try:
+                programs = sorted(pathlib.Path(entry).iterdir()) if entry else []
+            except OSError:
+                continue
+            for program in programs:
+                link = bin_dir / program.name
+                if program.name == "jq" or link.is_symlink():
+                    continue
+                try:
+                    runnable = program.is_file() and os.access(program, os.X_OK)
+                except OSError:
+                    continue
+                if runnable:
+                    link.symlink_to(program)
+        return str(bin_dir)
+
+    def test_without_jq_the_hooks_are_printed_not_wired(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.path_without_jq(home / "no-jq-bin")
+            self.assertIsNone(shutil.which("jq", path=path), "jq must be unreachable")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env={"PATH": path})
+
+            target = home / ".ironrace" / "bin" / "ironmem"
+            self.assertIn("jq not installed", result.stderr)
+            self.assertIn(f"Claude Code hooks were not wired either. Add these four to {home / '.claude' / 'settings.json'}", result.stderr)
+            self.assertIn(
+                f'"<Event>": [ {{ "hooks": [ {{ "type": "command", "command": "{target} hook '
+                '<session-start|user-prompt-submit|stop|precompact> --harness claude-code" } ] } ]',
+                result.stderr,
+            )
+            self.assertFalse((home / ".claude" / "settings.json").exists())
 
 
 if __name__ == "__main__":
