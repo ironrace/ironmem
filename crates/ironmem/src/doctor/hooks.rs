@@ -961,6 +961,67 @@ mod tests {
         );
     }
 
+    /// The commands scripts/install-ironmem.sh writes for an install path the
+    /// shell would split: the path single-quoted, an embedded `'` as `'\''`.
+    #[test]
+    fn single_quoted_install_paths_are_wired_and_their_mode_is_read() {
+        for program in [
+            "'/Users/Jo Smith/.ironrace/bin/ironmem'",
+            r"'/Users/Jo Smith/it'\''s here/bin/ironmem'",
+        ] {
+            let cmds =
+                PLUGIN_HOOKS.map(|(e, n)| (e, format!("{program} hook {n} --harness claude-code")));
+            let refs: Vec<(&str, &str)> = cmds.iter().map(|(e, c)| (*e, c.as_str())).collect();
+            let home = home_with_settings(&settings_with(&refs));
+            let checks = claude_hook_checks(Some(home.path()), None);
+            assert_eq!(checks[0].status, CheckStatus::Ok, "{}", checks[0].summary);
+            assert!(
+                checks[0].summary.contains("all 4 wired"),
+                "{}",
+                checks[0].summary
+            );
+            assert!(
+                checks[1].summary.contains(
+                    "Stop: read-only (IRONMEM_MCP_MODE unset, so the default) -> not mined"
+                ),
+                "{program}: {}",
+                checks[1].summary
+            );
+
+            let trusted: Vec<(&str, String)> = cmds
+                .iter()
+                .map(|(e, c)| (*e, format!("IRONMEM_MCP_MODE=trusted {c}")))
+                .collect();
+            let refs: Vec<(&str, &str)> = trusted.iter().map(|(e, c)| (*e, c.as_str())).collect();
+            let home = home_with_settings(&settings_with(&refs));
+            let checks = claude_hook_checks(Some(home.path()), None);
+            assert_eq!(
+                checks[1].status,
+                CheckStatus::Ok,
+                "{program}: {}",
+                checks[1].summary
+            );
+            assert!(
+                checks[1]
+                    .summary
+                    .contains("Stop: trusted (set in the hook command) -> mined"),
+                "{program}: {}",
+                checks[1].summary
+            );
+        }
+        // Unquoted, the shell runs `/Users/Jo`, so the hook is missing.
+        let unquoted = "/Users/Jo Smith/.ironrace/bin/ironmem hook stop --harness claude-code";
+        let home = home_with_settings(&settings_with(&[("Stop", unquoted)]));
+        let checks = claude_hook_checks(Some(home.path()), None);
+        assert!(
+            checks[0]
+                .summary
+                .contains("missing SessionStart, UserPromptSubmit, Stop, PreCompact"),
+            "{}",
+            checks[0].summary
+        );
+    }
+
     #[test]
     fn missing_hooks_are_named_with_their_effect() {
         let home = home_with_settings(&settings_with(&[ALL_FOUR_BARE[2]]));

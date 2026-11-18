@@ -717,6 +717,29 @@ CLAUDE_HOOK_EVENTS=(
   PreCompact:precompact
 )
 
+_SHELL_SAFE_CHARS='abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./+@%,:-'
+
+# Prints $1 as one shell word for a hook command, which Claude Code runs
+# through a shell. A word made only of _SHELL_SAFE_CHARS (spelled out, so no
+# locale widens a range) is printed as it is; anything else is single-quoted,
+# with each embedded ' written as '\''. Loops instead of ${1//\'/...}, whose
+# replacement text bash 3.2 and 5.2 read differently.
+_shell_word() {
+  local rest="$1" quoted=""
+  if [[ -n "$rest" && "$rest" != *[!$_SHELL_SAFE_CHARS]* ]]; then
+    printf '%s' "$rest"
+    return 0
+  fi
+  while [[ "$rest" == *\'* ]]; do
+    quoted+="${rest%%\'*}'\\''"
+    rest="${rest#*\'}"
+  done
+  printf "'%s'" "$quoted$rest"
+}
+
+# $TARGET as the first word of a hook command.
+HOOK_PROGRAM="$(_shell_word "$TARGET")"
+
 # Prints the WARN every failed wiring attempt ends with; $1 says what failed.
 _wire_claude_hooks_warn() {
   echo "    WARN: $1; wired no Claude hooks." >&2
@@ -809,7 +832,7 @@ _wire_claude_hooks_into() {
       _wire_claude_hooks_warn "jq failed reading the $event hooks in $settings"
       return 0
     fi
-    if ! jq --arg ev "$event" --arg cmd "$TARGET hook $name --harness claude-code" \
+    if ! jq --arg ev "$event" --arg cmd "$HOOK_PROGRAM hook $name --harness claude-code" \
       '.hooks = (.hooks // {}) | .hooks[$ev] = ((.hooks[$ev] // []) + [{hooks: [{type: "command", command: $cmd}]}])' \
       "$work" > "$next" 2>/dev/null || [[ ! -s "$next" ]]; then
       _wire_claude_hooks_warn "jq failed adding the $event hook to $settings"
@@ -964,7 +987,7 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     echo "          { \"schema_version\": 1, \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" }, \"mode\": \"optional\" } } }" >&2
     echo "          Claude Code hooks were not wired either. Add these four to $CLAUDE_SETTINGS_JSON" >&2
     echo "          under \"hooks\", one key each for SessionStart, UserPromptSubmit, Stop and PreCompact, shaped as" >&2
-    echo "          \"<Event>\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"$TARGET hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] } ]" >&2
+    echo "          \"<Event>\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"$HOOK_PROGRAM hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] } ]" >&2
   else
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \

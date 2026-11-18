@@ -861,6 +861,65 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 self.assertEqual(len(self.ironmem_hook_commands(settings, event)), 1, event)
             self.assertIn("already wired", result.stdout)
 
+    def assert_hooks_run_from_an_unsafe_install_dir(self, dir_name: str) -> None:
+        """Install into a directory whose path the shell would split or unquote,
+        then check each written hook command is one argv that runs the binary."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            install_dir = home / dir_name / "bin"
+            env = {"IRONMEM_INSTALL_DIR": str(install_dir)}
+            first = self.run_installer(home, home / ".claude.json", extra_env=env)
+            self.assertIn("Wired Claude hooks", first.stdout)
+
+            target = install_dir / "ironmem"
+            # A recording stub in the installed binary's place, so running a
+            # hook command proves what argv the shell hands the binary.
+            record = home / "argv.txt"
+            target.write_text(f'#!/bin/sh\nprintf "%s\\n" "$@" > {shlex.quote(str(record))}\n', encoding="utf-8")
+            target.chmod(0o755)
+
+            settings = self.claude_settings(home)
+            for event, name in self.plugin_hook_names().items():
+                with self.subTest(event=event):
+                    commands = self.ironmem_hook_commands(settings, event)
+                    self.assertEqual(len(commands), 1, commands)
+                    expected = ["hook", name, "--harness", "claude-code"]
+                    self.assertEqual(shlex.split(commands[0]), [str(target), *expected])
+                    record.unlink(missing_ok=True)
+                    ran = subprocess.run(["sh", "-c", commands[0]], capture_output=True, text=True)
+                    self.assertEqual(ran.returncode, 0, ran.stderr)
+                    self.assertEqual(record.read_text(encoding="utf-8").splitlines(), expected)
+
+            second = self.run_installer(home, home / ".claude.json", extra_env=env)
+            self.assertEqual(self.claude_settings(home), settings, "a re-run adds nothing")
+            self.assertNotIn("Wired Claude hooks", second.stdout)
+            self.assertIn(
+                "Claude hooks already wired, left as they are: SessionStart UserPromptSubmit Stop PreCompact",
+                second.stdout,
+            )
+
+    def test_hooks_run_from_an_install_dir_with_a_space(self) -> None:
+        self.assert_hooks_run_from_an_unsafe_install_dir("Jo Smith")
+
+    def test_hooks_run_from_an_install_dir_with_a_single_quote(self) -> None:
+        self.assert_hooks_run_from_an_unsafe_install_dir("it's here")
+
+    def test_without_jq_the_printed_hook_command_is_quoted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.path_without_jq(home / "no-jq-bin")
+            install_dir = home / "Jo Smith" / "bin"
+            env = {"PATH": path, "IRONMEM_INSTALL_DIR": str(install_dir)}
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            program = shlex.quote(str(install_dir / "ironmem"))
+            self.assertTrue(program.startswith("'"), program)
+            self.assertIn(
+                f'"command": "{program} hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code"',
+                result.stderr,
+            )
+
     def test_existing_hooks_and_keys_are_kept(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
