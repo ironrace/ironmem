@@ -400,9 +400,9 @@ fn is_scoped(filters: &SearchFilters) -> bool {
 /// Unscoped searches take the top `overfetch` across the HNSW index and drop
 /// superseded rows. A wing/room-scoped search does not use the index: it
 /// scores every drawer in the scope exactly (`scoped_vector_candidates`). The
-/// index has no scope filter, and its global top-k could hold none of the
-/// scope's drawers, which left a scoped search empty although matching
-/// drawers existed.
+/// index has no scope filter, and its global top-k can hold none of the
+/// scope's drawers, so a search of the index would return nothing for a
+/// scope whose drawers exist.
 fn vector_candidates(
     app: &App,
     primary: &[f32],
@@ -447,12 +447,19 @@ fn search_index_ids(
 /// One `SELECT` (after the column probe `scope_vectors` makes, as the other
 /// drawer reads do) fetches the scope's drawers, in no particular order. A
 /// drawer is kept when `row_matches_filters` keeps it (the same rules as the
-/// final filter) and its embedding decodes and has a non-zero, finite norm;
-/// only kept rows are decoded. Each is scored by cosine similarity with the
-/// query; the content-word variant is scored the same way and merged with
-/// `union_hnsw`, as the unscoped path merges it. Returns at most `overfetch`
-/// ids, highest score first, ties broken by drawer id. The cost grows with
-/// the scope: every in-scope row is read and scored, with no cap or cache.
+/// final filter) and its embedding decodes, has the query's length and has a
+/// non-zero, finite norm; only rows the filters keep are decoded. Each is
+/// scored by cosine similarity with the query; the content-word variant is
+/// scored the same way and merged with `union_hnsw`, as the unscoped path
+/// merges it. Returns at most `overfetch` ids, highest score first, ties
+/// broken by drawer id. The cost grows with the scope: every in-scope row is
+/// read and scored, with no cap or cache.
+///
+/// An all-zero embedding (Autopilot and collab rows) is skipped silently: it
+/// is deliberate and has no direction to score. Every other skipped row (an
+/// undecodable blob, another length than the query, a norm that is not
+/// usable, a cosine that is not finite) is malformed; they are counted and
+/// reported in one `warn` that names the scope.
 fn scoped_vector_candidates(
     app: &App,
     primary: &[f32],
@@ -460,6 +467,8 @@ fn scoped_vector_candidates(
     overfetch: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<String>, MemoryError> {
+    use crate::db::drawers::EmbeddingNorm;
+
     let rows = app
         .db
         .scope_vectors(filters.wing.as_deref(), filters.room.as_deref())?;
@@ -473,9 +482,17 @@ fn scoped_vector_candidates(
             malformed += 1;
             continue;
         };
-        // A zero vector (Autopilot and collab rows) has no direction to score.
-        let Some(norm) = crate::db::drawers::vector_norm(&embedding) else {
+        if embedding.len() != primary.len() {
+            malformed += 1;
             continue;
+        }
+        let norm = match crate::db::drawers::embedding_norm(&embedding) {
+            EmbeddingNorm::Usable(norm) => norm,
+            EmbeddingNorm::Zero => continue,
+            EmbeddingNorm::Unusable => {
+                malformed += 1;
+                continue;
+            }
         };
         candidates.push(ScopeCandidate {
             id: row.id,
@@ -483,24 +500,30 @@ fn scoped_vector_candidates(
             norm,
         });
     }
-    if malformed > 0 {
-        tracing::warn!(
-            malformed,
-            "scoped search skipped drawers whose stored embedding is malformed"
-        );
-    }
     // `union_hnsw` breaks ties by position, so positions must follow id order.
     candidates.sort_unstable_by(|a, b| a.id.cmp(&b.id));
 
-    let primary_top = exact_top_k(&candidates, primary, overfetch);
+    // A row either query cannot score counts once, however many queries
+    // drop it.
+    let mut unscorable = vec![false; candidates.len()];
+    let primary_top = exact_top_k(&candidates, primary, overfetch, &mut unscorable);
     let top = match content {
         Some(cv) => union_hnsw(
             primary_top,
-            exact_top_k(&candidates, cv, overfetch),
+            exact_top_k(&candidates, cv, overfetch, &mut unscorable),
             overfetch,
         ),
         None => primary_top,
     };
+    malformed += unscorable.iter().filter(|dropped| **dropped).count();
+    if malformed > 0 {
+        tracing::warn!(
+            malformed,
+            wing = filters.wing.as_deref(),
+            room = filters.room.as_deref(),
+            "scoped search skipped drawers whose stored embedding is malformed"
+        );
+    }
     Ok(top
         .into_iter()
         .map(|(pos, _)| candidates[pos].id.clone())
@@ -517,10 +540,18 @@ struct ScopeCandidate {
 
 /// The top `k` of `candidates` by cosine similarity with `query`, as
 /// (position, score), highest first, ties broken by drawer id whatever order
-/// `candidates` is in. A candidate of another length than `query` is skipped,
-/// as is one whose score is not finite. A zero-norm query scores every
-/// candidate 0.
-fn exact_top_k(candidates: &[ScopeCandidate], query: &[f32], k: usize) -> Vec<(usize, f32)> {
+/// `candidates` is in. A candidate of another length than `query` is skipped
+/// (the scoped leg has already dropped, and counted, rows of another length
+/// than the primary query). A candidate whose score is not finite is skipped
+/// and marked in `unscorable` (indexed by position, the same length as
+/// `candidates`); marks are only ever set, so one slice can collect them
+/// over several queries. A zero-norm query scores every candidate 0.
+fn exact_top_k(
+    candidates: &[ScopeCandidate],
+    query: &[f32],
+    k: usize,
+    unscorable: &mut [bool],
+) -> Vec<(usize, f32)> {
     let query_norm = crate::db::drawers::vector_norm(query);
     let mut scored: Vec<(usize, f32)> = candidates
         .iter()
@@ -528,12 +559,18 @@ fn exact_top_k(candidates: &[ScopeCandidate], query: &[f32], k: usize) -> Vec<(u
         .filter(|(_, candidate)| candidate.embedding.len() == query.len())
         .filter_map(|(pos, candidate)| {
             let score = match query_norm {
-                Some(query_norm) => crate::db::drawers::cosine(
-                    query,
-                    query_norm,
-                    &candidate.embedding,
-                    candidate.norm,
-                )?,
+                Some(query_norm) => {
+                    let score = crate::db::drawers::cosine(
+                        query,
+                        query_norm,
+                        &candidate.embedding,
+                        candidate.norm,
+                    );
+                    if score.is_none() {
+                        unscorable[pos] = true;
+                    }
+                    score?
+                }
                 None => 0.0,
             };
             Some((pos, score))
@@ -1221,9 +1258,9 @@ mod tests {
         dot / (na * nb)
     }
 
-    /// The scenario that used to be flaky: wing "a" holds more than
-    /// `overfetch` drawers nearer the query than the single drawer in wing
-    /// "b", so "b00" is outside the global top 30. A scoped search scores the
+    /// Wing "a" holds more than `overfetch` drawers nearer the query than the
+    /// single drawer in wing "b", so "b00" is outside the global top 30 and a
+    /// scoped search of the index could miss it. A scoped search scores the
     /// scope directly, so it returns exactly that drawer on every build.
     #[test]
     fn scoped_candidates_return_the_scope_drawer_outside_the_global_top_k() {
@@ -1359,9 +1396,12 @@ mod tests {
             candidate_of("extreme", extreme, 1.0),
             candidate_of("plain", at_similarity(0.5, 1.0), 1.0),
         ];
-        let top = exact_top_k(&candidates, &query, 10);
+        let mut unscorable = [false; 2];
+        let top = exact_top_k(&candidates, &query, 10, &mut unscorable);
         assert_eq!(top.len(), 1, "{top:?}");
         assert_eq!(candidates[top[0].0].id, "plain");
+        // The dropped candidate is reported, so the scoped leg can count it.
+        assert_eq!(unscorable, [true, false]);
     }
 
     fn candidate_of(id: &str, embedding: Vec<f32>, norm: f32) -> ScopeCandidate {
@@ -1382,18 +1422,20 @@ mod tests {
             candidate_of("top", at_similarity(0.9, 1.0), 1.0),
             candidate_of("b", v, 1.0),
         ];
-        let order: Vec<&str> = exact_top_k(&candidates, &query_vec(), 10)
+        let mut unscorable = [false; 4];
+        let order: Vec<&str> = exact_top_k(&candidates, &query_vec(), 10, &mut unscorable)
             .into_iter()
             .map(|(pos, _)| candidates[pos].id.as_str())
             .collect();
         assert_eq!(order, ["top", "a", "b", "c"]);
         // With a zero query every score is 0 and the id order alone decides.
         let zero = vec![0.0; DIM];
-        let order: Vec<&str> = exact_top_k(&candidates, &zero, 2)
+        let order: Vec<&str> = exact_top_k(&candidates, &zero, 2, &mut unscorable)
             .into_iter()
             .map(|(pos, _)| candidates[pos].id.as_str())
             .collect();
         assert_eq!(order, ["a", "b"]);
+        assert_eq!(unscorable, [false; 4]);
     }
 
     #[test]
@@ -1460,38 +1502,68 @@ mod tests {
         assert_eq!(current.unwrap(), ["x-current"]);
     }
 
+    /// Every skipped row but the deliberate all-zero one is malformed and is
+    /// counted in the one warning, which names the scope.
     #[test]
     fn scoped_candidates_skip_zero_malformed_and_wrong_dimension_embeddings() {
         let app = App::open_for_test().unwrap();
         add(&app, "good", "s", "r", &at_similarity(0.5, 1.0));
         add(&app, "zero", "s", "r", &vec![0.0; DIM]);
         add(&app, "short", "s", "r", &[1.0; 10]);
+        // Finite components whose sum of squares overflows `f32`.
+        add(&app, "overflow", "s", "r", &vec![1e20; DIM]);
         add(&app, "bad-blob", "s", "r", &at_similarity(0.5, 1.0));
         app.db
             .exec_raw("UPDATE drawers SET embedding = x'0102' WHERE id = 'bad-blob'")
             .unwrap();
 
-        let ids = vector_candidates(&app, &query_vec(), None, 30, &scope(Some("s"), None)).unwrap();
+        let (ids, log) = with_captured_log(|| {
+            vector_candidates(&app, &query_vec(), None, 30, &scope(Some("s"), Some("r"))).unwrap()
+        });
         assert_eq!(ids, ["good"]);
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("malformed=3"), "{log}");
+        assert!(warnings[0].contains("wing=\"s\""), "{log}");
+        assert!(warnings[0].contains("room=\"r\""), "{log}");
+
+        // A scope whose only skipped row is the all-zero one warns about nothing.
+        add(&app, "t-good", "t", "r", &at_similarity(0.5, 1.0));
+        add(&app, "t-zero", "t", "r", &vec![0.0; DIM]);
+        let (ids, log) = with_captured_log(|| {
+            vector_candidates(&app, &query_vec(), None, 30, &scope(Some("t"), None)).unwrap()
+        });
+        assert_eq!(ids, ["t-good"]);
+        assert!(!log.contains("WARN"), "{log}");
     }
 
-    /// One `SELECT` statement; the `PRAGMA table_info` column probe that
+    /// One `SELECT` statement, for an empty scope and for a populated one (so
+    /// a per-row read would show); the `PRAGMA table_info` column probe that
     /// precedes it is not a `SELECT` and is not counted.
     #[test]
-    fn an_empty_scope_returns_no_candidates_from_one_select() {
+    fn a_scoped_search_reads_its_rows_with_one_select() {
         let mut app = App::open_for_test().unwrap();
-        add(&app, "a00", "a", "r", &at_similarity(0.5, 1.0));
-        let selects = app.db.count_select_statements();
+        for id in ["a00", "a01", "a02"] {
+            add(&app, id, "a", "r", &at_similarity(0.5, 1.0));
+        }
 
+        let selects = app.db.count_select_statements();
         let ids =
             vector_candidates(&app, &query_vec(), None, 30, &scope(Some("none"), None)).unwrap();
         assert!(ids.is_empty());
         assert_eq!(selects.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let selects = app.db.count_select_statements();
+        let ids = vector_candidates(&app, &query_vec(), None, 30, &scope(Some("a"), None)).unwrap();
+        assert_eq!(ids, ["a00", "a01", "a02"]);
+        assert_eq!(selects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
-    /// The unscoped candidate sequence exactly as `search` built it before
-    /// this issue changed scoped search (copied from the code at 105b3f47).
-    fn old_unscoped_candidates(
+    /// The unscoped candidate sequence computed straight from the index: the
+    /// top `overfetch` of the primary query (unioned with the content-word
+    /// variant's), mapped to drawer ids, superseded rows dropped. An unscoped
+    /// `vector_candidates` must return exactly this.
+    fn expected_unscoped_candidates(
         app: &App,
         primary_vec: &[f32],
         content: Option<&[f32]>,
@@ -1519,7 +1591,7 @@ mod tests {
         let q = query_vec();
 
         let unscoped = vector_candidates(&app, &q, None, 30, &scope(None, None)).unwrap();
-        assert_eq!(unscoped, old_unscoped_candidates(&app, &q, None, 30));
+        assert_eq!(unscoped, expected_unscoped_candidates(&app, &q, None, 30));
         assert_eq!(unscoped.len(), 30);
         assert!(!unscoped.contains(&"b00".to_string()));
 
@@ -1528,15 +1600,46 @@ mod tests {
         let with_variant = vector_candidates(&app, &q, Some(&cv), 30, &scope(None, None)).unwrap();
         assert_eq!(
             with_variant,
-            old_unscoped_candidates(&app, &q, Some(&cv), 30)
+            expected_unscoped_candidates(&app, &q, Some(&cv), 30)
         );
         assert_eq!(with_variant.len(), 30);
     }
 
+    /// The index holds superseded drawers too (a rebuild loads every row), so
+    /// the unscoped leg drops them itself, unless history is requested. Real
+    /// vectors, so the superseded drawer is in the index and outranks the
+    /// current one.
+    #[test]
+    fn unscoped_candidates_drop_a_superseded_drawer_unless_history_is_requested() {
+        let app = App::open_for_test().unwrap();
+        add(&app, "current", "a", "r", &at_similarity(0.5, 1.0));
+        add(&app, "old", "a", "r", &at_similarity(0.9, 1.0));
+        app.db
+            .exec_raw("UPDATE drawers SET superseded_by = 'current' WHERE id = 'old'")
+            .unwrap();
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+        let q = query_vec();
+        // Premise: the index itself returns the superseded drawer, first.
+        assert_eq!(
+            search_index_ids(&app, &q, None, 30).unwrap(),
+            ["old", "current"]
+        );
+
+        let current = vector_candidates(&app, &q, None, 30, &scope(None, None)).unwrap();
+        assert_eq!(current, ["current"]);
+        let with_history = SearchFilters {
+            include_superseded: true,
+            ..scope(None, None)
+        };
+        let history = vector_candidates(&app, &q, None, 30, &with_history).unwrap();
+        assert_eq!(history, ["old", "current"]);
+    }
+
     /// A drawer stored with a zero vector (Autopilot and collab rows) has no
-    /// direction, and the index's cosine distance is 0 against it, so it used
-    /// to come back at similarity 1.0 for every query. It is no longer in the
-    /// index, so the vector leg never returns it.
+    /// direction, and the index's cosine distance is 0 against it, so in the
+    /// index it would match every query at similarity 1.0. A rebuild leaves
+    /// it out of the index, so the vector leg never returns it.
     #[test]
     fn unscoped_vector_candidates_hold_no_zero_vector_drawer() {
         let app = App::open_for_test().unwrap();
