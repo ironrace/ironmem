@@ -3,7 +3,8 @@
 //!
 //! Hybrid retrieval strategy:
 //!   1. Embed the cleaned query (content-word variant only for long queries)
-//!   2. Run HNSW ANN search for each query variant, union the ranked lists
+//!   2. Run HNSW ANN search for each query variant (an exact scan of the
+//!      scope instead for a wing/room-scoped search), union the ranked lists
 //!   3. Run BM25 full-text search via SQLite FTS5 (porter-stemmed tokens)
 //!   4. Merge HNSW and BM25 via weighted RRF (BM25 down-weighted when sparse)
 //!   5. Apply KG-entity score boosts
@@ -92,7 +93,8 @@ pub fn search(
 
     let content_word_variant_fired = maybe_content_vec.is_some();
 
-    // Step 3: HNSW search — overfetch at 5× limit, clamped to MAX_OVERFETCH.
+    // Step 3: vector search (HNSW, or an exact scan of a wing/room scope) —
+    // overfetch at 5× limit, clamped to MAX_OVERFETCH.
     let overfetch = limit.saturating_mul(5).clamp(30, tunables::max_overfetch());
 
     let hnsw_ids = hnsw_candidates(
