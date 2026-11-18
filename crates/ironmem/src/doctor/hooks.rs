@@ -118,6 +118,8 @@ const MIS_SHAPED_HINT: &str = "fix hooks in settings.json by hand (it must be an
 each hooks.<event> an array of hook groups), then re-run scripts/install-ironmem.sh, which \
 refuses the file until then";
 
+const DISABLE_ALL_HOOKS_HINT: &str = "remove disableAllHooks from settings.json or set it to false";
+
 const HOME_UNKNOWN: &str = "hook mining: skipped (home directory unknown)";
 
 /// The command shape of a plugin hook, used to work out the mode it runs in.
@@ -139,6 +141,9 @@ enum HookWiring {
     /// object whose values are all arrays (the shape the installer accepts),
     /// for this reason.
     MisShaped(String),
+    /// settings.json sets `disableAllHooks: true`, so Claude Code runs no
+    /// hook, the plugin's included.
+    AllHooksDisabled,
     /// The ironmem plugin is enabled; its hooks.json supplies the hooks.
     Plugin {
         /// Plugin hooks that settings.json also wires by hand (they run
@@ -223,6 +228,24 @@ pub(super) fn claude_hook_checks(
                 HOOK_MINING_KEY,
                 CheckStatus::Info,
                 "hook mining: skipped (the hooks in settings.json cannot be read)",
+            ),
+        ],
+        HookWiring::AllHooksDisabled => [
+            Check::new(
+                HOOKS_KEY,
+                CheckStatus::Warn,
+                format!(
+                    "Claude Code hooks: {} sets disableAllHooks to true, so Claude Code runs no \
+                     hooks: no memory context is loaded at session start, prompt recall is off \
+                     and no hook mines workspace files",
+                    path.display()
+                ),
+            )
+            .with_hint(DISABLE_ALL_HOOKS_HINT),
+            Check::new(
+                HOOK_MINING_KEY,
+                CheckStatus::Info,
+                "hook mining: skipped (disableAllHooks is true in settings.json, so no hook runs)",
             ),
         ],
         HookWiring::Plugin {
@@ -331,6 +354,13 @@ fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
     }
     if let Some(reason) = hooks_shape_problem(&doc) {
         return HookWiring::MisShaped(reason);
+    }
+    // Claude Code's documented switch: `"disableAllHooks": true` turns every
+    // hook off; any other value is ignored. Doctor reads only
+    // ~/.claude/settings.json, so a project or managed settings file that
+    // sets it back to false (or sets it at all) is out of scope here.
+    if doc.get("disableAllHooks") == Some(&Value::Bool(true)) {
+        return HookWiring::AllHooksDisabled;
     }
     let mut wired = Vec::new();
     let mut missing = Vec::new();
@@ -1325,6 +1355,61 @@ mod tests {
                 c[0].summary
             );
         }
+    }
+
+    #[test]
+    fn disable_all_hooks_turns_every_hook_off() {
+        let mut manual: Value = serde_json::from_str(&settings_with(&ALL_FOUR_BARE)).unwrap();
+        manual["disableAllHooks"] = Value::Bool(true);
+        let plugin = r#"{"enabledPlugins": {"ironmem@ironrace": true}, "disableAllHooks": true}"#;
+        for settings in [manual.to_string(), plugin.to_owned()] {
+            let home = home_with_settings(&settings);
+            let c = claude_hook_checks(Some(home.path()), None);
+            let path = home.path().join(".claude").join("settings.json");
+            assert_eq!(c[0].status, CheckStatus::Warn, "{settings}");
+            assert_eq!(
+                c[0].summary,
+                format!(
+                    "Claude Code hooks: {} sets disableAllHooks to true, so Claude Code runs no \
+                     hooks: no memory context is loaded at session start, prompt recall is off \
+                     and no hook mines workspace files",
+                    path.display()
+                ),
+                "{settings}"
+            );
+            assert_eq!(c[0].hint.as_deref(), Some(DISABLE_ALL_HOOKS_HINT));
+            assert_eq!(c[1].status, CheckStatus::Info, "{settings}");
+            assert_eq!(
+                c[1].summary,
+                "hook mining: skipped (disableAllHooks is true in settings.json, so no hook runs)"
+            );
+            assert_eq!(c[1].hint, None);
+        }
+    }
+
+    #[test]
+    fn a_non_boolean_or_false_disable_all_hooks_is_ignored() {
+        for value in [r#""true""#, "1", "false", "null"] {
+            let mut doc: Value = serde_json::from_str(&settings_with(&ALL_FOUR_BARE)).unwrap();
+            doc["disableAllHooks"] = serde_json::from_str(value).unwrap();
+            let home = home_with_settings(&doc.to_string());
+            let c = claude_hook_checks(Some(home.path()), None);
+            assert_eq!(c[0].summary, all_four_wired(home.path()), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_settings_file_that_cannot_be_read_wins_over_disable_all_hooks() {
+        let home = home_with_settings(r#"{"disableAllHooks": true, "hooks": {"Stop": {}}}"#);
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert!(
+            c[0].summary.contains("cannot read the hooks in"),
+            "{}",
+            c[0].summary
+        );
+        let home = home_with_settings(r#"{"disableAllHooks": true,"#);
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert!(c[0].summary.contains("not valid JSON"), "{}", c[0].summary);
     }
 
     const PLUGIN_ON: &str = r#"{"enabledPlugins": {"ironmem@ironrace": true}"#;
