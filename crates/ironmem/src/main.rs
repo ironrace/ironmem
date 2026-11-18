@@ -1011,8 +1011,9 @@ enum AutopilotCmd {
     /// it; a stored name never matches a name on another host). A config
     /// that does not parse could be this repo's under another spelling (one
     /// that holds no name is matched by its storage key, which can match a
-    /// name on another host). Or 1000 or more configs are stored and none is
-    /// under this exact name.
+    /// name on another host). Or none is stored under this exact name and
+    /// the others cannot all be compared with it: 1000 or more are stored,
+    /// or one is filed under an id that is not its key's.
     ///
     /// The ironmem config cannot be loaded, as for every command that loads
     /// it (`IRONMEM_MCP_MODE` or `IRONMEM_EMBED_MODE` holds a value it does

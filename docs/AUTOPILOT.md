@@ -904,8 +904,12 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   flag, a usage error.
 - **The database cannot be read.** A path with no file at it is
   `db not found at <path>`; the message points at `--db <path>` and
-  `IRONMEM_DB_PATH`, and says that `onboard` creates a database Autopilot was
-  never set up with. A path that names a directory is
+  `IRONMEM_DB_PATH`, and gives the command that creates a database Autopilot
+  was never set up with: `ironmem autopilot onboard owner/repo --path . --db
+  <path>`, with the name asked about, run from the repo's checkout. The
+  command names the missing database with `--db` whether the path came from
+  `--db`, `IRONMEM_DB_PATH` or the default, so it creates that file and no
+  other. A path that names a directory is
   `<path> is a directory, not a database file`. A path that cannot be
   examined (a parent directory this user may not search, say) is
   `could not reach the database at <path>: <os error>`. A file that is there
@@ -928,27 +932,37 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   not UTF-8 never gets this far: it is a usage error, exit 2.
 - **The stored config does not parse.** A config is stored under a key made
   from the repo name with each `/` written as `-`, so two names that differ
-  only in `/` versus `-` (`foo-bar/baz` and `foo/bar-baz`) share one key, and
-  the `repo` the stored config still holds is what says whose it is. The
-  error for a config under the asked name's key depends on that `repo`:
+  only in `/` versus `-` (`foo-bar/baz` and `foo/bar-baz`) share one key.
+  Every other character that is not a letter, a digit, `.`, `_` or `-` is
+  written as `-` too, and `onboard` takes names `status` refuses (#422), so
+  `owner/repo` shares its key with an `owner-repo` that was onboarded. The
+  `repo` the stored config still holds is what says whose it is. The error
+  for a config under the asked name's key depends on that `repo`:
   - It is the name asked about. The error names the repo and the database
     and gives the `onboard` and `approve` commands, with `--db`, that replace
     the config.
-  - It names another repo. The error names the key, the database, the parse
-    error and that repo, and says not to onboard the name asked about into
+  - It names another repo: it has an owner and a name, or it is a name
+    stored under that key (`owner-repo`, asked as `owner/repo`). The error
+    names the key, the database, the parse error and that `repo`, and gives
+    no command for the name asked about. When the `repo` is a name stored
+    under that key, the error says not to onboard the name asked about into
     this database, because that would replace the other repo's config
-    (#421). It gives no command for the name asked about. When the other
-    name is a repo name stored under that key, the error ends with the
+    (#421); when it is also a name `status` accepts, the error ends with the
     `onboard` and `approve` commands that replace the config under that
-    name.
-  - It names no owner: the config is not JSON, holds no `repo` string, or
-    holds one with no `/` or with an empty owner or name part (`/repo`,
-    `owner/`). The error names the key and the database and gives the
-    `onboard` and `approve` commands for the name asked about. When that name
-    holds a `-` or names a host, so that another name could share its key,
-    the error first says that the config may belong to another repo and to
-    check which repo was onboarded into this database before replacing it
-    (#421).
+    name, to be run from that repo's checkout and not the asked repo's. When
+    the `repo` is not a name stored under that key (`someone/else` under the
+    key of `foo/bar-baz`), no `onboard` wrote the config as it stands: the
+    error says so, gives no command at all, and says to check where the
+    config came from before anything replaces it.
+  - It names no repo: the config is not JSON, holds no `repo` string, or
+    holds one that has no owner and name (`baz`, `/repo`, `owner/`) and is
+    not a name stored under that key. The error names the key and the
+    database and shows the `repo` the config holds, if any. It then says
+    that the config may belong to another repo and to check which repo was
+    onboarded into this database before replacing it (#421), and after that
+    gives the `onboard` and `approve` commands for the name asked about. The
+    warning is given for every name, because every name shares its key with
+    another.
 - **A config that does not parse could be this repo's under another spelling
   of its name.** This is an error when no config is stored under the asked
   name's own key. It names each such config by the key it is stored under,
@@ -959,27 +973,42 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   included: a config that is not JSON, stored for `foo-bar/baz`, makes
   `status bar/baz` exit 1, and one stored for `my-ghe/owner/repo` makes
   `status ghe/owner/repo` exit 1. The error ends with how to replace each
-  config. For one whose `repo` is a repo name stored under that key, it is
-  `ironmem autopilot onboard <that name> --path . --db <db>`, run from that
-  repo's checkout. For any other, it is `onboard` with the name the repo was
+  config and which name to ask with afterwards. For a config whose `repo` is
+  a repo name stored under that key, it is `ironmem autopilot onboard <that
+  name> --path . --db <db>`, run from that repo's checkout, then `status`
+  with that name. For any other, it is `onboard` with the name the repo was
   onboarded under, which the key gives only as `gate-config:` followed by
-  that name with each `/` written as `-`.
+  that name with each `/` written as `-`, then `status` with that name. The
+  name first asked about would be refused again, as another spelling of the
+  stored one.
 - **A config is stored under another spelling of the name**: one that differs
   only in letter case, or in whether it names a host. The error names the
   stored name. When a config that parses and one that does not both match,
   this is the error reported.
 - **The stored config belongs to another repo name.** The config under the
-  asked name's key parses, and its `repo` is not the name asked about: two
-  names that differ only in `/` versus `-` share one storage key. The error
-  names the key, the database and the repo the config belongs to, and says
-  not to onboard the name asked about into this database, because that would
-  replace the other repo's config (#421); use a separate database (`--db`)
-  for one of the two. A config under that key that does not parse and names
-  another repo is refused the same way, as described above.
+  asked name's key parses, and its `repo` is not the name asked about. When
+  that `repo` is a name stored under the key, the two names share it. The
+  error names the key, the database and the repo the config belongs to, and
+  says not to onboard the name asked about into this database, because that
+  would replace the other repo's config (#421); use a separate database
+  (`--db`) for one of the two. When the `repo` is not a name stored under
+  the key, no `onboard` wrote the config as it stands: the error says so and
+  says to check where the config came from before anything replaces it.
+  Neither error gives a command. A config under that key that does not parse
+  and names another repo is refused the same way, as described above.
 - **1000 or more gate configs are stored and none is under the exact name.**
   `status` compares fewer than that with the name, so it cannot rule out a
   config stored under another spelling (#426). A repo asked about by the exact
   name it was onboarded under is still answered.
+- **A stored gate config is filed under an id that is not its key's, and none
+  is under the exact name.** A config is found by an id made from its key,
+  and its row also records the key. A row whose id is not the id of the key
+  it records is one Autopilot does not write (an edited or imported row,
+  say). Which repo name reads such a row cannot be told from the row, so `status`
+  cannot rule it out as a config of the repo asked about, whatever that
+  name is. The error gives the row's id and the key it records
+  (`source_file`). A repo asked about by the exact name it was onboarded
+  under is still answered.
 - **The ironmem config cannot be loaded**, as for every command that loads
   it: `IRONMEM_MCP_MODE` or `IRONMEM_EMBED_MODE` holds a value it does not
   accept, or the home directory cannot be determined.
@@ -1048,7 +1077,9 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   a directory or cannot be examined: `gh` is then not run, and the error says
   so. A `--path` that is a directory this user cannot enter is a failed read
   of another kind: `gh` is started there and the start fails, and the error
-  names the directory.
+  names the directory and what the filesystem says about it. A `gh` that
+  cannot be started in a directory that can be entered (one this user may
+  not execute, say) is reported with the start error alone.
 - `labels.error` is a plain sentence, with no `Not found:` or
   `Validation error:` in front. For a `gh` that exited non-zero it gives the
   exit code and what `gh` printed on stderr, and points at `gh auth status`.
