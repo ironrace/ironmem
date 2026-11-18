@@ -65,7 +65,7 @@ use super::gate_config::{
     gate_config_key, get_gate_config_read_only, stored_gate_configs_read_only, BrokenGateConfig,
     GateConfig, GateConfigState, StoredGateConfig, StoredGateConfigsError,
 };
-use super::gh::{repo_labels, GhCli, GhRunner};
+use super::gh::{repo_labels, GhCli, GhOutput, GhRunner};
 use super::labels::AgentLabel;
 use super::repo_slug;
 
@@ -287,9 +287,20 @@ pub enum StatusError {
     #[error("'{given}' ends in `.git`, which `gh` does not resolve — drop the `.git` suffix")]
     GitSuffix { given: String },
 
-    /// The database path could not be made absolute, so the report could not
-    /// say which file answered. `given` is the path as it was given.
-    #[error("could not make the database path '{}' absolute: {source}", .given.display())]
+    /// The database path is empty: an empty `--db`, or an empty
+    /// `IRONMEM_DB_PATH` with no `--db`.
+    #[error("the database path is empty — check `--db` and `IRONMEM_DB_PATH`")]
+    DbPathEmpty,
+
+    /// A relative database path could not be made absolute, so the report
+    /// could not say which file answered. `given` is the path as it was
+    /// given. The working directory is what could not be read: that is the
+    /// one thing making a non-empty path absolute needs.
+    #[error(
+        "could not make the database path '{}' absolute: {source} — a relative path is read \
+         against the working directory, which could not be read; pass an absolute `--db`",
+        .given.display()
+    )]
     DbPathNotAbsolute {
         given: PathBuf,
         #[source]
@@ -308,9 +319,19 @@ pub enum StatusError {
     /// No file is at the database path.
     #[error(
         "db not found at {db} — `status` never creates one; pass an existing database with \
-         `--db <path>` or set `IRONMEM_DB_PATH`"
+         `--db <path>` or set `IRONMEM_DB_PATH`. If Autopilot has never been set up with this \
+         database, `ironmem autopilot onboard` creates it"
     )]
     DatabaseNotFound { db: DbPath },
+
+    /// The database path names a directory. Found before the open, because
+    /// SQLite opens a directory read-only without complaint and fails on the
+    /// first read with a message about the disk.
+    #[error(
+        "{db} is a directory, not a database file — name the database file with `--db <path>` \
+         or `IRONMEM_DB_PATH`"
+    )]
+    DatabaseIsADirectory { db: DbPath },
 
     /// The database path could not be examined, so whether a file is there
     /// is not known.
@@ -562,12 +583,42 @@ fn broken_under_another_name(asked: &RepoName, db: &DbPath, rows: &[BrokenGateCo
         })
         .collect::<Vec<_>>()
         .join("; ");
+    let quoted_db = shell_quote(db.as_str());
+    let mut remedies: Vec<String> = Vec::new();
+    for row in rows {
+        // The command is given only for a name it would work for: one that
+        // is a repo name, and whose proposal is written over this row.
+        let held = row
+            .repo()
+            .and_then(|held| RepoName::parse(held).ok())
+            .filter(|held| row.is_stored_under_the_key_of(held.as_str()));
+        let remedy = match held {
+            Some(held) => format!(
+                "run `ironmem autopilot onboard {held} --path . --db {quoted_db}` from that \
+                 repo's checkout"
+            ),
+            // A key cannot be turned back into a name, so the reader is told
+            // how the two relate.
+            None => format!(
+                "run `ironmem autopilot onboard` with the name it was onboarded under and `--db \
+                 {quoted_db}` (its key is `gate-config:` followed by that name with each `/` \
+                 written as `-`)"
+            ),
+        };
+        if !remedies.contains(&remedy) {
+            remedies.push(remedy);
+        }
+    }
+    let those = if rows.len() == 1 {
+        "that config is"
+    } else {
+        "those configs are"
+    };
     format!(
         "'{asked}' has no gate config under that exact name, but {db} holds one that cannot be \
          read and could be this repo's under another spelling — {listed}. Whether '{asked}' is \
-         onboarded cannot be reported until that config is replaced: run `ironmem autopilot \
-         onboard` with the name it was onboarded under and `--db {}`, then ask again",
-        shell_quote(db.as_str())
+         onboarded cannot be reported until {those} replaced: {}, then ask again",
+        remedies.join("; ")
     )
 }
 
@@ -582,11 +633,14 @@ enum DbHint {
     ReadOnlyRefused,
     /// The file is not a database, or is one without ironmem's tables.
     NotAnIronmemDatabase,
+    /// Another connection holds the database, or a table in it, and did not
+    /// let go within the busy timeout. The failure passes by itself.
+    InUse,
 }
 
 impl DbHint {
     /// The hint for `e`, chosen by its primary result code and, for a
-    /// missing table, its message. A busy or locked database gets none.
+    /// missing table, its message.
     fn for_error(e: &rusqlite::Error) -> Option<Self> {
         let rusqlite::Error::SqliteFailure(failure, detail) = e else {
             return None;
@@ -598,6 +652,9 @@ impl DbHint {
             .is_some_and(|text| text.starts_with("no such table"));
         match failure.code {
             rusqlite::ErrorCode::ReadOnly => Some(Self::ReadOnlyRefused),
+            rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked => {
+                Some(Self::InUse)
+            }
             code if code == rusqlite::ErrorCode::NotADatabase || no_such_table => {
                 Some(Self::NotAnIronmemDatabase)
             }
@@ -614,6 +671,7 @@ impl DbHint {
             Self::NotAnIronmemDatabase => {
                 " If this is not an ironmem database, pass the right one with --db."
             }
+            Self::InUse => " Another process is using the database; run the command again.",
         }
     }
 }
@@ -651,7 +709,9 @@ impl From<StatusError> for MemoryError {
             StatusError::NotARepoName { .. }
             | StatusError::NameTooLong { .. }
             | StatusError::GitSuffix { .. }
+            | StatusError::DbPathEmpty
             | StatusError::DbPathNotUtf8 { .. }
+            | StatusError::DatabaseIsADirectory { .. }
             | StatusError::StoredUnderAnotherName { .. }
             | StatusError::KeyCollision { .. }
             | StatusError::TooManyStoredConfigs { .. } => MemoryError::Validation(message),
@@ -755,9 +815,33 @@ impl GateConfigRead {
     }
 }
 
+/// A `gh` that is started in `path`, the directory `--path` names. When it
+/// cannot be started, the error says so: a directory that is there and
+/// cannot be entered fails the start, and the runner's own message names
+/// only the `gh` binary and its arguments.
+struct StartedIn<'a, G> {
+    gh: G,
+    path: &'a Path,
+}
+
+impl<G: GhRunner> GhRunner for StartedIn<'_, G> {
+    fn run(&mut self, args: &[String]) -> Result<GhOutput, MemoryError> {
+        // An `Err` from a runner is a `gh` that did not start; one that ran
+        // and failed is an `Ok` (see [`GhRunner::run`]).
+        self.gh.run(args).map_err(|err| {
+            MemoryError::NotFound(format!(
+                "{} — gh is started in the directory `--path` names, '{}', so check that this \
+                 user can enter it",
+                bare_message(err),
+                self.path.display()
+            ))
+        })
+    }
+}
+
 /// The `gh` on `PATH`, set to run in `path`, or why no `gh` can be run there:
 /// `path` is not a directory or cannot be examined, or there is no `gh`.
-fn gh_to_run_in(path: &Path) -> Result<GhCli, String> {
+fn gh_to_run_in(path: &Path) -> Result<StartedIn<'_, GhCli>, String> {
     match std::fs::metadata(path) {
         Ok(found) if found.is_dir() => {}
         Ok(_) => {
@@ -776,7 +860,10 @@ fn gh_to_run_in(path: &Path) -> Result<GhCli, String> {
             ));
         }
     }
-    GhCli::resolve(path).map_err(bare_message)
+    match GhCli::resolve(path) {
+        Ok(gh) => Ok(StartedIn { gh, path }),
+        Err(err) => Err(bare_message(err)),
+    }
 }
 
 /// The reported part of a stored gate config. Built only from a
@@ -920,6 +1007,11 @@ pub fn read_gate_config_status(
     // whether or not a database is there. Every error from here on names
     // this absolute path, as the report does.
     let db_path = absolute_db_path(db_path)?;
+    // A path that cannot be examined is left to the open, whose failure
+    // `why_not_opened` explains.
+    if std::fs::metadata(db_path.as_path()).is_ok_and(|found| found.is_dir()) {
+        return Err(StatusError::DatabaseIsADirectory { db: db_path });
+    }
     let db = match Database::open_read_only(db_path.as_path()) {
         // `open_read_only` calls every `CannotOpen` "not found".
         Err(MemoryError::NotFound(_)) => return Err(why_not_opened(&db_path)),
@@ -958,6 +1050,11 @@ fn why_not_opened(db: &DbPath) -> StatusError {
 /// lossily converted path would name a file that may not exist. The only
 /// place a [`DbPath`] is built.
 fn absolute_db_path(db: &Path) -> Result<DbPath, StatusError> {
+    // The one path `std::path::absolute` refuses whatever the working
+    // directory is, so it gets an error of its own.
+    if db.as_os_str().is_empty() {
+        return Err(StatusError::DbPathEmpty);
+    }
     let absolute = std::path::absolute(db).map_err(|source| StatusError::DbPathNotAbsolute {
         given: db.to_path_buf(),
         source,
@@ -1182,8 +1279,8 @@ mod tests {
     use super::*;
     use crate::autopilot::gate_config::testing::{store_gate_configs, store_raw_gate_config};
     use crate::autopilot::gate_config::{approve_gate_config, propose_gate_config};
+    use crate::autopilot::gh::label_list_argv;
     use crate::autopilot::gh::testing::ScriptedGh;
-    use crate::autopilot::gh::{label_list_argv, GhOutput};
     use crate::autopilot::testing::on_disk_db;
     use crate::autopilot::validate_repo;
 
@@ -1370,6 +1467,36 @@ mod tests {
         ))]);
         let status = LabelStatus::read(&mut gh, &repo("owner/repo"));
         assert_eq!(status, LabelStatus::failed("failed to start gh label list"));
+    }
+
+    #[test]
+    fn a_gh_that_cannot_start_in_the_path_names_the_path_and_one_that_ran_is_passed_through() {
+        let path = Path::new("/srv/check out");
+        let ran = GhOutput::failed("", "HTTP 401");
+        let mut gh = StartedIn {
+            gh: ScriptedGh::new(vec![
+                Ok(ran.clone()),
+                Err(MemoryError::NotFound(
+                    "failed to start /usr/bin/gh label list: Permission denied (os error 13)"
+                        .into(),
+                )),
+            ]),
+            path,
+        };
+        let argv = label_list_argv("owner/repo");
+
+        // A `gh` that ran, whatever it exited with, is not this wrapper's
+        // business.
+        assert_eq!(gh.run(&argv).unwrap(), ran);
+        match gh.run(&argv).unwrap_err() {
+            MemoryError::NotFound(message) => assert_eq!(
+                message,
+                "failed to start /usr/bin/gh label list: Permission denied (os error 13) — gh \
+                 is started in the directory `--path` names, '/srv/check out', so check that \
+                 this user can enter it"
+            ),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1706,7 +1833,7 @@ mod tests {
     }
 
     #[test]
-    fn a_read_only_failure_gets_the_wal_sentence_and_a_locked_one_gets_neither() {
+    fn a_read_only_failure_gets_the_wal_sentence_and_a_locked_one_is_told_to_run_again() {
         let readonly = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
             Some("attempt to write a readonly database".into()),
@@ -1725,16 +1852,25 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             Some("database is locked".into()),
         );
-        let err = StatusError::from_read(&db_at("/x/m.db"), MemoryError::Db(busy));
-        assert!(
-            matches!(&err, StatusError::Database { source, .. }
-                if DbHint::for_error(source).is_none()),
-            "{err:?}"
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            Some("database table is locked".into()),
         );
-        let message = err.to_string();
-        assert!(message.contains("database is locked"), "{message}");
-        assert!(!message.contains("-wal/-shm"), "{message}");
-        assert!(!message.contains("pass the right one"), "{message}");
+        for (failure, said) in [(busy, "database is locked"), (locked, "table is locked")] {
+            let err = StatusError::from_read(&db_at("/x/m.db"), MemoryError::Db(failure));
+            let message = err.to_string();
+            assert!(message.contains(said), "{message}");
+            // The failure passes, so the reader is told to ask again.
+            assert!(
+                message.ends_with(
+                    "never writes it. Another process is using the database; run the command \
+                     again."
+                ),
+                "{message}"
+            );
+            assert!(!message.contains("-wal/-shm"), "{message}");
+            assert!(!message.contains("pass the right one"), "{message}");
+        }
     }
 
     #[test]
@@ -1770,6 +1906,14 @@ mod tests {
         );
         assert!(message.contains("`--db <path>`"), "{message}");
         assert!(message.contains("`IRONMEM_DB_PATH`"), "{message}");
+        // And what makes a database, for one that was never created.
+        assert!(
+            message.ends_with(
+                " If Autopilot has never been set up with this database, `ironmem autopilot \
+                 onboard` creates it"
+            ),
+            "{message}"
+        );
         let shown = MemoryError::from(err);
         assert!(matches!(shown, MemoryError::NotFound(_)), "{shown:?}");
         assert_eq!(shown.to_string(), format!("Not found: {message}"));
@@ -2142,10 +2286,84 @@ mod tests {
             if let Some(held) = held {
                 assert!(message.contains(&format!("{held:?}")), "{message}");
             }
+            // What to do about it: the command, when the row says which name
+            // it was onboarded under; how to read that name off the key, when
+            // it does not.
+            let quoted = shell_quote(&path.display().to_string());
+            let remedy = match held {
+                Some(held) => format!(
+                    "cannot be reported until that config is replaced: run `ironmem autopilot \
+                     onboard {held} --path . --db {quoted}` from that repo's checkout, then ask \
+                     again"
+                ),
+                None => format!(
+                    "cannot be reported until that config is replaced: run `ironmem autopilot \
+                     onboard` with the name it was onboarded under and `--db {quoted}` (its key \
+                     is `gate-config:` followed by that name with each `/` written as `-`), \
+                     then ask again"
+                ),
+            };
+            assert!(message.ends_with(&remedy), "{message}");
             let shown = MemoryError::from(err);
             assert!(matches!(shown, MemoryError::Json(_)), "{shown:?}");
             assert_eq!(shown.to_string(), format!("JSON error: {message}"));
         }
+    }
+
+    #[test]
+    fn two_broken_rows_under_other_spellings_are_both_listed_with_a_quoted_database() {
+        // A database path a shell would split, so the `--db` in the remedy
+        // has to be quoted.
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::absolute(dir.path().join("two words"))
+            .unwrap()
+            .join("memory.sqlite3");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+            store_raw_gate_config(&db, "Owner/Repo", &no_gate("Owner/Repo"));
+            store_raw_gate_config(&db, "github.com/owner/repo", "not json");
+        }
+
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+
+        let mut keys: Vec<&str> = match &err {
+            StatusError::BrokenUnderAnotherName { rows, .. } => {
+                rows.iter().map(BrokenGateConfig::storage_key).collect()
+            }
+            other => panic!("expected the broken rows, got {other:?}"),
+        };
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "gate-config:Owner-Repo",
+                "gate-config:github.com-owner-repo"
+            ]
+        );
+        let message = err.to_string();
+        let shown_db = path.display().to_string();
+        assert!(shown_db.contains(' '), "{shown_db}");
+        for listed in [
+            "the config stored under the key 'gate-config:Owner-Repo', whose `repo` is \
+             \"Owner/Repo\", does not parse: ",
+            "the config stored under the key 'gate-config:github.com-owner-repo' does not parse: ",
+        ] {
+            assert!(message.contains(listed), "{message}");
+        }
+        assert!(message.contains("; the config stored under"), "{message}");
+        for remedy in [
+            format!("run `ironmem autopilot onboard Owner/Repo --path . --db '{shown_db}'` from"),
+            format!("with the name it was onboarded under and `--db '{shown_db}'` (its key is"),
+        ] {
+            assert!(message.contains(&remedy), "{message}");
+        }
+        assert!(
+            message.contains("cannot be reported until those configs are replaced: "),
+            "{message}"
+        );
+        assert!(message.ends_with(", then ask again"), "{message}");
     }
 
     #[test]
@@ -3113,22 +3331,68 @@ mod tests {
     // ── a database path the report could not name ───────────────────────
 
     #[test]
-    fn a_database_path_that_cannot_be_made_absolute_is_an_error_not_a_relative_path() {
+    fn an_empty_database_path_is_an_error_that_names_both_places_it_can_come_from() {
         // An empty path is the one input `std::path::absolute` refuses
-        // whatever the working directory is.
+        // whatever the working directory is, and it is what an empty `--db`
+        // and an empty `IRONMEM_DB_PATH` both arrive as.
         let err = read_gate_config_status(Path::new(""), &repo("owner/repo")).unwrap_err();
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            "the database path is empty — check `--db` and `IRONMEM_DB_PATH`"
+        );
+        let shown = MemoryError::from(err);
+        assert!(matches!(shown, MemoryError::Validation(_)), "{shown:?}");
+        assert_eq!(shown.to_string(), format!("Validation error: {message}"));
+    }
+
+    #[test]
+    fn a_relative_database_path_with_no_working_directory_says_what_is_missing() {
+        // What `std::path::absolute` returns for a relative path when the
+        // working directory has been removed.
+        let err = StatusError::DbPathNotAbsolute {
+            given: PathBuf::from("memory.sqlite3"),
+            source: std::io::Error::from(std::io::ErrorKind::NotFound),
+        };
+        let message = err.to_string();
         assert!(
-            matches!(&err, StatusError::DbPathNotAbsolute { given, .. } if given == Path::new("")),
-            "{err:?}"
+            message.starts_with("could not make the database path 'memory.sqlite3' absolute: "),
+            "{message}"
+        );
+        // Not a missing database: the working directory is what could not
+        // be read.
+        assert!(
+            message.ends_with(
+                " — a relative path is read against the working directory, which could not be \
+                 read; pass an absolute `--db`"
+            ),
+            "{message}"
         );
         let shown = MemoryError::from(err);
         assert!(matches!(shown, MemoryError::Io(_)), "{shown:?}");
-        assert!(
-            shown
-                .to_string()
-                .contains("could not make the database path '' absolute"),
-            "{shown}"
+        assert_eq!(shown.to_string(), format!("IO error: {message}"));
+    }
+
+    #[test]
+    fn a_database_path_that_is_a_directory_is_refused_as_one_before_sqlite_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::absolute(dir.path()).unwrap();
+
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            format!(
+                "{} is a directory, not a database file — name the database file with `--db \
+                 <path>` or `IRONMEM_DB_PATH`",
+                path.display()
+            )
         );
+        let shown = MemoryError::from(err);
+        assert!(matches!(shown, MemoryError::Validation(_)), "{shown:?}");
+        assert_eq!(shown.to_string(), format!("Validation error: {message}"));
+        assert_eq!(std::fs::read_dir(&path).unwrap().count(), 0);
     }
 
     #[cfg(unix)]

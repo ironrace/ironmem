@@ -558,6 +558,46 @@ fn status_never_creates_a_missing_database() {
 }
 
 #[test]
+fn a_missing_database_is_created_by_the_onboard_its_error_names() {
+    let fixture = Fixture::new();
+    let db = fixture.db_path();
+
+    let output = fixture.status(ALL_LABELS, None);
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &[
+            &format!("Error: Not found: db not found at {}", db.display()),
+            "If Autopilot has never been set up with this database, `ironmem autopilot onboard` \
+             creates it",
+        ],
+    );
+    assert!(!db.exists(), "status created the database file");
+
+    // What the error says is true: `onboard` creates the database.
+    let checkout = fixture.root.path().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let mut onboard = ironmem();
+    onboard
+        .args(["autopilot", "onboard", REPO, "--path", ".", "--db"])
+        .arg(&db)
+        .current_dir(&checkout);
+    fixture.env(
+        &mut onboard,
+        &isolated_path(&fixture.stubs()),
+        ALL_LABELS,
+        None,
+    );
+    let onboarded = onboard.output().unwrap();
+    assert!(onboarded.status.success(), "{onboarded:?}");
+
+    let report = report(&fixture.status(ALL_LABELS, None));
+    assert_eq!(report["gate_config"]["state"], json!("pending"));
+}
+
+#[test]
 fn the_text_report_is_the_default() {
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
@@ -727,7 +767,70 @@ fn an_empty_db_path_exits_one_instead_of_reporting_a_relative_path() {
     assert_unreadable(
         &fixture,
         &output,
-        &["could not make the database path '' absolute"],
+        &["Error: Validation error: the database path is empty — check `--db` and `IRONMEM_DB_PATH`"],
+    );
+}
+
+#[test]
+fn an_empty_ironmem_db_path_exits_one_and_the_error_names_the_variable() {
+    let fixture = Fixture::new();
+
+    let output = fixture
+        .bare(&[REPO, "--json"])
+        .env("IRONMEM_DB_PATH", "")
+        .output()
+        .unwrap();
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &["Error: Validation error: the database path is empty — check `--db` and `IRONMEM_DB_PATH`"],
+    );
+    assert_eq!(fixture.home_entries(), Vec::<String>::new());
+}
+
+#[test]
+fn a_relative_db_from_a_removed_working_directory_exits_one_and_says_what_is_missing() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    let gone = fixture.root.path().join("gone");
+    std::fs::create_dir_all(&gone).unwrap();
+
+    // The shell enters the directory, removes it, and becomes `ironmem`:
+    // the only way to start a process whose working directory is gone.
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", r#"cd "$1" && rmdir "$1" && shift && exec "$@""#, "sh"])
+        .arg(&gone)
+        .arg(autopilot_support::bin())
+        .args([
+            "autopilot",
+            "status",
+            REPO,
+            "--json",
+            "--db",
+            "memory.sqlite3",
+        ])
+        .arg("--path")
+        .arg(fixture.root.path());
+    autopilot_support::scrub_git_env(&mut command);
+    fixture.env(
+        &mut command,
+        &isolated_path(&fixture.stubs()),
+        ALL_LABELS,
+        None,
+    );
+    let output = command.output().unwrap();
+
+    assert!(!gone.exists(), "the shell did not remove the directory");
+    assert_unreadable(
+        &fixture,
+        &output,
+        &[
+            "Error: IO error: could not make the database path 'memory.sqlite3' absolute: ",
+            " — a relative path is read against the working directory, which could not be read; \
+             pass an absolute `--db`",
+        ],
     );
 }
 
@@ -852,6 +955,54 @@ fn a_path_that_is_a_regular_file_is_a_failed_label_read_and_gh_does_not_run() {
     assert_eq!(report["labels"]["read"], json!("failed"));
     let error = report["labels"]["error"].as_str().unwrap();
     assert!(error.contains("--path"), "{error}");
+    assert_eq!(fixture.gh_log(), "", "gh did not run");
+}
+
+#[test]
+fn a_path_gh_cannot_be_started_in_is_a_failed_label_read_that_names_the_path() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    // A directory this user can see and cannot enter: the check that it is
+    // a directory passes, and starting `gh` in it fails.
+    let locked = fixture.root.path().join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // As root the directory can be entered and the case cannot arise.
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        eprintln!("skipped: running as root, a directory mode does not stop gh starting in it");
+        return;
+    }
+
+    let output = fixture
+        .command(
+            REPO,
+            &fixture.db_path(),
+            &locked,
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+    // Restore before asserting, so a failure still lets the tempdir drop.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let report = report(&output);
+    assert_eq!(report["gate_config"]["state"], json!("pending"));
+    assert_eq!(report["labels"]["read"], json!("failed"));
+    let error = report["labels"]["error"].as_str().unwrap();
+    assert!(error.starts_with("failed to start "), "{error}");
+    // The failure is about the directory, so the error has to name it, and
+    // the flag it came from: `gh` itself is fine.
+    assert!(
+        error.ends_with(&format!(
+            " — gh is started in the directory `--path` names, '{}', so check that this user \
+             can enter it",
+            locked.display()
+        )),
+        "{error}"
+    );
     assert_eq!(fixture.gh_log(), "", "gh did not run");
 }
 
@@ -1387,9 +1538,10 @@ fn gh_output_that_is_empty_is_a_failed_label_read() {
     assert_eq!(report["labels"]["read"], json!("failed"));
     assert!(report["labels"].get("agent").is_none());
     let error = report["labels"]["error"].as_str().unwrap();
-    assert!(
-        error.starts_with("could not parse `gh label list --json name`"),
-        "{error}"
+    assert_eq!(
+        error,
+        "gh label list on owner/repo exited 0, but its output could not be read as a label list \
+         — it printed nothing on stdout"
     );
     assert_eq!(fixture.gh_log(), EXPECTED_GH_LOG);
 }
@@ -1448,15 +1600,16 @@ fn a_db_path_that_is_a_directory_exits_one_and_is_not_called_missing() {
 
     let output = fixture.status_at(&dir, &isolated_path(&fixture.stubs()), ALL_LABELS, None);
 
-    // SQLite's own wording for a directory differs by platform, so only what
-    // holds everywhere is pinned: a database error that names the path.
+    // Said before SQLite is asked: it opens a directory without complaint
+    // and fails on the first read with a message about the disk.
     assert_unreadable(
         &fixture,
         &output,
-        &[
-            "Error: Database error: could not ",
-            &dir.display().to_string(),
-        ],
+        &[&format!(
+            "Error: Validation error: {} is a directory, not a database file — name the \
+             database file with `--db <path>` or `IRONMEM_DB_PATH`",
+            dir.display()
+        )],
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("not found"), "{stderr}");

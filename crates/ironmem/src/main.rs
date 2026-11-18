@@ -3620,8 +3620,13 @@ after {n} attempt(s)",
                     render_text(&status, db.is_some())
                 };
                 // Not `print!`, which panics (exit 101) when stdout is a
-                // closed pipe or a full disk: a report that could not be
-                // written is exit 1, like every other failure to report.
+                // closed pipe or a full disk: a write that fails is exit 1,
+                // like every other failure to report. A stdout that was
+                // closed before the program started (`>&-`) is not such a
+                // failure and is not detected: the Rust runtime reopens a
+                // closed standard descriptor on `/dev/null` and reads a bad
+                // descriptor on stdout as written, so the report is
+                // discarded and the exit is 0.
                 let mut stdout = std::io::stdout().lock();
                 write!(stdout, "{report}")
                     .and_then(|()| stdout.flush())

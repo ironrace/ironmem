@@ -771,9 +771,9 @@ fn label_list_failure(repo: &str, out: &GhOutput) -> String {
 ///
 /// Every way this can fail is an `Err`, and none of them is an empty list: a
 /// `gh` that could not start, a non-zero exit (auth, rate limit, unknown
-/// repo), output that is not the expected JSON, and a list long enough to
-/// have been truncated. The caller reports each as a *failed read*; an empty
-/// `Ok` means the repo really has no labels.
+/// repo), output that is not the expected JSON (nothing at all included),
+/// and a list long enough to have been truncated. The caller reports each as
+/// a *failed read*; an empty `Ok` means `gh` printed an empty list (`[]`).
 ///
 /// A `gh` that did not succeed is [`MemoryError::NotFound`], the variant
 /// every refused read in this module is carried in, whatever the cause was.
@@ -782,7 +782,25 @@ pub fn repo_labels(gh: &mut dyn GhRunner, repo: &str) -> Result<Vec<String>, Mem
     if !out.success {
         return Err(MemoryError::NotFound(label_list_failure(repo, &out)));
     }
-    let names = parse_label_list(&out.stdout)?;
+    // A `gh` that exited 0 and printed something else: the error names the
+    // repo and keeps what `gh` said on stderr, which is the only clue left.
+    let unreadable = |reason: &str| {
+        let said = match out.stderr.trim() {
+            "" => String::new(),
+            said => format!(" (gh also printed: {said})"),
+        };
+        MemoryError::Validation(format!(
+            "gh label list on {repo} exited 0, but its output could not be read as a label list \
+             — {reason}{said}"
+        ))
+    };
+    if out.stdout.trim().is_empty() {
+        return Err(unreadable("it printed nothing on stdout"));
+    }
+    let names = parse_label_list(&out.stdout).map_err(|err| match err {
+        MemoryError::Validation(reason) => unreadable(&reason),
+        other => other,
+    })?;
     if names.len() >= LABEL_LIST_LIMIT {
         return Err(MemoryError::Validation(format!(
             "gh label list on {repo} returned {} labels, at least the limit it was asked for — \
@@ -2936,6 +2954,55 @@ mod tests {
         let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("not json"))]);
         let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
         assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn a_label_list_that_cannot_be_read_names_the_repo_and_keeps_what_gh_said() {
+        let exited_zero = |stdout: &str, stderr: &str| {
+            let mut gh = ScriptedGh::new(vec![Ok(GhOutput {
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+                success: true,
+                code: Some(0),
+            })]);
+            match repo_labels(&mut gh, "owner/repo").unwrap_err() {
+                MemoryError::Validation(message) => message,
+                other => panic!("expected Validation, got {other:?}"),
+            }
+        };
+        let head = "gh label list on owner/repo exited 0, but its output could not be read as a \
+                    label list — ";
+
+        // Nothing on stdout is said in words, not as a JSON parser's "EOF".
+        assert_eq!(
+            exited_zero(" \n", ""),
+            format!("{head}it printed nothing on stdout")
+        );
+        // What `gh` printed on stderr is the only clue there is, so it stays.
+        assert_eq!(
+            exited_zero("", "  warning: something changed\n"),
+            format!(
+                "{head}it printed nothing on stdout (gh also printed: warning: something changed)"
+            )
+        );
+        let not_json = exited_zero("not json", "a notice");
+        assert!(
+            not_json.starts_with(&format!(
+                "{head}could not parse `gh label list --json name`: "
+            )),
+            "{not_json}"
+        );
+        assert!(
+            not_json.ends_with(" (gh also printed: a notice)"),
+            "{not_json}"
+        );
+        let no_name = exited_zero(r#"[{"name":"bug"},{}]"#, "");
+        assert!(
+            no_name.starts_with(&format!(
+                "{head}`gh label list --json name` returned a label with no name"
+            )),
+            "{no_name}"
+        );
     }
 
     #[test]
