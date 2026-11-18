@@ -141,7 +141,8 @@ Options:
   --skip-skills    Do not install bundled Codex/Claude/Muse skill, agent,
                    command, and prompt dependencies.
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse
-                   config.
+                   config, and do not wire the Claude Code hooks into
+                   $CLAUDE_HOME/settings.json.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
                    files update by default (three-way merged for Codex/Claude,
                    overwritten in the Muse managed store); use --skip-skills
@@ -684,6 +685,79 @@ register_json_mcpservers() {
   fi
 }
 
+# ---- Claude Code hooks (#377) ----------------------------------------------
+# A plugin install gets its four hooks from .claude-plugin/hooks/hooks.json. A
+# script install gets the same four here, in $CLAUDE_HOME/settings.json, each
+# running the installed binary directly. They carry no IRONMEM_MCP_MODE, so
+# they run read-only: SessionStart context and UserPromptSubmit recall work,
+# and Stop and PreCompact skip mining (a cheaper way to mine outside the
+# plugin is #418). `ironmem doctor` reports that on its hook_mining line.
+#
+# The merge only appends. An event that already runs `ironmem hook <name>`
+# (from any path, or through the plugin's ironmem-hook.sh) is left alone, and
+# so is every other hook and key. The file is rewritten in place (`cat >`)
+# instead of being moved over, so a settings.json symlinked into a dotfiles
+# repo stays a symlink. Keep CLAUDE_HOOK_EVENTS in step with PLUGIN_HOOKS in
+# crates/ironmem/src/doctor/hooks.rs; the unit test
+# plugin_hooks_table_matches_the_plugin_hooks_json pins that table to
+# hooks.json, and scripts/test_install_ironmem.py pins this one to it.
+CLAUDE_HOOK_EVENTS=(
+  SessionStart:session-start
+  UserPromptSubmit:user-prompt-submit
+  Stop:stop
+  PreCompact:precompact
+)
+
+wire_claude_hooks() {
+  local settings="$1" pair event name tmp added="" kept=""
+
+  if [[ ! -f "$settings" ]]; then
+    mkdir -p "$(dirname "$settings")"
+    printf '{}\n' > "$settings"
+  fi
+
+  if ! jq -e 'type == "object" and ((.hooks // {}) | type == "object" and all(.[]; type == "array"))' \
+    "$settings" >/dev/null 2>&1; then
+    echo "    WARN: $settings is not a JSON object with array-valued hooks; wired no Claude hooks." >&2
+    echo "          Fix the file, then re-run this script. \`ironmem doctor\` shows what is missing." >&2
+    return 0
+  fi
+
+  if jq -e '(.enabledPlugins // {}) | to_entries | any((.key == "ironmem" or (.key | startswith("ironmem@"))) and .value == true)' \
+    "$settings" >/dev/null 2>&1; then
+    echo "    Claude hooks come from the enabled ironmem plugin; wired none in $settings"
+    return 0
+  fi
+
+  for pair in "${CLAUDE_HOOK_EVENTS[@]}"; do
+    event="${pair%%:*}"
+    name="${pair#*:}"
+    if jq -e --arg ev "$event" --arg name "$name" '
+        [(.hooks[$ev] // [])[] | (.hooks // [])[] | (.command // "")]
+        | any(test("(^|[/\\s])ironmem(-mcp\\.sh)?\\s+hook\\s+" + $name + "(\\s|$)")
+              or test("ironmem-hook\\.sh\\s+" + $name + "(\\s|$)"))' \
+      "$settings" >/dev/null 2>&1; then
+      kept+="$event "
+      continue
+    fi
+    tmp="$(mktemp)"
+    jq --arg ev "$event" --arg cmd "$TARGET hook $name --harness claude-code" \
+      '.hooks = (.hooks // {}) | .hooks[$ev] = ((.hooks[$ev] // []) + [{hooks: [{type: "command", command: $cmd}]}])' \
+      "$settings" > "$tmp"
+    cat "$tmp" > "$settings"
+    rm -f "$tmp"
+    added+="$event "
+  done
+
+  if [[ -n "$added" ]]; then
+    echo "==> Wired Claude hooks in $settings: ${added% }"
+    echo "    They run read-only: prompt recall works; Stop and PreCompact skip mining (see \`ironmem doctor\`)."
+  fi
+  if [[ -n "$kept" ]]; then
+    echo "    Claude hooks already wired, left as they are: ${kept% }"
+  fi
+}
+
 if [[ "$SKIP_BUILD" -eq 0 ]]; then
   echo "==> Building ironmem release"
   (cd "$REPO_ROOT" && cargo build --release -p ironmem --bin ironmem)
@@ -777,6 +851,7 @@ fi
 # install the files but wire MCP themselves.
 if [[ "$SKIP_WIRING" -eq 0 ]]; then
   CLAUDE_CONFIG_JSON="${CLAUDE_CONFIG_JSON:-$HOME/.claude.json}"
+  CLAUDE_SETTINGS_JSON="${CLAUDE_SETTINGS_JSON:-$CLAUDE_HOME/settings.json}"
   CODEX_CONFIG_TOML="${CODEX_CONFIG_TOML:-$CODEX_HOME/config.toml}"
 
   # Muse reads $XDG_CONFIG_HOME/muse/settings.json when that variable is set
@@ -800,10 +875,14 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     echo "          the ironmem entry so a stale command cannot abort a Muse session, and" >&2
     echo "          \"schema_version\": 1 alongside \"mcpServers\" if you are creating that file:" >&2
     echo "          { \"schema_version\": 1, \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" }, \"mode\": \"optional\" } } }" >&2
+    echo "          Claude Code hooks were not wired either. Add these four to $CLAUDE_SETTINGS_JSON" >&2
+    echo "          under \"hooks\" (SessionStart, UserPromptSubmit, Stop, PreCompact), each as" >&2
+    echo "          { \"hooks\": [ { \"type\": \"command\", \"command\": \"$TARGET hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] }" >&2
   else
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \
       '{"schema_version": 1}' '{"mode": "optional"}'
+    wire_claude_hooks "$CLAUDE_SETTINGS_JSON"
   fi
 
   # ---- Codex: ~/.codex/config.toml [mcp_servers.ironmem] --------------------

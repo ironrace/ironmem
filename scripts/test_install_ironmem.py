@@ -26,6 +26,7 @@ import unittest
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "scripts" / "install-ironmem.sh"
 RELEASE_BINARY = ROOT / "target" / "release" / "ironmem"
+PLUGIN_HOOKS_JSON = ROOT / ".claude-plugin" / "hooks" / "hooks.json"
 
 
 class InstallIronmemSelfTest(unittest.TestCase):
@@ -101,6 +102,9 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 # every full-install test. Tests that pin the Muse argv override
                 # MUSE_BIN with a recording shim.
                 "MUSE_BIN": str(home / ".no-muse-here"),
+                # Pinned, not inherited: the installer now writes Claude hooks
+                # into $CLAUDE_HOME/settings.json.
+                "CLAUDE_HOME": str(home / ".claude"),
                 **(extra_env or {}),
             },
             capture_output=True,
@@ -803,6 +807,135 @@ class InstallIronmemSelfTest(unittest.TestCase):
             for name in ("using-superpowers", "executing-plans"):
                 self.assertFalse((skills_dir / name).exists(), f"{name} survived on the Codex side")
             self.assertTrue((skills_dir / "pr-review-toolkit" / "SKILL.md").is_file())
+
+
+    def claude_settings(self, home: pathlib.Path) -> dict[str, object]:
+        return json.loads((home / ".claude" / "settings.json").read_text(encoding="utf-8"))
+
+    @staticmethod
+    def ironmem_hook_commands(settings: dict, event: str) -> list[str]:
+        return [
+            hook.get("command", "")
+            for group in settings.get("hooks", {}).get(event, [])
+            for hook in group.get("hooks", [])
+            if "ironmem" in hook.get("command", "")
+        ]
+
+    @staticmethod
+    def plugin_hook_names() -> dict[str, str]:
+        plugin = json.loads(PLUGIN_HOOKS_JSON.read_text(encoding="utf-8"))["hooks"]
+        return {event: groups[0]["hooks"][0]["command"].split()[-1] for event, groups in plugin.items()}
+
+    def test_fresh_install_wires_the_plugin_hooks_read_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            result = self.run_installer(home, home / ".claude.json")
+
+            settings = self.claude_settings(home)
+            target = home / ".ironrace" / "bin" / "ironmem"
+            names = self.plugin_hook_names()
+            self.assertEqual(set(settings["hooks"]), set(names), "same events as the plugin")
+            for event, name in names.items():
+                self.assertEqual(
+                    self.ironmem_hook_commands(settings, event),
+                    [f"{target} hook {name} --harness claude-code"],
+                )
+            self.assertNotIn("IRONMEM_MCP_MODE", json.dumps(settings), "decided: hooks stay read-only")
+            self.assertIn("Wired Claude hooks", result.stdout)
+            self.assertIn("skip mining", result.stdout)
+
+    def test_rerun_does_not_duplicate_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            self.run_installer(home, home / ".claude.json")
+            result = self.run_installer(home, home / ".claude.json")
+
+            settings = self.claude_settings(home)
+            for event in self.plugin_hook_names():
+                self.assertEqual(len(self.ironmem_hook_commands(settings, event)), 1, event)
+            self.assertIn("already wired", result.stdout)
+
+    def test_existing_hooks_and_keys_are_kept(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(
+                json.dumps(
+                    {
+                        "model": "opus",
+                        "hooks": {
+                            "SessionStart": [
+                                {"hooks": [{"type": "command", "command": "~/.ironrace/bin/ironmem hook session-start --harness claude-code"}]}
+                            ],
+                            "Stop": [{"hooks": [{"type": "command", "command": "~/.claude/scripts/reply-rules.sh"}]}],
+                            "Notification": [{"hooks": [{"type": "command", "command": "say hi"}]}],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.run_installer(home, home / ".claude.json")
+
+            settings = self.claude_settings(home)
+            self.assertEqual(settings["model"], "opus")
+            self.assertEqual(settings["hooks"]["Notification"], [{"hooks": [{"type": "command", "command": "say hi"}]}])
+            # The hand-wired SessionStart (different path) is recognized, not duplicated.
+            self.assertEqual(
+                self.ironmem_hook_commands(settings, "SessionStart"),
+                ["~/.ironrace/bin/ironmem hook session-start --harness claude-code"],
+            )
+            stop_commands = [h["command"] for g in settings["hooks"]["Stop"] for h in g["hooks"]]
+            self.assertEqual(stop_commands[0], "~/.claude/scripts/reply-rules.sh")
+            self.assertEqual(len(self.ironmem_hook_commands(settings, "Stop")), 1)
+
+    def test_enabled_plugin_gets_no_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            original = json.dumps({"enabledPlugins": {"ironmem@ironrace": True}})
+            settings_path.write_text(original, encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), original)
+            self.assertIn("enabled ironmem plugin", result.stdout)
+
+    def test_malformed_hooks_are_left_alone_with_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            original = json.dumps({"hooks": {"Stop": {"not": "an array"}}})
+            settings_path.write_text(original, encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertEqual(settings_path.read_text(encoding="utf-8"), original)
+            self.assertIn("wired no Claude hooks", result.stderr)
+
+    def test_symlinked_settings_stays_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            real = home / "dotfiles" / "settings.json"
+            real.parent.mkdir(parents=True)
+            real.write_text("{}", encoding="utf-8")
+            link = home / ".claude" / "settings.json"
+            link.parent.mkdir(parents=True)
+            link.symlink_to(real)
+
+            self.run_installer(home, home / ".claude.json")
+
+            self.assertTrue(link.is_symlink(), "a dotfiles symlink must survive the install")
+            self.assertIn("hooks", json.loads(real.read_text(encoding="utf-8")))
+
+    def test_skip_wiring_leaves_claude_settings_absent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            self.run_installer(home, home / ".claude.json", skip_wiring=True)
+            self.assertFalse((home / ".claude" / "settings.json").exists())
 
 
 if __name__ == "__main__":
