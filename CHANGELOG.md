@@ -14,7 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.claude/settings.json` (or reports that the enabled plugin supplies them);
   `hook_mining` says whether Stop/PreCompact can mine, with each hook's
   effective `IRONMEM_MCP_MODE` and where it came from; `mined_rows` shows how
-  old the newest mined row is and warns past 7 days. Problems are warnings and
+  old the newest mined row (a chunk of a workspace file) is and warns past 7
+  days, which an unchanged workspace also triggers. Problems are warnings and
   never fail `doctor` (exit 0). `scripts/install-ironmem.sh` now appends the
   four hooks to `$CLAUDE_HOME/settings.json` (override with
   `CLAUDE_SETTINGS_JSON`) unless the ironmem plugin is enabled. Hooks already

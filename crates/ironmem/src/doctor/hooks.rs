@@ -27,7 +27,8 @@ pub(super) const PLUGIN_HOOKS: [(&str, &str); 4] = [
     ("PreCompact", "precompact"),
 ];
 
-/// The hooks whose run mines transcripts (and is skipped without write access).
+/// The hooks whose run mines the workspace's changed files (and is skipped
+/// without write access).
 const MINING_EVENTS: [&str; 2] = ["Stop", "PreCompact"];
 
 const INSTALL_HINT: &str = "re-run scripts/install-ironmem.sh to wire the missing hooks, \
@@ -131,7 +132,7 @@ pub(super) fn claude_hook_checks(
                 CheckStatus::Warn,
                 format!(
                     "Claude Code hooks: none wired ({} does not exist): \
-                     prompt recall and transcript mining are off",
+                     prompt recall is off and workspace files are not mined",
                     path.display()
                 ),
             )
@@ -347,8 +348,8 @@ fn failure_consequence(event: &str) -> &'static str {
     match event {
         "SessionStart" => "no memory context is loaded at session start",
         "UserPromptSubmit" => "prompt recall is off",
-        "Stop" => "no transcript is mined when a session stops",
-        "PreCompact" => "no transcript is mined before compaction",
+        "Stop" => "workspace files are not mined when a session stops",
+        "PreCompact" => "workspace files are not mined before compaction",
         _ => "an unknown hook does not run",
     }
 }
@@ -643,7 +644,7 @@ fn no_miner_check() -> Check {
     Check::new(
         "hook_mining",
         CheckStatus::Warn,
-        "no Stop or PreCompact hook is wired: transcripts are not mined",
+        "no Stop or PreCompact hook is wired: workspace files are not mined",
     )
     .with_hint(INSTALL_HINT)
 }
@@ -1033,8 +1034,8 @@ mod tests {
             *s,
             format!(
                 "Claude Code hooks: missing SessionStart, UserPromptSubmit, PreCompact in {} \
-                 (no memory context is loaded at session start; prompt recall is off; no \
-                 transcript is mined before compaction)",
+                 (no memory context is loaded at session start; prompt recall is off; \
+                 workspace files are not mined before compaction)",
                 path.display()
             )
         );
@@ -1050,9 +1051,10 @@ mod tests {
         let home = home_with_settings(&settings_with(&ALL_FOUR_BARE[..2]));
         let checks = claude_hook_checks(Some(home.path()), None);
         assert_eq!(checks[1].status, CheckStatus::Warn);
-        assert!(checks[1]
-            .summary
-            .contains("no Stop or PreCompact hook is wired"));
+        assert_eq!(
+            checks[1].summary,
+            "no Stop or PreCompact hook is wired: workspace files are not mined"
+        );
     }
 
     #[test]
@@ -1086,6 +1088,13 @@ mod tests {
         assert_eq!(
             (c[0].status, c[1].status),
             (CheckStatus::Warn, CheckStatus::Warn)
+        );
+        assert!(
+            c[0].summary.ends_with(
+                "does not exist): prompt recall is off and workspace files are not mined"
+            ),
+            "{}",
+            c[0].summary
         );
         // Malformed JSON: hooks warns, mining is skipped as Info.
         let broken = home_with_settings("{not json");
@@ -1851,8 +1860,11 @@ mod tests {
                  env in settings.json), so no memory context is loaded at session start; \
                  UserPromptSubmit fails to start: {BOGUS_REASON} (set by env in \
                  settings.json), so prompt recall is off",
-                may_cover("Stop", "no transcript is mined when a session stops"),
-                may_cover("PreCompact", "no transcript is mined before compaction"),
+                may_cover("Stop", "workspace files are not mined when a session stops"),
+                may_cover(
+                    "PreCompact",
+                    "workspace files are not mined before compaction"
+                ),
             )
         );
         assert_eq!(
@@ -2319,8 +2331,8 @@ mod tests {
         assert_eq!(
             c[0].summary,
             format!(
-                "Claude Code hooks: missing PreCompact in {} (no transcript is mined before \
-                 compaction); \
+                "Claude Code hooks: missing PreCompact in {} (workspace files are not mined \
+                 before compaction); \
                  SessionStart fails to start: IRONMEM_MCP_MODE=\"bogus\" is not trusted, \
                  read-only or restricted (set in the hook command), so no memory context is \
                  loaded at session start; UserPromptSubmit's mode cannot be determined \

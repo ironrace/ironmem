@@ -310,7 +310,7 @@ fn non_plugin_read_only_hooks_say_plainly_that_nothing_is_mined() {
     );
     assert!(stdout.contains("no wired hook mines"), "{stdout}");
     assert!(
-        stdout.contains("(2026-01-01 00:00:00 UTC): transcripts are not being mined"),
+        stdout.contains("(2026-01-01 00:00:00 UTC): nothing new has been mined since"),
         "{stdout}"
     );
 }

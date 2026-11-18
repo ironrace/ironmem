@@ -627,8 +627,10 @@ the first `[FAIL]`:
   Stop and PreCompact commands with `IRONMEM_MCP_MODE=trusted` turns mining on,
   at the cost of loading the embedding model and rebuilding the vector index on
   each run; a cheaper path is tracked in #418.
-- **`mined_rows` older than 7 days** (a `[WARN]`) → nothing has been mined
-  recently. MCP writes don't count. Check the `hook_mining` line.
+- **`mined_rows` older than 7 days** (a `[WARN]`) → no workspace file has been
+  mined in that time. Mining stores only files whose content changed, so a
+  workspace you haven't edited looks the same as mining that stopped; MCP writes
+  don't count. Check the `hook_mining` line.
 
 Codex's config location honors `CODEX_HOME` (default `~/.codex/config.toml`);
 Claude Code's is `~/.claude.json`; Muse Code's is `$XDG_CONFIG_HOME/muse/settings.json`,
@@ -815,7 +817,7 @@ The DB is updated automatically as you work:
 
 - **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet. In Claude Code the injected status block also tells the session to say "ironmem tools failed to load" when no ironmem tools reached it, so a rejected tool list or dead server is loud instead of a session silently working without memory
 - **UserPromptSubmit** (Claude Code only) — every prompt with at least two content words triggers bounded local BM25/KG/diary recall, with drawers scoped to the current workspace (with opt-in ready-daemon hybrid vector recall; embedder never loaded by the hook) that injects sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for all prompt-recall tunables and daemon cost caveats, and [UserPromptSubmit recall](#userpromptsubmit-recall-claude-code-only) for what is and isn't recalled
-- **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary. A hook without write access (`ironmem hook` run with `IRONMEM_MCP_MODE` unset or `read-only`, the default for hand-registered hook commands) never mines and only records metrics, from the database alone: the embedder and vector index are never loaded, so a Stop costs milliseconds instead of seconds on a large store. The plugin's hooks run `trusted` and still load them to mine. `scripts/install-ironmem.sh` wires these hooks read-only, and `ironmem doctor`'s `hook_mining` and `mined_rows` lines show whether a store is being mined.
+- **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary. A hook without write access (`ironmem hook` run with `IRONMEM_MCP_MODE` unset or `read-only`, the default for hand-registered hook commands) never mines and only records metrics, from the database alone: the embedder and vector index are never loaded, so a Stop costs milliseconds instead of seconds on a large store. The plugin's hooks run `trusted` and still load them to mine. `scripts/install-ironmem.sh` wires these hooks read-only, and `ironmem doctor`'s `hook_mining` line shows whether they can mine and its `mined_rows` line when a file was last mined.
 - **Stop handoff nudge** (Claude Code only) — after a commit, push or PR, or 5+ file edits since the session last saved to ironmem, the Stop is blocked once with a request to save a handoff drawer (wing = the workspace's repository wing, the one prompt recall reads it from, room `handoffs`, logical_key `<branch>-handoff`), so the next session in any harness resumes from memory. At most once per 30 minutes per session, never on a stop that is already retrying; `IRONMEM_HANDOFF_NUDGE=0` (or `false`/`no`/`off`) turns it off
 - **Later sessions** — only files whose content hash changed since the last hook run are re-embedded, so updates are fast
 

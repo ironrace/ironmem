@@ -1,10 +1,13 @@
 //! The `mined_rows` doctor check (#377): how old the newest mined drawer is.
 //!
 //! MCP writes keep a store looking alive while hook mining has stopped, so the
-//! age of the newest `added_by = 'mine'` row is the direct evidence of whether
-//! transcripts are still being mined. It is also the backstop for the
-//! `hook_mining` check, which infers a hook's mode from config and can be
-//! wrong about it.
+//! age of the newest `added_by = 'mine'` row (a chunk of a workspace file,
+//! written by a trusted hook, the launcher's warm-up or `ironmem mine`) is the
+//! direct evidence of whether files are still being mined. Mining stores only
+//! files whose content changed, so an old row means either that mining stopped
+//! or that no mined workspace changed; this check cannot tell which. It is also
+//! the backstop for the `hook_mining` check, which infers a hook's mode from
+//! config and can be wrong about it.
 
 use std::path::Path;
 use std::time::Duration;
@@ -68,7 +71,7 @@ pub(super) fn mined_rows_check(
             return Check::new(
                 KEY,
                 CheckStatus::Info,
-                "no mined rows yet: no transcript has been mined into this store",
+                "no mined rows yet: no workspace file has been mined into this store",
             )
             .with_hint("mining runs in the Stop and PreCompact hooks; see the hook_mining line")
         }
@@ -87,12 +90,13 @@ pub(super) fn mined_rows_check(
             KEY,
             CheckStatus::Warn,
             format!(
-                "newest mined row is {} old ({filed_at} UTC): transcripts are not being mined",
+                "newest mined row is {} old ({filed_at} UTC): nothing new has been mined since",
                 describe_age(age)
             ),
         )
         .with_hint(
-            "MCP writes do not count as mining; the hook_mining line says why the hooks skip it",
+            "only changed files are mined, so a workspace left unchanged that long looks the \
+             same; MCP writes do not count; the hook_mining line says whether the hooks mine",
         )
     } else {
         Check::new(
@@ -152,11 +156,16 @@ mod tests {
         assert_eq!(c.status, CheckStatus::Warn);
         assert!(c.summary.contains("119 days old"), "{}", c.summary);
         assert!(
-            c.summary.contains("transcripts are not being mined"),
+            c.summary
+                .ends_with("(2026-07-18 06:10:11 UTC): nothing new has been mined since"),
             "{}",
             c.summary
         );
-        assert!(c.hint.as_deref().unwrap().contains("hook_mining"));
+        let hint = c.hint.as_deref().unwrap();
+        assert!(hint.contains("hook_mining"), "{hint}");
+        // Mining stores only changed files, so the warning cannot tell a
+        // stopped miner from an unchanged workspace; the hint must say so.
+        assert!(hint.contains("workspace left unchanged"), "{hint}");
     }
 
     #[test]
@@ -172,7 +181,10 @@ mod tests {
     fn no_mined_rows_is_info() {
         let c = mined_rows_check(Ok(None), at("2026-11-14 12:00:00"));
         assert_eq!(c.status, CheckStatus::Info);
-        assert!(c.summary.contains("no mined rows yet"), "{}", c.summary);
+        assert_eq!(
+            c.summary,
+            "no mined rows yet: no workspace file has been mined into this store"
+        );
     }
 
     #[test]
