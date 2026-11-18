@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 /// Every cleaned token is emitted as an FTS5 string (wrapped in `"`, any inner
 /// `"` doubled) and the tokens are joined by spaces, so the implicit AND applies
 /// between tokens. A bare `handoff-issue-377` is not safe: FTS5 reads `-` as a
-/// column filter (`no such column: issue`), and a bare `AND`, `OR`, `NOT` or `NEAR`
-/// or a token starting with `-` or `^` is a syntax error. Either way the rejection
-/// was scored as zero keyword hits. Inside quotes they are plain text.
+/// column filter (`no such column: issue`), and a token starting with `-` or `^`
+/// is a syntax error. Either way the rejection was scored as zero keyword hits.
+/// Inside quotes they are plain text.
 ///
 /// A quoted string is a phrase, so a hyphenated word such as `non-plugin` matches
 /// only where `non` and `plugin` are adjacent and in that order (the
@@ -20,11 +20,18 @@ use sha2::{Digest, Sha256};
 /// with one another, so partial overlap between *different* tokens is unchanged.
 ///
 /// A token with no letter or digit (`-`, `'`) would become an empty phrase, so it
-/// is dropped. So is a bare upper-case `AND`, `OR`, `NOT` or `NEAR`: quoted, it
-/// would have to occur in the drawer (`hooks AND` would need the word `and`),
-/// whereas the writer meant an operator, not a term. FTS5 keywords are
-/// case-sensitive, so a lower-case `and` stays a word. If every token is dropped the result is empty, as it is for an
-/// empty query, and the caller returns no hits.
+/// is dropped.
+///
+/// The four upper-case words `AND`, `OR`, `NOT` and `NEAR` are dropped when they
+/// are bare in the query, so a query is always plain words. At the start or end of
+/// a query FTS5 rejected them, and the rejection was scored as zero keyword hits.
+/// Between two words the first three used to act as operators (`a OR b` matched
+/// either word, `a NOT b` excluded `b`); that is given up on purpose, because
+/// queries are natural-language text (the prompt-recall hook passes raw prompts,
+/// where "do NOT ..." is ordinary English) and nothing documents operator syntax.
+/// Lower-case `and`, `or`, `not` and `near` stay ordinary words, and so does a
+/// word the writer put in double quotes (`"NOT"`). If every token is dropped the
+/// result is empty, as it is for an empty query, and the caller returns no hits.
 fn fts5_sanitize(query: &str) -> String {
     query
         .split_whitespace()
@@ -33,7 +40,9 @@ fn fts5_sanitize(query: &str) -> String {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || matches!(c, '\'' | '-'))
                 .collect();
-            let is_fts_keyword = matches!(clean.as_str(), "AND" | "OR" | "NOT" | "NEAR");
+            let was_quoted = token.len() >= 2 && token.starts_with('"') && token.ends_with('"');
+            let is_fts_keyword =
+                !was_quoted && matches!(clean.as_str(), "AND" | "OR" | "NOT" | "NEAR");
             if !is_fts_keyword && clean.chars().any(char::is_alphanumeric) {
                 Some(format!("\"{}\"", clean.replace('"', "\"\"")))
             } else {
@@ -2730,6 +2739,64 @@ mod tests {
                 assert_eq!(ids, vec![id.clone()], "{query:?}");
             }
         }
+    }
+
+    fn two_drawers(db: &Database) -> (String, String) {
+        let emb = dummy_embedding();
+        let only_hooks = "h".repeat(32);
+        let both = "i".repeat(32);
+        db.insert_drawer(
+            &only_hooks,
+            "the hooks are wired",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        db.insert_drawer(
+            &both,
+            "hooks and doctor, not near",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        (only_hooks, both)
+    }
+
+    #[test]
+    fn bm25_ignores_upper_case_operator_words_so_every_term_is_required() {
+        let db = Database::open_in_memory().unwrap();
+        let (_only_hooks, both) = two_drawers(&db);
+        // `OR` and `NOT` no longer act as operators: both words are required.
+        assert_eq!(bm25_ids(&db, "hooks OR doctor", None), vec![both.clone()]);
+        assert_eq!(bm25_ids(&db, "hooks NOT doctor", None), vec![both.clone()]);
+    }
+
+    #[test]
+    fn bm25_keeps_lower_case_operator_words_and_words_that_contain_them() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let (_only_hooks, both) = two_drawers(&db);
+        // Lower-case `or` is a word: the drawer without it is not a hit.
+        assert!(bm25_ids(&db, "hooks or doctor", None).is_empty());
+        let android = "j".repeat(32);
+        db.insert_drawer(&android, "an android phone", &emb, "w", "r", "", "test")
+            .unwrap();
+        assert_eq!(bm25_ids(&db, "ANDROID", None), vec![android]);
+        assert_eq!(bm25_ids(&db, "hooks and doctor", None), vec![both]);
+    }
+
+    #[test]
+    fn bm25_keeps_an_upper_case_operator_word_the_writer_quoted() {
+        let db = Database::open_in_memory().unwrap();
+        let (_only_hooks, both) = two_drawers(&db);
+        // `"NOT"` is the word, so the drawer lacking "not" is not a hit.
+        assert_eq!(bm25_ids(&db, "hooks \"NOT\"", None), vec![both]);
     }
 
     #[test]
