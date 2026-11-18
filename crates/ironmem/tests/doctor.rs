@@ -268,6 +268,7 @@ const BARE_HOOKS: [(&str, &str); 4] = [
 ];
 
 /// Insert one mined drawer filed at `filed_at` (UTC) into an initialized store.
+/// `'mine'` copies `crate::db::drawers::MINED_ADDED_BY`, which is `pub(crate)`.
 fn insert_mined_row(db_path: &Path, filed_at: &str) {
     let conn = rusqlite::Connection::open(db_path).unwrap();
     conn.execute(
@@ -356,12 +357,17 @@ fn plugin_install_and_trusted_hooks_report_mining_on() {
         .env_remove("IRONMEM_MCP_MODE")
         .output()
         .unwrap();
+    assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         stdout.contains("supplied by the enabled ironmem plugin"),
         "{stdout}"
     );
     assert!(stdout.contains("Stop and PreCompact are mined"), "{stdout}");
+    assert!(
+        stdout.contains("Stop: trusted (the plugin wrapper's default) -> mined"),
+        "{stdout}"
+    );
 
     let trusted: Vec<(&str, String)> = BARE_HOOKS
         .iter()
@@ -374,6 +380,7 @@ fn plugin_install_and_trusted_hooks_report_mining_on() {
         .env_remove("IRONMEM_MCP_MODE")
         .output()
         .unwrap();
+    assert!(out.status.success(), "{out:?}");
     let stdout = String::from_utf8(out.stdout).unwrap();
     assert!(
         stdout.contains(
