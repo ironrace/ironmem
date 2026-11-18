@@ -803,7 +803,7 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "If the issue fetch fails, or the result has no `labels` field, stop and report the failure; never route an issue whose labels were not read.",
     "Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved.",
     "A non-zero exit, a run that could not be made, output that is not JSON, or a report that fits none of the three states above is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.",
-    "Use only its exit status and `gate_config`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.",
+    "Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.",
     "Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `\"approved\"`; keep that object's `gate_commands`.",
     "failed `status` read gets neither command: its fix line gives the command that was run, its exit status if it had one, and its error; for an `ironmem` that is missing or too old, it also says to install a current one.",
     "with the fix rule 1 gives for that state (not onboarded, pending, or a failed `status` read)",

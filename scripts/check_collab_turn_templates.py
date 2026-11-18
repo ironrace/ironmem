@@ -540,8 +540,8 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 #   - the Step 1 stop when the issue or its labels cannot be read;
 #   - the three Step 2 prerequisite reads (the `ironmem autopilot status`
 #     command, both `gh label list` commands), the gate-config approval
-#     condition and fail-closed rule, that only the status exit status and
-#     `gate_config` are used (never the report's `labels` section), the
+#     condition and fail-closed rule, that only the status exit status,
+#     `gate_config` and `db` are used (never the report's `labels` section), the
 #     status-read rule (a non-zero exit, a run that could not be made, output
 #     that is not JSON, or a report that fits none of the three states is
 #     reported as a failed read, never as a repo that is not onboarded),
@@ -599,8 +599,8 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "or a report that fits none of the three states above is a failed read: "
     "the router reports it as one, naming the command and its error, never "
     "as a repo that is not onboarded and with no onboard fix line.",
-    "Use only its exit status and `gate_config`: the label requirements come "
-    "from the two `gh label list` reads below, never from its `labels` "
+    "Use only its exit status, `gate_config` and `db`: the label requirements "
+    "come from the two `gh label list` reads below, never from its `labels` "
     "section.",
     "Approved only when it exits 0 and its JSON `gate_config` is an object "
     "whose `state` is `\"approved\"`; keep that object's `gate_commands`.",

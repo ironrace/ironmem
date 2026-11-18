@@ -71,7 +71,7 @@ tracing.**
      `ironmem autopilot status <owner>/<repo> --json` (read-only: it never
      creates or migrates the database, and asks `gh` only to list labels).
      Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `"approved"`; keep that object's `gate_commands`.
-     Use only its exit status and `gate_config`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
+     Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
      A `null` `gate_config` is a repo not onboarded under that exact name in
      the database the report names in `db`; a `state` of `"pending"` is a
      proposal nobody has approved.
@@ -147,14 +147,13 @@ not justify COLLAB — it drives the review tier recommendation instead.
    If the issue otherwise fits but a prerequisite is missing, add
    `Missing AUTOPILOT prerequisite:` to *Why* with its fix, then continue
    down the list. Repo not onboarded (`gate_config` `null`) →
-   `ironmem autopilot onboard <owner>/<repo> --path '<checkout>'` (write any
-   `'` in `<checkout>` as `'\''`) then
-   `ironmem autopilot approve <owner>/<repo>`, naming the database the report
-   gave in `db`; gate config `"pending"` → review its `gate_commands` and
-   `manifest_warnings`, re-run the `onboard` command first if `proposed_at`
-   is old or the checkout's build setup has changed since, then
-   `ironmem autopilot approve <owner>/<repo>`, again naming that database;
-   agent labels missing →
+   `ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`
+   then `ironmem autopilot approve <owner>/<repo> --db '<db>'`, where `<db>`
+   is the path the report gave in `db` (write any `'` in `<checkout>` or
+   `<db>` as `'\''`); gate config `"pending"` → review its `gate_commands` and
+   `manifest_warnings`, re-run that `onboard` command first if `proposed_at`
+   is old or the checkout's build setup has changed since, then that
+   `approve` command; agent labels missing →
    `ironmem autopilot labels <owner>/<repo>`; `risk:<expected class>` label
    missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`;
    issue carries `risk:<other>` → name it; removing it is a human's risk

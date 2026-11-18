@@ -97,12 +97,11 @@ Goal: a rough estimate of how much code the issue touches.
      `gh` only to list labels.
      Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `"approved"`; keep that object's `gate_commands`.
      A GOAL command's condition is built from those `gate_commands`.
-     Use only its exit status and `gate_config`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
-     A `gate_config` of `null`, printed with `"onboarded": false`, is a repo
-     not onboarded under that exact name in the database the report names in
-     `db`: a name spelled differently (letter case included) or another
-     database reads the same way. A `state` of `"pending"` is a proposal
-     nobody has approved.
+     Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
+     A `gate_config` of `null` is a repo not onboarded under that exact name
+     in the database the report names in `db`: a name spelled differently
+     (letter case included) or another database reads the same way. A `state`
+     of `"pending"` is a proposal nobody has approved.
      Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
      A non-zero exit, a run that could not be made, output that is not JSON, or a report that fits none of the three states above is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
      An `ironmem` missing from `PATH` or older than `status` fails this way; the fix is a current install.
@@ -197,13 +196,12 @@ When the issue otherwise fits AUTOPILOT but a prerequisite is missing, add a
 `Missing AUTOPILOT prerequisite:` line to *Why* naming each missing one and
 the command that supplies it, then continue down the table:
 
-- repo not onboarded (`gate_config` `null`) → `ironmem autopilot onboard <owner>/<repo> --path '<checkout>'`, then `ironmem autopilot approve <owner>/<repo>`
-  (`<checkout>` is single-quoted: write any `'` in it as `'\''`); name the
-  database the report gave in `db`
+- repo not onboarded (`gate_config` `null`) → `ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`, then `ironmem autopilot approve <owner>/<repo> --db '<db>'`
+  (`<db>` is the path the report gave in `db`; `<checkout>` and `<db>` are
+  single-quoted: write any `'` in them as `'\''`)
 - gate config `"pending"` → review its `gate_commands` and `manifest_warnings`
-  (re-run the `onboard` command above first if `proposed_at` is old or the
-  checkout's build setup has changed since), then `ironmem autopilot approve <owner>/<repo>`,
-  again naming that database
+  (re-run that `onboard` command first if `proposed_at` is old or the
+  checkout's build setup has changed since), then that `approve` command
 - a failed `status` read gets neither command: its fix line gives the command that was run, its exit status if it had one, and its error; for an `ironmem` that is missing or too old, it also says to install a current one.
 - agent labels missing → `ironmem autopilot labels <owner>/<repo>`
 - `risk:<expected class>` label missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`
