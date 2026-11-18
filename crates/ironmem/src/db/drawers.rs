@@ -25,8 +25,8 @@ use sha2::{Digest, Sha256};
 ///
 /// A token that is exactly `AND`, `OR`, `NOT` or `NEAR` once cleaned (`NOT`,
 /// `NOT,`) is dropped, not quoted, so it is neither an FTS5 operator nor a word
-/// the drawer must contain: `a OR b` requires both words and `a NOT b` does not
-/// exclude `b`. That is on purpose, because queries are natural-language text
+/// the drawer must contain: `a OR b` and `a NOT b` both require `a` and `b`, so
+/// `a NOT b` matches only drawers that do contain `b`. That is on purpose, because queries are natural-language text
 /// (the prompt-recall hook passes the user's prompt, where "do NOT ..." is
 /// ordinary English). Lower-case `and`, `or`, `not` and `near` stay ordinary
 /// words, and so does a token that starts and ends with `"` (`"NOT"`). Only a
@@ -404,9 +404,11 @@ impl Database {
 
     /// `filed_at` of the newest drawer the miner wrote (`added_by = 'mine'`),
     /// or `None` when nothing has ever been mined into this store. Superseded
-    /// rows count: the question is when mining last ran, not what is current.
-    /// `ironmem doctor` uses it to show when mining stopped, since MCP writes
-    /// keep a store looking alive while the hooks mine nothing (#377).
+    /// rows count: the question is when mining last wrote a row, not what is
+    /// current. The miner writes only files that changed, so a run that found
+    /// nothing new leaves this value as it was: it dates the last mined write,
+    /// not the last run. `ironmem doctor` shows it because MCP writes keep a
+    /// store looking alive while the hooks mine nothing (#377).
     pub fn newest_mined_filed_at(&self) -> Result<Option<String>, MemoryError> {
         let newest: Option<String> = self.conn.query_row(
             "SELECT MAX(filed_at) FROM drawers WHERE added_by = ?1",
@@ -2986,7 +2988,7 @@ mod tests {
     fn bm25_ignores_upper_case_operator_words_so_every_term_is_required() {
         let db = Database::open_in_memory().unwrap();
         let (only_hooks, both) = two_drawers(&db);
-        // `OR` and `NOT` no longer act as operators: both words are required.
+        // `OR` and `NOT` do not act as operators: both words are required.
         assert_eq!(bm25_ids(&db, "hooks OR doctor", None), vec![both.clone()]);
         assert_eq!(bm25_ids(&db, "hooks NOT doctor", None), vec![both.clone()]);
         // The check is made after punctuation is stripped, so `NOT,` is dropped too.

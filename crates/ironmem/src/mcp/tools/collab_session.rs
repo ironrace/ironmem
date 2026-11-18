@@ -41,8 +41,10 @@ pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
 /// counts any drawer whose embedding length is not `EMBED_DIM` as a dimension
 /// mismatch and warns about it. A zero vector of the right length avoids that
 /// warning, and `load_all_vectors` leaves it out of the index without one,
-/// since it has no direction to match on. Note the generic drawer FTS index still
-/// sees their content (see the `COLLAB_PLAN_ROOM` comment).
+/// since it has no direction to match on. Their content is still in the drawer
+/// keyword (FTS5) index: `Database::insert_drawer_conn` leaves only
+/// `COLLAB_MESSAGE_ROOM` rows out of it, so `search` can find a plan by keyword.
+/// The prompt-recall hook does not inject one (`PROMPT_RECALL_EXCLUDED_ROOMS`).
 fn store_collab_plan_drawer(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
