@@ -1229,6 +1229,28 @@ mod tests {
         assert_eq!(with_variant.len(), 30);
     }
 
+    /// A drawer stored with a zero vector (Autopilot and collab rows) has no
+    /// direction, and the index's cosine distance is 0 against it, so it used
+    /// to come back at similarity 1.0 for every query. It is no longer in the
+    /// index, so the vector leg never returns it.
+    #[test]
+    fn unscoped_vector_candidates_hold_no_zero_vector_drawer() {
+        let app = App::open_for_test().unwrap();
+        for i in 0..20 {
+            add(&app, &format!("n{i:02}"), "a", "r", &near_query(i, 0.3));
+        }
+        let zero = vec![0.0; DIM];
+        for i in 0..5 {
+            add(&app, &format!("z{i:02}"), "a", "r", &zero);
+        }
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+
+        let ids = hnsw_candidates(&app, &query_vec(), None, 30, &scope(None, None)).unwrap();
+        assert!(!ids.is_empty());
+        assert!(ids.iter().all(|id| id.starts_with('n')), "{ids:?}");
+    }
+
     /// A fake index of `len` ids named `id0..`, nearest first, that records
     /// each `k` it is searched with. `in_scope` keeps ids numbered >= `from`.
     fn run_widen(overfetch: usize, len: usize, from: usize) -> (Vec<String>, Vec<usize>) {

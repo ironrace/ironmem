@@ -87,13 +87,32 @@ fn seed_db_file_bulk(path: &Path, n: usize) {
 }
 
 fn seed_db_file_rows(path: &Path, rows: &[(&str, &str, &str)]) -> Vec<String> {
+    seed_db_file_rows_embedded(path, rows, |_| vec![0.0f32; EMBED_DIM])
+}
+
+/// Like `seed_db_file_rows`, but row `i` gets the unit vector on axis `i`.
+/// Zero vectors are kept out of the vector index, so a daemon whose vector
+/// leg must return these rows needs real ones.
+fn seed_db_file_rows_with_vectors(path: &Path, rows: &[(&str, &str, &str)]) -> Vec<String> {
+    seed_db_file_rows_embedded(path, rows, |i| {
+        let mut v = vec![0.0f32; EMBED_DIM];
+        v[i] = 1.0;
+        v
+    })
+}
+
+fn seed_db_file_rows_embedded(
+    path: &Path,
+    rows: &[(&str, &str, &str)],
+    embedding: impl Fn(usize) -> Vec<f32>,
+) -> Vec<String> {
     let db = Database::open(path).unwrap();
     db.migrate().unwrap();
-    let zero = vec![0.0f32; EMBED_DIM];
     rows.iter()
-        .map(|(content, wing, room)| {
+        .enumerate()
+        .map(|(i, (content, wing, room))| {
             let id = generate_id(content, wing, room);
-            db.insert_drawer(&id, content, &zero, wing, room, "test", "test")
+            db.insert_drawer(&id, content, &embedding(i), wing, room, "test", "test")
                 .unwrap();
             id
         })
@@ -890,11 +909,13 @@ fn prompt_hook_warm_noop_daemon_fuses_compact_remote_ids_into_local_rendering() 
     let semantic = ("unrelated local semantic memory", "infra", "semantic");
     let foreign = ("foreign daemon-only vector memory", "remote", "foreign");
     let local_ids = seed_db_file_rows(&local_db, &[lexical, semantic]);
-    // Keep the warm daemon's zero-vector index to the two IDs the test needs.
-    // With three equal noop vectors, HNSW tie traversal can omit one candidate
-    // even when the requested limit is larger; the local DB still supplies the
-    // lexical BM25 row for the fused selection path.
-    let daemon_ids = seed_db_file_rows(&daemon_db, &[semantic, foreign]);
+    // Keep the warm daemon's index to the two IDs the test needs. The daemon's
+    // noop query vector is zero, so every indexed vector ties at distance 0,
+    // and with three tied vectors HNSW traversal can omit one candidate even
+    // when the requested limit is larger; the local DB still supplies the
+    // lexical BM25 row for the fused selection path. The daemon rows carry
+    // real vectors because zero vectors are kept out of the index.
+    let daemon_ids = seed_db_file_rows_with_vectors(&daemon_db, &[semantic, foreign]);
     let lexical_id = &local_ids[0];
     let semantic_id = &local_ids[1];
     let foreign_id = &daemon_ids[1];

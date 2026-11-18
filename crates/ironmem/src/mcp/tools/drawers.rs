@@ -1192,6 +1192,10 @@ mod tests {
         let successor_id = first["id"].as_str().unwrap();
         assert_eq!(second["id"].as_str(), Some(successor_id));
 
+        // The noop embedder stores a zero vector, which is kept out of the
+        // vector index (#377), so this successor is not indexed at all. The
+        // no-duplicate rule for an indexed drawer is pinned by
+        // `replayed_index_insert_of_an_indexed_drawer_keeps_one_id_map_entry`.
         let state = app.index_state.read().unwrap();
         assert_eq!(
             state
@@ -1199,8 +1203,8 @@ mod tests {
                 .iter()
                 .filter(|id| id.as_str() == successor_id)
                 .count(),
-            1,
-            "a replayed upsert must not append a duplicate HNSW id"
+            0,
+            "a noop-embedded (zero-vector) drawer must not be in the HNSW index"
         );
         drop(state);
 
@@ -1224,6 +1228,36 @@ mod tests {
             1,
             "search must expose the replayed successor once"
         );
+    }
+
+    /// `handle_add_drawer` calls `insert_into_index` again when a write is
+    /// replayed. The test embedder only produces zero vectors, which are not
+    /// indexed, so this drives the same call directly with a real vector: the
+    /// replay must leave exactly one `id_map` entry for the drawer.
+    #[test]
+    fn replayed_index_insert_of_an_indexed_drawer_keeps_one_id_map_entry() {
+        let app = test_app();
+        let mut embedding = vec![0.0f32; ironrace_embed::EMBED_DIM];
+        embedding[7] = 1.0;
+        let id = "replayed-indexed-drawer";
+        app.db
+            .insert_drawer(id, "replayed", &embedding, "project", "state", "", "test")
+            .unwrap();
+
+        app.insert_into_index(id, &embedding).unwrap();
+        app.insert_into_index(id, &embedding).unwrap();
+
+        let state = app.index_state.read().unwrap();
+        assert_eq!(
+            state
+                .id_map
+                .iter()
+                .filter(|entry| entry.as_str() == id)
+                .count(),
+            1,
+            "a replayed upsert must not append a duplicate HNSW id"
+        );
+        assert_eq!(state.index.len(), state.id_map.len());
     }
 
     #[test]

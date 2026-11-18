@@ -38,10 +38,11 @@ pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
 /// by id and are not intended for recall, so they carry a full zero vector
 /// rather than an empty slice: `insert_drawer_tx` does not validate embedding
 /// length, but the HNSW index-load path (`load_all_vectors` in `db/schema.rs`)
-/// skips — with a per-row warning — any drawer whose embedding length is not
-/// `EMBED_DIM`. A zero vector stays loadable (contributing no vector signal)
-/// and avoids that warn/skip. Note the generic drawer FTS index still sees
-/// their content (see the `COLLAB_PLAN_ROOM` comment).
+/// counts any drawer whose embedding length is not `EMBED_DIM` as a dimension
+/// mismatch and warns about it. A zero vector of the right length avoids that
+/// warning, and `load_all_vectors` leaves it out of the index without one,
+/// since it has no direction to match on. Note the generic drawer FTS index still
+/// sees their content (see the `COLLAB_PLAN_ROOM` comment).
 fn store_collab_plan_drawer(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,

@@ -1404,7 +1404,7 @@ fn decode_embedding(blob: &[u8]) -> Option<Vec<f32>> {
         .then_some(embedding)
 }
 
-fn vector_norm(embedding: &[f32]) -> Option<f32> {
+pub(crate) fn vector_norm(embedding: &[f32]) -> Option<f32> {
     let squared_sum: f32 = embedding.iter().map(|value| value * value).sum();
     let norm = squared_sum.sqrt();
     (norm.is_finite() && norm > 0.0).then_some(norm)
@@ -2342,6 +2342,27 @@ mod tests {
         assert_eq!(vectors.len(), 1);
         assert_eq!(vectors[0].0, "id01aabbccddeeff01aabbccddeeff01");
         assert_eq!(vectors[0].1, emb);
+    }
+
+    #[test]
+    fn load_all_vectors_leaves_out_zero_norm_embeddings() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let zero = vec![0.0; ironrace_embed::embedder::EMBED_DIM];
+        // -0.0 has a sign bit set but is still a zero component.
+        let negative_zero = vec![-0.0; ironrace_embed::embedder::EMBED_DIM];
+        db.insert_drawer("real", "c", &emb, "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("zero", "c", &zero, "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("negzero", "c", &negative_zero, "w", "r", "", "mcp")
+            .unwrap();
+
+        let vectors = db.load_all_vectors().unwrap();
+        let ids: Vec<&str> = vectors.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["real"]);
+        // The rows themselves are untouched.
+        assert!(db.get_drawer("zero").unwrap().is_some());
     }
 
     #[test]

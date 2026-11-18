@@ -800,8 +800,14 @@ impl Database {
         f(&self.conn)
     }
 
-    /// Load all vectors from the drawers table for HNSW index building.
-    /// Returns (id, embedding) pairs.
+    /// Load the vectors the HNSW index is built from, as (id, embedding) pairs.
+    ///
+    /// A drawer whose embedding has no usable norm (all zeros: Autopilot and
+    /// collab rows, or anything written by the noop embedder; also a
+    /// non-finite norm) is left out. The
+    /// index's cosine distance is 0 against a zero vector, so such a row would
+    /// match every query perfectly. Those drawers stay in the table and are
+    /// still found by keyword search and by id.
     pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
         let mut stmt = self.conn.prepare("SELECT id, embedding FROM drawers")?;
 
@@ -846,11 +852,20 @@ impl Database {
 
         let mut result = Vec::new();
         let mut skipped = 0usize;
+        let mut no_norm = 0usize;
         for row in rows {
             match row {
+                Ok((_, embedding)) if crate::db::drawers::vector_norm(&embedding).is_none() => {
+                    no_norm += 1;
+                }
                 Ok(item) => result.push(item),
                 Err(_) => skipped += 1,
             }
+        }
+        if no_norm > 0 {
+            tracing::debug!(
+                "{no_norm} drawer(s) left out of the index: zero (or non-finite) embedding norm"
+            );
         }
         if skipped > 0 {
             tracing::warn!(

@@ -132,7 +132,7 @@ impl App {
 
         // Load vectors and build HNSW index
         let vectors_with_ids = db.load_all_vectors()?;
-        let drawer_count = vectors_with_ids.len();
+        let indexed_count = vectors_with_ids.len();
         let vectors_for_index: Vec<Vec<f32>> =
             vectors_with_ids.iter().map(|(_, v)| v.clone()).collect();
         let id_map: Vec<String> = vectors_with_ids.into_iter().map(|(id, _)| id).collect();
@@ -144,8 +144,8 @@ impl App {
         };
 
         tracing::info!(
-            "Memory loaded: {} drawers, HNSW index built, MCP mode: {:?}",
-            drawer_count,
+            "Memory loaded: {} drawers in the HNSW index, MCP mode: {:?}",
+            indexed_count,
             config.mcp_access_mode,
         );
 
@@ -520,6 +520,10 @@ impl App {
 
     /// Insert a single embedding into the live HNSW index without a full rebuild.
     /// Falls back to a full rebuild from DB if the index is at capacity.
+    ///
+    /// An embedding with no usable norm (all zeros, or a non-finite norm) is
+    /// not inserted, for the reason given on `Database::load_all_vectors`,
+    /// which leaves the same rows out of every rebuild.
     pub fn insert_into_index(&self, drawer_id: &str, embedding: &[f32]) -> Result<(), MemoryError> {
         let mut state = self
             .index_state
@@ -527,11 +531,21 @@ impl App {
             .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
 
         if state.id_map.iter().any(|id| id == drawer_id) {
-            // An upsert replay may have changed the stored embedding. Avoid
-            // appending the ID a second time; a lazy rebuild refreshes the
-            // vector from SQLite before the next search.
+            // An upsert replay may have changed the stored embedding (possibly
+            // to a zero vector). Avoid appending the ID a second time; a lazy
+            // rebuild refreshes the vector from SQLite before the next search.
             drop(state);
             self.mark_dirty();
+            return Ok(());
+        }
+
+        if crate::db::drawers::vector_norm(embedding).is_none() {
+            drop(state);
+            // The drawer is new to the wing/room graph even though it has no
+            // place in the vector index.
+            if let Ok(mut cache) = self.graph_cache.write() {
+                *cache = None;
+            }
             return Ok(());
         }
 
@@ -1061,6 +1075,128 @@ mod tests {
             session_id_from_params(&params).as_deref(),
             Some("meta-snake-session")
         );
+    }
+
+    // ---- zero vectors stay out of the vector index (#377) ------------------
+
+    fn unit_axis(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0; ironrace_embed::EMBED_DIM];
+        v[axis] = 1.0;
+        v
+    }
+
+    fn zero_vector() -> Vec<f32> {
+        vec![0.0; ironrace_embed::EMBED_DIM]
+    }
+
+    fn store(app: &App, id: &str, embedding: &[f32]) {
+        app.db
+            .insert_drawer(
+                id,
+                &format!("content {id}"),
+                embedding,
+                "w",
+                "r",
+                "",
+                "test",
+            )
+            .unwrap();
+    }
+
+    /// The drawer ids in the index, sorted. Also checks that the index and
+    /// `id_map` agree on the size.
+    fn indexed_ids(app: &App) -> Vec<String> {
+        let state = app.index_state.read().unwrap();
+        assert_eq!(state.index.len(), state.id_map.len());
+        let mut ids = state.id_map.clone();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn rebuild_indexes_only_nonzero_vectors_and_stays_fresh_after_a_search() {
+        let app = App::open_for_test().unwrap();
+        store(&app, "n1", &unit_axis(1));
+        store(&app, "z1", &zero_vector());
+        store(&app, "n2", &unit_axis(2));
+        store(&app, "z2", &zero_vector());
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+        assert_eq!(indexed_ids(&app), ["n1", "n2"]);
+
+        // Freshness is the dirty flag, not a count of rows against index
+        // entries, so an index smaller than the table is not stale: a search
+        // leaves the flag clear and the next search does not rebuild.
+        let filters = crate::db::SearchFilters {
+            wing: None,
+            room: None,
+            limit: 10,
+            include_superseded: false,
+        };
+        crate::search::pipeline::search(&app, "content", &filters).unwrap();
+        assert!(!app.dirty.load(Ordering::Acquire));
+        assert_eq!(indexed_ids(&app), ["n1", "n2"]);
+    }
+
+    #[test]
+    fn insert_into_index_skips_a_zero_vector_and_keeps_positions_in_step() {
+        let app = App::open_for_test().unwrap();
+        store(&app, "n1", &unit_axis(1));
+        app.insert_into_index("n1", &unit_axis(1)).unwrap();
+        store(&app, "z1", &zero_vector());
+
+        // The skipped drawer is still new to the wing/room graph.
+        *app.graph_cache.write().unwrap() = Some(MemoryGraph {
+            wing_rooms: HashMap::new(),
+            room_wings: HashMap::new(),
+        });
+        app.insert_into_index("z1", &zero_vector()).unwrap();
+        assert!(app.graph_cache.read().unwrap().is_none());
+        assert_eq!(indexed_ids(&app), ["n1"]);
+        assert!(!app.dirty.load(Ordering::Acquire));
+
+        // A later insert lands at the position `id_map` gives it.
+        store(&app, "n2", &unit_axis(2));
+        app.insert_into_index("n2", &unit_axis(2)).unwrap();
+        assert_eq!(indexed_ids(&app), ["n1", "n2"]);
+        let state = app.index_state.read().unwrap();
+        let top = state.index.search(&unit_axis(2), 1);
+        assert_eq!(state.id_map[top[0].0], "n2");
+    }
+
+    #[test]
+    fn a_drawer_whose_embedding_turns_zero_or_nonzero_follows_it_in_and_out() {
+        let app = App::open_for_test().unwrap();
+
+        // Zero, then re-stored with a real vector: it enters the index.
+        store(&app, "x", &zero_vector());
+        app.insert_into_index("x", &zero_vector()).unwrap();
+        assert!(indexed_ids(&app).is_empty());
+        store(&app, "x", &unit_axis(3));
+        app.insert_into_index("x", &unit_axis(3)).unwrap();
+        assert_eq!(indexed_ids(&app), ["x"]);
+
+        // Re-stored as a zero vector: the next rebuild drops it.
+        store(&app, "x", &zero_vector());
+        app.insert_into_index("x", &zero_vector()).unwrap();
+        app.ensure_index_fresh().unwrap();
+        assert!(indexed_ids(&app).is_empty());
+    }
+
+    #[test]
+    fn deleting_a_drawer_that_is_not_in_the_index_rebuilds_cleanly() {
+        let app = App::open_for_test().unwrap();
+        store(&app, "n1", &unit_axis(1));
+        store(&app, "z1", &zero_vector());
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+
+        // What `delete_drawer` does: delete the row, mark the index dirty.
+        assert!(app.db.delete_drawer("z1").unwrap());
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+        assert_eq!(indexed_ids(&app), ["n1"]);
+        assert!(!app.dirty.load(Ordering::Acquire));
     }
 
     #[test]
