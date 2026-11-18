@@ -258,9 +258,9 @@ pub fn search(
 
     // Step 6: Fetch drawer metadata with filters. When PRF fetched foreground /
     // background drawers, carry those forward to avoid repeating the same lookup.
-    // Cached drawers still must satisfy final filters: PRF's foreground fetch is
-    // not scope-filtered, and a scope-filtered candidate list can still hold
-    // BM25-only ids.
+    // PRF fetched the cached drawers by id with no filter, so they are checked
+    // against `drawer_matches_filters` here; the uncached ids are filtered in
+    // SQL by wing, room and supersession.
     let mut drawers: HashMap<String, Drawer> = HashMap::new();
     let mut missing_candidate_ids: Vec<&str> = Vec::new();
     for id in &merged_ids {
@@ -395,14 +395,12 @@ fn is_scoped(filters: &SearchFilters) -> bool {
 /// Vector candidates for one query (plus the optional content-word variant),
 /// as drawer ids in rank order.
 ///
-/// Unscoped searches take the top `overfetch` across the index and drop
-/// superseded rows, exactly as they always have. A wing/room-scoped search
-/// instead filters to the scope and widens the vector search (`k` doubling, up
-/// to the index size) until it holds `overfetch` in-scope candidates or `k` has
-/// reached the index size. The index is approximate, so even a search at that
-/// size can miss a drawer its graph does not reach. The old scope-agnostic
-/// top-k could hold none of the scope's drawers, which left a scoped search
-/// empty although matching drawers existed.
+/// Unscoped searches take the top `overfetch` across the HNSW index and drop
+/// superseded rows. A wing/room-scoped search does not use the index: it
+/// scores every drawer in the scope exactly (`scoped_vector_candidates`). The
+/// index has no scope filter, and its global top-k could hold none of the
+/// scope's drawers, which left a scoped search empty although matching
+/// drawers existed.
 fn hnsw_candidates(
     app: &App,
     primary: &[f32],
@@ -410,26 +408,22 @@ fn hnsw_candidates(
     overfetch: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<String>, MemoryError> {
-    if !is_scoped(filters) {
-        let (ids, _) = search_index_ids(app, primary, content, overfetch)?;
-        return filter_superseded_candidate_ids(app, ids, filters.include_superseded);
+    if is_scoped(filters) {
+        return scoped_vector_candidates(app, primary, content, overfetch, filters);
     }
-    widen_until_in_scope(
-        overfetch,
-        |k| search_index_ids(app, primary, content, k),
-        |ids| keep_in_scope(app, ids, filters),
-    )
+    let ids = search_index_ids(app, primary, content, overfetch)?;
+    filter_superseded_candidate_ids(app, ids, filters.include_superseded)
 }
 
 /// Search the index for the top `k` of the primary vector (unioned with the
 /// content-word variant when present). Holds the `index_state` read lock only
-/// for the search and the id mapping. Also returns the index size.
+/// for the search and the id mapping.
 fn search_index_ids(
     app: &App,
     primary: &[f32],
     content: Option<&[f32]>,
     k: usize,
-) -> Result<(Vec<String>, usize), MemoryError> {
+) -> Result<Vec<String>, MemoryError> {
     let state = app
         .index_state
         .read()
@@ -440,83 +434,109 @@ fn search_index_ids(
         Some(cv) => union_hnsw(primary_hnsw, state.index.search(cv, k), k),
         None => primary_hnsw,
     };
-    let ids = hnsw_results
+    Ok(hnsw_results
         .iter()
         .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
-        .collect();
-    Ok((ids, state.index.len()))
-}
-
-/// Keep the candidates the final filter would keep, in rank order. One query
-/// fetches the rows for all of `ids`; the rule itself is `drawer_matches_filters`.
-fn keep_in_scope(
-    app: &App,
-    ids: Vec<String>,
-    filters: &SearchFilters,
-) -> Result<Vec<String>, MemoryError> {
-    if ids.is_empty() {
-        return Ok(ids);
-    }
-    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-    let drawers = app.db.get_drawers_by_ids_filtered(
-        &refs,
-        filters.wing.as_deref(),
-        filters.room.as_deref(),
-        filters.include_superseded,
-    )?;
-    Ok(ids
-        .into_iter()
-        .filter(|id| {
-            drawers
-                .get(id)
-                .is_some_and(|drawer| drawer_matches_filters(drawer, filters))
-        })
         .collect())
 }
 
-/// Search with `k = overfetch`, then with `k` doubled, until `in_scope` keeps
-/// `overfetch` candidates or `k` has reached the index size. `search(k)`
-/// returns the top-`k` ids and the index size; `in_scope` filters them.
+/// Vector candidates for a wing/room-scoped search, scored exactly.
 ///
-/// The cap is the index size seen on the first search, so `k` strictly
-/// increases toward a fixed bound and the loop ends even if another writer
-/// grows the index meanwhile. A scope that holds nothing ends with one search
-/// at `k` = the index size, with no further check. At most `overfetch` ids are
-/// returned.
-fn widen_until_in_scope<S, F>(
+/// One `SELECT` fetches the scope's drawers in id order. A drawer is kept
+/// when `row_matches_filters` keeps it (the same rules as the final filter)
+/// and its embedding is usable: decodable, as long as the query, and with a
+/// non-zero, finite norm. Each is scored by cosine similarity with the query;
+/// the content-word variant is scored the same way and merged with
+/// `union_hnsw`, as the unscoped path merges it. Returns at most `overfetch`
+/// ids, highest score first, ties broken by drawer id. The cost grows with
+/// the scope: every in-scope row is read and scored, with no cap or cache.
+fn scoped_vector_candidates(
+    app: &App,
+    primary: &[f32],
+    content: Option<&[f32]>,
     overfetch: usize,
-    mut search: S,
-    mut in_scope: F,
-) -> Result<Vec<String>, MemoryError>
-where
-    S: FnMut(usize) -> Result<(Vec<String>, usize), MemoryError>,
-    F: FnMut(Vec<String>) -> Result<Vec<String>, MemoryError>,
-{
-    let mut k = overfetch.max(1);
-    let mut cap: Option<usize> = None;
-    loop {
-        let (ids, index_len) = search(k)?;
-        let cap = *cap.get_or_insert(index_len);
-        let mut kept = in_scope(ids)?;
-        if kept.len() >= overfetch || k >= cap {
-            kept.truncate(overfetch);
-            return Ok(kept);
+    filters: &SearchFilters,
+) -> Result<Vec<String>, MemoryError> {
+    let rows = app
+        .db
+        .scope_vectors(filters.wing.as_deref(), filters.room.as_deref())?;
+    let mut unusable = 0usize;
+    let mut ids: Vec<String> = Vec::new();
+    let mut vectors: Vec<(Vec<f32>, f32)> = Vec::new();
+    for row in rows {
+        if !row_matches_filters(&row.wing, &row.room, row.superseded_by.is_some(), filters) {
+            continue;
         }
-        k = k.saturating_mul(2).min(cap);
+        let Some(embedding) = row.embedding.filter(|e| e.len() == primary.len()) else {
+            unusable += 1;
+            continue;
+        };
+        // A zero vector (Autopilot and collab rows) has no direction to score.
+        let Some(norm) = crate::db::drawers::vector_norm(&embedding) else {
+            continue;
+        };
+        ids.push(row.id);
+        vectors.push((embedding, norm));
     }
+    if unusable > 0 {
+        tracing::warn!(
+            unusable,
+            "scoped search skipped drawers whose embedding is malformed or of the wrong dimension"
+        );
+    }
+
+    let primary_top = exact_top_k(&vectors, primary, overfetch);
+    let top = match content {
+        Some(cv) => union_hnsw(primary_top, exact_top_k(&vectors, cv, overfetch), overfetch),
+        None => primary_top,
+    };
+    Ok(top.into_iter().map(|(pos, _)| ids[pos].clone()).collect())
+}
+
+/// The top `k` of `vectors` (each with its norm) by cosine similarity with
+/// `query`, as (position, score), highest first, ties by position. A vector
+/// of another length is skipped. A zero-norm query scores every vector 0.
+fn exact_top_k(vectors: &[(Vec<f32>, f32)], query: &[f32], k: usize) -> Vec<(usize, f32)> {
+    let query_norm = crate::db::drawers::vector_norm(query);
+    let mut scored: Vec<(usize, f32)> = vectors
+        .iter()
+        .enumerate()
+        .filter(|(_, (vector, _))| vector.len() == query.len())
+        .map(|(pos, (vector, norm))| {
+            let score = match query_norm {
+                Some(query_norm) => {
+                    let dot: f32 = vector.iter().zip(query).map(|(a, b)| a * b).sum();
+                    dot / (query_norm * norm)
+                }
+                None => 0.0,
+            };
+            (pos, score)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.truncate(k);
+    scored
 }
 
 fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
-    drawer.room != crate::db::drawers::COLLAB_MESSAGE_ROOM
-        && (filters.include_superseded || drawer.superseded_by.is_none())
-        && filters
-            .wing
-            .as_deref()
-            .is_none_or(|wing| drawer.wing == wing)
-        && filters
-            .room
-            .as_deref()
-            .is_none_or(|room| drawer.room == room)
+    row_matches_filters(
+        &drawer.wing,
+        &drawer.room,
+        drawer.superseded_by.is_some(),
+        filters,
+    )
+}
+
+/// The rules `drawer_matches_filters` applies, for a row given by its
+/// columns: a collab message never matches, a superseded row matches only
+/// when `include_superseded` is set, and a set wing or room must equal the
+/// row's. The scoped vector leg, which has no `Drawer` to hand, calls this
+/// too, so the two cannot drift apart.
+fn row_matches_filters(wing: &str, room: &str, superseded: bool, filters: &SearchFilters) -> bool {
+    room != crate::db::drawers::COLLAB_MESSAGE_ROOM
+        && (filters.include_superseded || !superseded)
+        && filters.wing.as_deref().is_none_or(|w| wing == w)
+        && filters.room.as_deref().is_none_or(|r| room == r)
 }
 
 /// Drop retained historical rows before they can influence RRF or PRF. This
@@ -1154,28 +1174,6 @@ mod tests {
     }
 
     #[test]
-    fn scoped_candidates_include_a_drawer_outside_the_global_top_k() {
-        let app = app_with_scope_outside_top_k();
-        let q = query_vec();
-
-        // Premise: "b00" is not among the global top 30.
-        let (global_top_k, _) = search_index_ids(&app, &q, None, 30).unwrap();
-        assert!(!global_top_k.contains(&"b00".to_string()));
-
-        let by_wing = hnsw_candidates(&app, &q, None, 30, &scope(Some("b"), None)).unwrap();
-        assert_eq!(by_wing, vec!["b00".to_string()]);
-
-        let by_room = hnsw_candidates(&app, &q, None, 30, &scope(None, Some("rb"))).unwrap();
-        assert_eq!(by_room, vec!["b00".to_string()]);
-
-        // The content-word variant is widened the same way.
-        let cv = near_query(7, 0.3);
-        let with_variant =
-            hnsw_candidates(&app, &q, Some(&cv), 30, &scope(Some("b"), None)).unwrap();
-        assert_eq!(with_variant, vec!["b00".to_string()]);
-    }
-
-    #[test]
     fn scoped_candidates_hold_only_in_scope_ids_capped_at_overfetch() {
         let app = app_with_scope_outside_top_k();
         let q = query_vec();
@@ -1185,8 +1183,205 @@ mod tests {
         assert!(in_a.iter().all(|id| id.starts_with('a')));
     }
 
+    /// Cosine similarity of two vectors, computed exactly for test premises.
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (na * nb)
+    }
+
+    /// The scenario that used to be flaky: wing "a" holds more than
+    /// `overfetch` drawers nearer the query than the single drawer in wing
+    /// "b", so "b00" is outside the global top 30. A scoped search scores the
+    /// scope directly, so it returns exactly that drawer on every build.
+    #[test]
+    fn scoped_candidates_return_the_scope_drawer_outside_the_global_top_k() {
+        let app = app_with_scope_outside_top_k();
+        let q = query_vec();
+
+        // Premise, computed exactly rather than through the index.
+        let b_score = cosine(&near_query(99, 0.5), &q);
+        let nearer = (0..70)
+            .filter(|i| cosine(&near_query(*i, 0.3), &q) > b_score)
+            .count();
+        assert!(nearer > 30, "only {nearer} wing-a drawers are nearer");
+
+        let by_wing = hnsw_candidates(&app, &q, None, 30, &scope(Some("b"), None)).unwrap();
+        assert_eq!(by_wing, ["b00"]);
+        let by_room = hnsw_candidates(&app, &q, None, 30, &scope(None, Some("rb"))).unwrap();
+        assert_eq!(by_room, ["b00"]);
+        let cv = near_query(7, 0.3);
+        let with_variant =
+            hnsw_candidates(&app, &q, Some(&cv), 30, &scope(Some("b"), None)).unwrap();
+        assert_eq!(with_variant, ["b00"]);
+    }
+
+    /// Through `search()` itself. The noop embedder gives a zero query
+    /// vector, so every in-scope drawer scores 0 and only the scope decides
+    /// what the vector leg hands on. The query matches no drawer's text, so
+    /// BM25 contributes nothing.
+    #[test]
+    fn search_scoped_to_a_wing_returns_its_one_drawer_with_one_candidate() {
+        let app = App::open_for_test().unwrap();
+        for i in 0..80 {
+            add(&app, &format!("a{i:02}"), "a", "r", &near_query(i, 0.3));
+        }
+        add(&app, "b00", "b", "rb", &near_query(99, 0.5));
+        app.mark_dirty();
+
+        let filters = SearchFilters {
+            wing: Some("b".to_string()),
+            room: None,
+            limit: 10,
+            include_superseded: false,
+        };
+        let result = search(&app, "orthogonal", &filters).unwrap();
+        let ids: Vec<&str> = result
+            .results
+            .iter()
+            .map(|r| r.drawer.id.as_str())
+            .collect();
+        assert_eq!(ids, ["b00"]);
+        assert_eq!(result.total_candidates, 1);
+        assert_eq!(result.bm25_hit_count, 0);
+    }
+
+    /// A vector whose cosine similarity with `query_vec()` is exactly `s`,
+    /// scaled to length `len` (so the score must divide by the norm).
+    fn at_similarity(s: f32, len: f32) -> Vec<f32> {
+        let mut v = vec![0.0; DIM];
+        v[0] = s * len;
+        v[1] = (1.0 - s * s).sqrt() * len;
+        v
+    }
+
+    #[test]
+    fn scoped_candidates_rank_by_similarity_ties_by_id_and_truncate() {
+        let app = App::open_for_test().unwrap();
+        add(&app, "o0", "o", "r", &at_similarity(0.1, 1.0));
+        add(&app, "o2", "o", "r", &at_similarity(0.5, 1.0));
+        add(&app, "o1", "o", "r", &at_similarity(0.5, 1.0));
+        add(&app, "o3", "o", "r", &at_similarity(0.9, 1.0));
+        // Stored at length 3: it ranks by its direction (0.7), not its length.
+        add(&app, "o4", "o", "r", &at_similarity(0.7, 3.0));
+        let wing_o = scope(Some("o"), None);
+
+        let all = hnsw_candidates(&app, &query_vec(), None, 30, &wing_o).unwrap();
+        assert_eq!(all, ["o3", "o4", "o1", "o2", "o0"]);
+        // A query of another length gives the same order.
+        let long_query: Vec<f32> = query_vec().iter().map(|x| x * 5.0).collect();
+        assert_eq!(
+            hnsw_candidates(&app, &long_query, None, 30, &wing_o).unwrap(),
+            all
+        );
+        // The top `overfetch`, cut after the order is decided.
+        assert_eq!(
+            hnsw_candidates(&app, &query_vec(), None, 3, &wing_o).unwrap(),
+            ["o3", "o4", "o1"]
+        );
+        // A zero query (the noop embedder's) scores every drawer 0, so the id
+        // tie-break alone decides, and nothing divides by zero.
+        let zero = vec![0.0; DIM];
+        assert_eq!(
+            hnsw_candidates(&app, &zero, None, 3, &wing_o).unwrap(),
+            ["o0", "o1", "o2"]
+        );
+    }
+
+    #[test]
+    fn scoped_candidates_honour_a_room_only_and_a_wing_and_room_scope() {
+        let app = App::open_for_test().unwrap();
+        let v = at_similarity(0.5, 1.0);
+        add(&app, "w1r1", "w1", "r1", &v);
+        add(&app, "w1r2", "w1", "r2", &v);
+        add(&app, "w2r1", "w2", "r1", &v);
+        let q = query_vec();
+
+        let room_only = hnsw_candidates(&app, &q, None, 30, &scope(None, Some("r1"))).unwrap();
+        assert_eq!(room_only, ["w1r1", "w2r1"]);
+        let wing_and_room =
+            hnsw_candidates(&app, &q, None, 30, &scope(Some("w1"), Some("r1"))).unwrap();
+        assert_eq!(wing_and_room, ["w1r1"]);
+    }
+
+    #[test]
+    fn scoped_candidates_exclude_exactly_what_the_final_filter_excludes() {
+        let app = App::open_for_test().unwrap();
+        let v = at_similarity(0.5, 1.0);
+        let collab_room = crate::db::drawers::COLLAB_MESSAGE_ROOM;
+        add(&app, "x-current", "x", "r", &v);
+        add(&app, "x-old", "x", "r", &v);
+        add(&app, "x-collab", "x", collab_room, &v);
+        add(&app, "y-collab", "y", collab_room, &v);
+        app.db
+            .exec_raw("UPDATE drawers SET superseded_by = 'x-current' WHERE id = 'x-old'")
+            .unwrap();
+        let every_id = ["x-current", "x-old", "x-collab", "y-collab"];
+        let drawers = app.db.get_drawers_by_ids(&every_id).unwrap();
+
+        for (wing, room, include_superseded) in [
+            (Some("x"), None, false),
+            (Some("x"), None, true),
+            (None, Some(collab_room), false),
+            (Some("y"), Some(collab_room), true),
+            (Some("x"), Some("r"), true),
+        ] {
+            let filters = SearchFilters {
+                include_superseded,
+                ..scope(wing, room)
+            };
+            let mut expected: Vec<&str> = every_id
+                .iter()
+                .copied()
+                .filter(|id| drawer_matches_filters(&drawers[*id], &filters))
+                .collect();
+            expected.sort_unstable();
+            let got = hnsw_candidates(&app, &query_vec(), None, 30, &filters).unwrap();
+            assert_eq!(got, expected, "{filters:?}");
+        }
+        // Spot-check the rules themselves, not just the agreement.
+        let with_history = SearchFilters {
+            include_superseded: true,
+            ..scope(Some("x"), None)
+        };
+        assert_eq!(
+            hnsw_candidates(&app, &query_vec(), None, 30, &with_history).unwrap(),
+            ["x-current", "x-old"]
+        );
+        let current = hnsw_candidates(&app, &query_vec(), None, 30, &scope(Some("x"), None));
+        assert_eq!(current.unwrap(), ["x-current"]);
+    }
+
+    #[test]
+    fn scoped_candidates_skip_zero_malformed_and_wrong_dimension_embeddings() {
+        let app = App::open_for_test().unwrap();
+        add(&app, "good", "s", "r", &at_similarity(0.5, 1.0));
+        add(&app, "zero", "s", "r", &vec![0.0; DIM]);
+        add(&app, "short", "s", "r", &[1.0; 10]);
+        add(&app, "bad-blob", "s", "r", &at_similarity(0.5, 1.0));
+        app.db
+            .exec_raw("UPDATE drawers SET embedding = x'0102' WHERE id = 'bad-blob'")
+            .unwrap();
+
+        let ids = hnsw_candidates(&app, &query_vec(), None, 30, &scope(Some("s"), None)).unwrap();
+        assert_eq!(ids, ["good"]);
+    }
+
+    #[test]
+    fn an_empty_scope_returns_no_candidates_from_one_select() {
+        let mut app = App::open_for_test().unwrap();
+        add(&app, "a00", "a", "r", &at_similarity(0.5, 1.0));
+        let selects = app.db.count_select_statements();
+
+        let ids =
+            hnsw_candidates(&app, &query_vec(), None, 30, &scope(Some("none"), None)).unwrap();
+        assert!(ids.is_empty());
+        assert_eq!(selects.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
     /// The unscoped candidate sequence exactly as `search` built it before
-    /// scoped widening existed (copied from the code at 105b3f47).
+    /// this issue changed scoped search (copied from the code at 105b3f47).
     fn old_unscoped_candidates(
         app: &App,
         primary_vec: &[f32],
@@ -1249,87 +1444,5 @@ mod tests {
         let ids = hnsw_candidates(&app, &query_vec(), None, 30, &scope(None, None)).unwrap();
         assert!(!ids.is_empty());
         assert!(ids.iter().all(|id| id.starts_with('n')), "{ids:?}");
-    }
-
-    /// A fake index of `len` ids named `id0..`, nearest first, that records
-    /// each `k` it is searched with. `in_scope` keeps ids numbered >= `from`.
-    fn run_widen(overfetch: usize, len: usize, from: usize) -> (Vec<String>, Vec<usize>) {
-        let mut ks = Vec::new();
-        let kept = widen_until_in_scope(
-            overfetch,
-            |k| {
-                ks.push(k);
-                Ok(((0..k.min(len)).map(|i| format!("id{i}")).collect(), len))
-            },
-            |ids| {
-                Ok(ids
-                    .into_iter()
-                    .filter(|id| id[2..].parse::<usize>().unwrap() >= from)
-                    .collect())
-            },
-        )
-        .unwrap();
-        (kept, ks)
-    }
-
-    #[test]
-    fn widen_stops_after_one_search_when_the_first_pass_is_enough() {
-        let (kept, ks) = run_widen(30, 1000, 0);
-        assert_eq!(ks, vec![30]);
-        assert_eq!(kept.len(), 30);
-    }
-
-    #[test]
-    fn widen_doubles_k_and_stops_at_the_index_size() {
-        // Only ids 90..100 are in scope: k = 30, 60, then the cap of 100.
-        let (kept, ks) = run_widen(30, 100, 90);
-        assert_eq!(ks, vec![30, 60, 100]);
-        assert_eq!(kept.len(), 10);
-        assert_eq!(kept[0], "id90");
-    }
-
-    #[test]
-    fn widen_stops_as_soon_as_enough_in_scope_candidates_are_found() {
-        // 40 in-scope ids from 60 up: k = 30 finds none, k = 60 none, k = 120
-        // finds 40 >= 30 and stops before the cap of 1000.
-        let (kept, ks) = run_widen(30, 1000, 60);
-        assert_eq!(ks, vec![30, 60, 120]);
-        assert_eq!(kept.len(), 30);
-    }
-
-    #[test]
-    fn widen_over_an_empty_scope_ends_with_one_search_at_the_index_size() {
-        let (kept, ks) = run_widen(30, 100, 1000);
-        assert_eq!(ks, vec![30, 60, 100]);
-        assert!(kept.is_empty());
-    }
-
-    #[test]
-    fn widen_handles_an_empty_index_and_an_overfetch_larger_than_the_index() {
-        let (kept, ks) = run_widen(30, 0, 0);
-        assert_eq!(ks, vec![30]);
-        assert!(kept.is_empty());
-
-        let (kept, ks) = run_widen(30, 10, 5);
-        assert_eq!(ks, vec![30]);
-        assert_eq!(kept.len(), 5);
-    }
-
-    #[test]
-    fn widen_terminates_when_the_index_grows_between_searches() {
-        // The index reports a bigger size on every search; the cap is the
-        // size seen first, so k still reaches it and the loop ends.
-        let mut calls = 0usize;
-        let kept = widen_until_in_scope(
-            30,
-            |_k| {
-                calls += 1;
-                Ok((Vec::new(), 100 * calls))
-            },
-            Ok,
-        )
-        .unwrap();
-        assert!(kept.is_empty());
-        assert_eq!(calls, 3);
     }
 }

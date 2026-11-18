@@ -341,6 +341,18 @@ pub struct SearchFilters {
     pub include_superseded: bool,
 }
 
+/// One drawer's scope columns and embedding, as [`Database::scope_vectors`]
+/// reads them for an exact scoped vector search.
+pub(crate) struct ScopeVector {
+    pub id: String,
+    pub wing: String,
+    pub room: String,
+    pub superseded_by: Option<String>,
+    /// `None` when the stored blob is missing, not a whole number of `f32`s,
+    /// or holds a non-finite value.
+    pub embedding: Option<Vec<f32>>,
+}
+
 /// The message of the `NotFound` error [`Database::mark_drawer_superseded_tx`]
 /// returns when the predecessor id names no drawer. `add_drawer` matches on it to
 /// tell that miss from a missing successor before it adds its id hint, so both
@@ -891,6 +903,68 @@ impl Database {
             );
         }
         Ok(best)
+    }
+
+    /// Every drawer in `wing` and/or `room`, ordered by id, with the columns
+    /// the search filters read and the decoded embedding, in one `SELECT`.
+    /// It narrows by scope only; the caller applies the filter rules.
+    pub(crate) fn scope_vectors(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+    ) -> Result<Vec<ScopeVector>, MemoryError> {
+        let superseded_by = if Self::has_superseded_by_column(&self.conn)? {
+            "superseded_by"
+        } else {
+            "NULL"
+        };
+        let mut sql =
+            format!("SELECT id, wing, room, {superseded_by}, embedding FROM drawers WHERE 1 = 1");
+        let mut values: Vec<&str> = Vec::new();
+        if let Some(wing) = wing {
+            sql.push_str(" AND wing = ?");
+            values.push(wing);
+        }
+        if let Some(room) = room {
+            sql.push_str(" AND room = ?");
+            values.push(room);
+        }
+        sql.push_str(" ORDER BY id");
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            let blob: Option<Vec<u8>> = row.get(4)?;
+            Ok(ScopeVector {
+                id: row.get(0)?,
+                wing: row.get(1)?,
+                room: row.get(2)?,
+                superseded_by: row.get(3)?,
+                embedding: blob.as_deref().and_then(decode_embedding),
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Test-only: count the `SELECT` statements this connection prepares from
+    /// now on (SQLite's authorizer sees each one as it is prepared).
+    #[cfg(test)]
+    pub(crate) fn count_select_statements(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        self.conn
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Select) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                Authorization::Allow
+            }))
+            .expect("install the authorizer");
+        count
     }
 
     /// BM25 full-text search via SQLite FTS5. Returns (drawer_id, score) pairs

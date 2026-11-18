@@ -187,12 +187,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently scored as zero keyword hits. Each token is now quoted, so a hyphenated
   word matches as a phrase (`non` then `plugin`, adjacent). A token with no
   letter or digit is dropped.
-- **Wing/room-scoped search finds matches outside the global top results.** Scope
+- **Wing/room-scoped search scores the drawers in its scope directly.** Scope
   was applied after taking the top vector candidates across every wing, so a
-  scoped search could come back empty while matching drawers existed. Scoped
-  searches now widen the vector search, doubling it up to the size of the index,
-  until they have enough in-scope candidates. The vector index is approximate, so
-  a drawer its graph search does not reach can still be missed.
+  scoped search could come back empty while matching drawers existed. The vector
+  leg of a scoped search now reads the scope's drawers and ranks them by exact
+  cosine similarity to the query instead of filtering the global top vector
+  results.
+- **Drawers stored without a real embedding are no longer in the vector index.**
+  Autopilot backlog-lineage and collab session rows are stored with an all-zero
+  vector, which matched every query perfectly and pushed real results out of
+  the vector leg. They are left out of the index and are still found by keyword
+  search. Everything the noop embedder (`IRONMEM_EMBED_MODE=noop`) writes is an
+  all-zero vector too, so search over a store it wrote is keyword-only.
 
 ## [0.7.0] - 2026-11-09
 
