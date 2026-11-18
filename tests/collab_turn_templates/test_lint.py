@@ -822,7 +822,7 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     # The two near-miss errors are raised only when nothing is stored under
     # the exact name, and the sentence says so: an exact name with a config
     # is reported whatever is stored under its other spellings.
-    "When no config is stored under that exact name, a name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name, and a name that a stored config that does not parse could be another spelling of exits 1 too; a config that does not parse under the exact name exits 1 whatever else is stored: each is a failed read, not `null`.",
+    "When no config is stored under that exact name, a name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1, and a name that a stored config that does not parse could be another spelling of exits 1 too; a config that does not parse under the exact name exits 1 whatever else is stored: each is a failed read, not `null`.",
     # The fix-line commands. `--db '<db>'` is what makes `onboard` and
     # `approve` act on the database `status` read; a mirror that drops it
     # sends the user to approve in a different one.
