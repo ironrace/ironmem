@@ -22,7 +22,7 @@ use ironmem::db::schema::Database;
 use serde_json::{json, Value};
 
 mod autopilot_support;
-use autopilot_support::{executable, ironmem, isolated_path, REPO};
+use autopilot_support::{bin, executable, ironmem, isolated_path, scrub_git_env, REPO};
 
 /// Bash builtins only, so it needs nothing from PATH. The log holds one line
 /// per argument, so two arguments cannot read as one that has a space in it.
@@ -283,6 +283,51 @@ fn hint_line<'a>(text: &'a str, command: &str) -> &'a str {
         .unwrap_or_else(|| panic!("no `{command}` hint in: {text}"))
 }
 
+/// The command line in `text` that starts with `command`: the backticked
+/// span it opens, as an error or a report printed it.
+fn printed_command<'a>(text: &'a str, command: &str) -> &'a str {
+    let opening = format!("`{command}");
+    let start = text
+        .find(&opening)
+        .unwrap_or_else(|| panic!("no `{command}` command in: {text}"))
+        + 1;
+    let rest = &text[start..];
+    &rest[..rest
+        .find('`')
+        .unwrap_or_else(|| panic!("unclosed code span in: {text}"))]
+}
+
+/// Run `command`, an `ironmem` command line as it was printed, in `cwd`, the
+/// way a reader who pasted it would: a POSIX shell splits it and reads its
+/// quotes. Its first word, `ironmem`, is the binary under test.
+fn run_as_printed(fixture: &Fixture, command: &str, cwd: &Path) -> Output {
+    let arguments = command
+        .strip_prefix("ironmem ")
+        .unwrap_or_else(|| panic!("not an ironmem command: {command}"));
+    let mut shell = Command::new("/bin/sh");
+    shell
+        .arg("-c")
+        .arg(format!("exec \"$0\" {arguments}"))
+        .arg(bin())
+        .current_dir(cwd);
+    scrub_git_env(&mut shell);
+    fixture.env(
+        &mut shell,
+        &isolated_path(&fixture.stubs()),
+        ALL_LABELS,
+        None,
+    );
+    shell.output().unwrap()
+}
+
+/// A directory `onboard` can infer a gate from.
+fn checkout(fixture: &Fixture) -> PathBuf {
+    let checkout = fixture.root().join("checkout");
+    std::fs::create_dir_all(&checkout).unwrap();
+    std::fs::write(checkout.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    checkout
+}
+
 /// The size of the database's `-wal` side file, 0 when there is none.
 fn wal_len(db: &Path) -> u64 {
     std::fs::metadata(format!("{}-wal", db.display())).map_or(0, |wal| wal.len())
@@ -318,6 +363,23 @@ fn overwrite_the_gate_config(db: &Path, content: &str) {
     assert_eq!(
         changed, 1,
         "the UPDATE must hit exactly the gate config row"
+    );
+}
+
+/// Replace the content of the gate config stored under `source_file` with
+/// `content`, leaving every other stored config as it is.
+fn overwrite_the_gate_config_under(db: &Path, source_file: &str, content: &str) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE drawers SET content = ?1 \
+             WHERE wing = 'autopilot' AND room = 'backlog-lineage' AND source_file = ?2",
+            [content, source_file],
+        )
+        .unwrap();
+    assert_eq!(
+        changed, 1,
+        "the UPDATE must hit the row under {source_file}"
     );
 }
 
@@ -358,7 +420,6 @@ fn an_approved_repo_with_every_label_reports_the_pinned_json() {
         "{printed}"
     );
     assert!(printed.ends_with("  }\n}\n"), "{printed}");
-    assert!(!printed.ends_with("\n\n"), "{printed}");
     assert_eq!(
         report(&output),
         json!({
@@ -604,40 +665,41 @@ fn status_never_creates_a_missing_database() {
 #[test]
 fn a_missing_database_is_created_by_the_onboard_its_error_names() {
     let fixture = Fixture::new();
-    let db = fixture.db_path();
+    // A path a shell would split, in a directory that is there, so the
+    // command the error prints has to quote it to name this file.
+    let db = fixture.root().join("auto pilot").join("memory.sqlite3");
+    std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+    let ask = || fixture.status_at(&db, &isolated_path(&fixture.stubs()), ALL_LABELS, None);
 
-    let output = fixture.status(ALL_LABELS, None);
+    let output = ask();
 
     assert_unreadable(
         &fixture,
         &output,
         &[
             &format!("Error: Not found: db not found at {}", db.display()),
-            "If Autopilot has never been set up with this database, `ironmem autopilot onboard` \
-             creates it",
+            "If Autopilot has never been set up with this database, `ironmem autopilot onboard \
+             owner/repo --path . --db '",
+            "`, run from the repo's checkout, creates it",
         ],
     );
     assert!(!db.exists(), "status created the database file");
 
-    // What the error says is true: `onboard` creates the database.
-    let checkout = fixture.root().join("checkout");
-    std::fs::create_dir_all(&checkout).unwrap();
-    std::fs::write(checkout.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
-    let mut onboard = ironmem();
-    onboard
-        .args(["autopilot", "onboard", REPO, "--path", ".", "--db"])
-        .arg(&db)
-        .current_dir(&checkout);
-    fixture.env(
-        &mut onboard,
-        &isolated_path(&fixture.stubs()),
-        ALL_LABELS,
-        None,
+    // What the error says is true of the command it prints: run as printed,
+    // from a checkout, it creates this database and no other. Without its
+    // `--db` it would write the default database, under `HOME`.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let hinted = printed_command(&stderr, "ironmem autopilot onboard");
+    let onboarded = run_as_printed(&fixture, hinted, &checkout(&fixture));
+    assert!(onboarded.status.success(), "{hinted}: {onboarded:?}");
+    assert!(db.exists(), "`{hinted}` did not create {}", db.display());
+    assert_eq!(
+        fixture.home_entries(),
+        Vec::<String>::new(),
+        "`{hinted}` wrote under HOME, where the default database lives"
     );
-    let onboarded = onboard.output().unwrap();
-    assert!(onboarded.status.success(), "{onboarded:?}");
 
-    let report = report(&fixture.status(ALL_LABELS, None));
+    let report = report(&ask());
     assert_eq!(report["gate_config"]["state"], json!("pending"));
 }
 
@@ -761,6 +823,9 @@ fn a_broken_config_of_the_colliding_name_exits_one_and_names_no_onboard_for_the_
             &fixture.db_path().display().to_string(),
             "gate_commands must not be empty",
             "its `repo` is \"foo-bar/baz\", not 'foo/bar-baz'",
+            // The command it does give is for the other repo, and says so.
+            "from the checkout of foo-bar/baz (not of foo/bar-baz), then `ironmem autopilot \
+             approve foo-bar/baz --db ",
         ],
     );
     // That command would overwrite the row of `foo-bar/baz`.
@@ -769,6 +834,109 @@ fn a_broken_config_of_the_colliding_name_exits_one_and_names_no_onboard_for_the_
         !stderr.contains("autopilot onboard foo/bar-baz"),
         "{stderr}"
     );
+}
+
+#[test]
+fn a_broken_config_of_a_name_with_no_slash_exits_one_and_names_no_onboard_at_all() {
+    let fixture = Fixture::new();
+    // `onboard` takes `owner-repo` (#422) and stores it under
+    // `gate-config:owner-repo`, the key of `owner/repo`.
+    let mut onboard = ironmem();
+    onboard
+        .args(["autopilot", "onboard", "owner-repo", "--path", ".", "--db"])
+        .arg(fixture.db_path())
+        .current_dir(checkout(&fixture));
+    fixture.env(
+        &mut onboard,
+        &isolated_path(&fixture.stubs()),
+        ALL_LABELS,
+        None,
+    );
+    let onboarded = onboard.output().unwrap();
+    assert!(onboarded.status.success(), "{onboarded:?}");
+    overwrite_the_gate_config_under(
+        &fixture.db_path(),
+        "logical:gate-config:owner-repo",
+        &no_gate("owner-repo"),
+    );
+
+    let output = fixture.status(ALL_LABELS, None);
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &[
+            "Error: JSON error: the gate config stored under the key 'gate-config:owner-repo' in ",
+            "its `repo` is \"owner-repo\", not 'owner/repo'",
+            "Do not onboard 'owner/repo' into this database",
+        ],
+    );
+    // An `onboard owner/repo` would overwrite the row of `owner-repo`.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("autopilot onboard"), "{stderr}");
+}
+
+#[test]
+fn a_gate_config_row_filed_under_another_key_exits_one_for_another_spelling_of_its_name() {
+    let fixture = Fixture::new();
+    fixture.propose("other/thing", &["cargo test"]);
+    // The row keeps the id a read of `other/thing` finds it by, and its
+    // `source_file` names another key, as a hand edit could leave it.
+    let conn = rusqlite::Connection::open(fixture.db_path()).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE drawers SET source_file = 'logical:gate-config:Other-Slug' \
+             WHERE source_file = 'logical:gate-config:other-thing'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "the UPDATE must hit the gate config row");
+    drop(conn);
+    let ask = |repo: &str| {
+        fixture
+            .command(
+                repo,
+                &fixture.db_path(),
+                fixture.root(),
+                &isolated_path(&fixture.stubs()),
+                ALL_LABELS,
+                None,
+            )
+            .output()
+            .unwrap()
+    };
+
+    assert_unreadable(
+        &fixture,
+        &ask("Other/Thing"),
+        &[
+            "Error: Validation error: 'Other/Thing' has no gate config under that exact name, and ",
+            "holds a gate config row whose id is not the id of the key in its `source_file` (id \"",
+            "`source_file` \"logical:gate-config:Other-Slug\")",
+        ],
+    );
+
+    // The exact name is read by id and is still answered.
+    let report = report(&ask("other/thing"));
+    assert_eq!(report["gate_config"]["state"], json!("pending"));
+}
+
+#[test]
+fn a_broken_config_under_another_spelling_does_not_stop_the_exact_names_report() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    fixture.approve(REPO);
+    fixture.propose("Owner/Repo", &["cargo test"]);
+    overwrite_the_gate_config_under(
+        &fixture.db_path(),
+        "logical:gate-config:Owner-Repo",
+        &no_gate("Owner/Repo"),
+    );
+
+    let report = report(&fixture.status(ALL_LABELS, None));
+
+    assert_eq!(report["onboarded"], json!(true));
+    assert_eq!(report["gate_config"]["state"], json!("approved"));
 }
 
 #[test]
@@ -1017,6 +1185,8 @@ fn a_path_gh_cannot_be_started_in_is_a_failed_label_read_that_names_the_path() {
         return;
     }
 
+    let reason = std::fs::metadata(locked.join(".")).unwrap_err();
+
     let output = fixture
         .command(
             REPO,
@@ -1036,17 +1206,46 @@ fn a_path_gh_cannot_be_started_in_is_a_failed_label_read_that_names_the_path() {
     assert_eq!(report["labels"]["read"], json!("failed"));
     let error = report["labels"]["error"].as_str().unwrap();
     assert!(error.starts_with("failed to start "), "{error}");
-    // The failure is about the directory, so the error has to name it, and
-    // the flag it came from: `gh` itself is fine.
+    // The failure is about the directory, so the error has to name it, the
+    // flag it came from and what the filesystem says: `gh` itself is fine.
     assert!(
         error.ends_with(&format!(
-            " — gh is started in the directory `--path` names, '{}', so check that this user \
-             can enter it",
+            " — gh is started in the directory `--path` names, '{}', and that directory cannot \
+             be entered ({reason})",
             locked.display()
         )),
         "{error}"
     );
     assert_eq!(fixture.gh_log(), "", "gh did not run");
+}
+
+#[test]
+fn a_gh_that_cannot_be_started_in_a_path_that_can_be_entered_does_not_blame_the_path() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    // A `gh` with an execute bit, so it is found on PATH, whose interpreter
+    // does not exist, so it cannot be started anywhere.
+    let stubs = fixture.root().join("unstartable");
+    std::fs::create_dir_all(&stubs).unwrap();
+    executable(&stubs.join("gh"), "#!/no/such/interpreter\n");
+
+    let output = fixture.status_at(&fixture.db_path(), &isolated_path(&stubs), ALL_LABELS, None);
+
+    let report = report(&output);
+    assert_eq!(report["gate_config"]["state"], json!("pending"));
+    assert_eq!(report["labels"]["read"], json!("failed"));
+    let error = report["labels"]["error"].as_str().unwrap();
+    assert!(
+        error.starts_with(&format!(
+            "failed to start {} label list ",
+            stubs.join("gh").display()
+        )),
+        "{error}"
+    );
+    // The directory `--path` names is the fixture's, which can be entered:
+    // it is not the cause, and the error must not send the reader to it.
+    assert!(!error.contains("--path"), "{error}");
+    assert!(!error.contains("cannot be entered"), "{error}");
 }
 
 #[test]
@@ -1225,6 +1424,9 @@ fn a_broken_config_under_another_spelling_exits_one_instead_of_reading_not_onboa
             "the config stored under the key 'gate-config:Owner-Repo'",
             "\"Owner/Repo\"",
             "does not parse: gate_commands must not be empty",
+            // The name the next read has to use: `owner/repo` would be
+            // refused again as another spelling of it.
+            "` from that repo's checkout, then ask with `Owner/Repo`",
         ],
     );
 }

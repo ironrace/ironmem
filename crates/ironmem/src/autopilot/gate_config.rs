@@ -299,6 +299,16 @@ pub(super) enum StoredGateConfigsError {
     /// incomplete, and an incomplete list cannot show that no near-miss
     /// exists.
     LimitReached { limit: usize },
+    /// A listed row's id is not the id of the key in its `source_file`. A
+    /// read by name finds a row by id alone, so which name reads this row is
+    /// not known, and a listing that left it out could not show that no
+    /// near-miss exists.
+    Misfiled {
+        /// The row's id.
+        id: String,
+        /// The row's `source_file`.
+        source_file: String,
+    },
 }
 
 /// Every stored gate config, read-only (#420): the `repo` of each row that
@@ -308,11 +318,12 @@ pub(super) enum StoredGateConfigsError {
 /// ([`get_gate_config_read_only`]) is a lookup by id that returns such a row
 /// too.
 ///
-/// A row is listed only when it is the row a read by name returns for the
-/// key in its `source_file` ([`listed_slug`]). The query matches the key
-/// prefix with SQLite's `LIKE`, which ignores ASCII letter case, so it also
-/// returns rows no read by name can reach; those are not stored gate configs
-/// and are passed over.
+/// The query matches the key prefix with SQLite's `LIKE`, which ignores
+/// ASCII letter case, so each row it returns is classified ([`Listed`]): the
+/// row a read by name returns for the key in its `source_file` is listed, a
+/// row filed under a key that is not a gate config's is passed over, and a
+/// row whose id and `source_file` disagree is
+/// [`StoredGateConfigsError::Misfiled`], which fails the listing.
 pub(super) fn stored_gate_configs_read_only(
     db: &ReadOnlyDb,
 ) -> Result<Vec<StoredGateConfig>, StoredGateConfigsError> {
@@ -333,32 +344,68 @@ pub(super) fn stored_gate_configs_read_only(
             limit: STORED_GATE_CONFIG_LIMIT,
         });
     }
-    Ok(drawers
-        .iter()
-        .filter_map(|drawer| {
-            let slug = listed_slug(drawer, &source_prefix)?;
-            Some(match parse_stored(slug, &drawer.content) {
-                Ok(config) => StoredGateConfig::Parsed(config.repo),
-                Err(broken) => StoredGateConfig::Broken(broken),
-            })
-        })
-        .collect())
+    let mut stored = Vec::with_capacity(drawers.len());
+    for drawer in &drawers {
+        match Listed::of(drawer, &source_prefix) {
+            Listed::GateConfig { slug } => {
+                stored.push(match parse_stored(slug, &drawer.content) {
+                    Ok(config) => StoredGateConfig::Parsed(config.repo),
+                    Err(broken) => StoredGateConfig::Broken(broken),
+                });
+            }
+            Listed::UnderAnotherKey => {}
+            Listed::Misfiled => {
+                return Err(StoredGateConfigsError::Misfiled {
+                    id: drawer.id.clone(),
+                    source_file: drawer.source_file.clone(),
+                });
+            }
+        }
+    }
+    Ok(stored)
 }
 
-/// The slug of the key `drawer` is stored under, when `drawer` is the row a
-/// read by name returns for that key: its `source_file` is `source_prefix`
-/// (compared without regard to ASCII letter case, as the listing's `LIKE`
-/// compares it) followed by the slug, and its id is the id of that slug's
-/// key. `None` for any other row.
-fn listed_slug<'a>(drawer: &'a Drawer, source_prefix: &str) -> Option<&'a str> {
-    let source = &drawer.source_file;
-    let prefix = source.get(..source_prefix.len())?;
-    if !prefix.eq_ignore_ascii_case(source_prefix) {
-        return None;
+/// What a row the listing query returned is, judged by its id, because a
+/// read by name finds a row by id alone and never reads `source_file`.
+enum Listed<'a> {
+    /// The row a read by name returns for the gate-config key of `slug`: its
+    /// `source_file` names that key, in any letter case, and its id is that
+    /// key's id.
+    GateConfig { slug: &'a str },
+    /// A row filed where its `source_file` says, under a key that is not a
+    /// gate config's: `Gate-Config:` in another letter case, which
+    /// `add_drawer` can store and the query's `LIKE` returns. Its id is the
+    /// id of that key, so no read by name returns it.
+    UnderAnotherKey,
+    /// A row whose id is neither the id of the gate-config key in its
+    /// `source_file` nor the id of the key as `source_file` spells it. Which
+    /// key its id belongs to, and so which name reads it, is not known.
+    Misfiled,
+}
+
+impl<'a> Listed<'a> {
+    /// Classify `drawer`, a row whose `source_file` starts with
+    /// `source_prefix` in some letter case.
+    fn of(drawer: &'a Drawer, source_prefix: &str) -> Self {
+        let source = &drawer.source_file;
+        let has_the_prefix = source
+            .get(..source_prefix.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(source_prefix));
+        if !has_the_prefix {
+            return Self::Misfiled;
+        }
+        let slug = &source[source_prefix.len()..];
+        if drawer.id == logical_drawer_id(&format!("{GATE_CONFIG_KEY_PREFIX}{slug}")) {
+            return Self::GateConfig { slug };
+        }
+        // Not the gate-config key's id, so a key spelled in another letter
+        // case is another key, with an id of its own.
+        let spelled_key = source.strip_prefix(crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX);
+        if spelled_key.is_some_and(|key| drawer.id == logical_drawer_id(key)) {
+            return Self::UnderAnotherKey;
+        }
+        Self::Misfiled
     }
-    let slug = &source[source_prefix.len()..];
-    let key = format!("{GATE_CONFIG_KEY_PREFIX}{slug}");
-    (drawer.id == logical_drawer_id(&key)).then_some(slug)
 }
 
 /// Row `content` stored under the key of `slug`, as a [`GateConfig`] or as
