@@ -2877,6 +2877,10 @@ mod tests {
         }
     }
 
+    /// The ids `bm25_search` returns for `query`. `bm25_search` reads an FTS5
+    /// rejection of the query text as no hits, so an empty result alone does
+    /// not show that FTS5 ran: a test expecting no hit for a query also files
+    /// a drawer that the same query does match, and asserts exactly that one.
     fn bm25_ids(db: &Database, query: &str, wing: Option<&str>) -> Vec<String> {
         db.bm25_search(query, 10, wing, None)
             .unwrap_or_else(|e| panic!("{query:?} must not error: {e}"))
@@ -2903,8 +2907,21 @@ mod tests {
         for query in ["non-plugin hooks", "read-only"] {
             assert_eq!(bm25_ids(&db, query, None), vec![id.clone()], "{query:?}");
         }
-        // A quoted string is a phrase: the two halves must be adjacent and in order.
-        assert!(bm25_ids(&db, "plugin-non", None).is_empty());
+        // A quoted string is a phrase: the two halves must be adjacent and in
+        // order, so only the control drawer, which has them as "plugin non",
+        // matches. A query FTS5 rejected would match nothing, not the control.
+        let control = "b2".repeat(16);
+        db.insert_drawer(
+            &control,
+            "a plugin non sequitur",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(bm25_ids(&db, "plugin-non", None), vec![control]);
     }
 
     #[test]
@@ -2981,8 +2998,13 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         let emb = dummy_embedding();
         let (_only_hooks, both) = two_drawers(&db);
-        // Lower-case `or` is a word: the drawer without it is not a hit.
-        assert!(bm25_ids(&db, "hooks or doctor", None).is_empty());
+        // Lower-case `or` is a word: neither drawer above has it, so only the
+        // control drawer, which does, is a hit. A query FTS5 rejected would
+        // match nothing, not the control.
+        let control = "o".repeat(32);
+        db.insert_drawer(&control, "hooks or doctor", &emb, "w", "r", "", "test")
+            .unwrap();
+        assert_eq!(bm25_ids(&db, "hooks or doctor", None), vec![control]);
         let android = "j".repeat(32);
         db.insert_drawer(&android, "an android phone", &emb, "w", "r", "", "test")
             .unwrap();

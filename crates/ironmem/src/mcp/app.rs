@@ -1144,7 +1144,9 @@ mod tests {
 
         // Freshness is the dirty flag, not a count of rows against index
         // entries, so an index smaller than the table is not stale: a search
-        // leaves the flag clear and the next search does not rebuild.
+        // leaves the flag clear and does not rebuild. `n3` is stored without
+        // marking the index dirty, so only a rebuild would put it in.
+        store(&app, "n3", &unit_axis(3));
         let filters = crate::db::SearchFilters {
             wing: None,
             room: None,
@@ -1222,20 +1224,37 @@ mod tests {
         assert!(indexed_ids(&app).is_empty());
     }
 
+    /// A zero-vector drawer is not in the vector index but is in the
+    /// wing/room graph, so deleting it through the `delete_drawer` tool must
+    /// still refresh what it was part of, and leave the indexed drawer be.
     #[test]
     fn deleting_a_drawer_that_is_not_in_the_index_rebuilds_cleanly() {
         let app = App::open_for_test().unwrap();
         store(&app, "n1", &unit_axis(1));
-        store(&app, "z1", &zero_vector());
-        app.mark_dirty();
-        app.ensure_index_fresh().unwrap();
-
-        // What `delete_drawer` does: delete the row, mark the index dirty.
-        assert!(app.db.delete_drawer("z1").unwrap());
+        app.db
+            .insert_drawer("z1", "content z1", &zero_vector(), "zw", "zr", "", "test")
+            .unwrap();
         app.mark_dirty();
         app.ensure_index_fresh().unwrap();
         assert_eq!(indexed_ids(&app), ["n1"]);
+        // Caches the graph, which holds z1's wing.
+        let before = crate::search::graph::graph_stats(&app).unwrap();
+        assert_eq!(before.total_wings, 2);
+
+        let out =
+            crate::mcp::tools::call_tool(&app, "delete_drawer", &serde_json::json!({ "id": "z1" }))
+                .unwrap();
+        assert_eq!(out["success"], true, "{out}");
+        assert!(app.db.get_drawer("z1").unwrap().is_none());
+        let after = crate::search::graph::graph_stats(&app).unwrap();
+        assert_eq!(after.total_wings, 1, "the graph still holds z1's wing");
+
+        app.ensure_index_fresh().unwrap();
+        assert_eq!(indexed_ids(&app), ["n1"]);
         assert!(!app.dirty.load(Ordering::Acquire));
+        let state = app.index_state.read().unwrap();
+        let top = state.index.search(&unit_axis(1), 1);
+        assert_eq!(state.id_map[top[0].0], "n1");
     }
 
     #[test]

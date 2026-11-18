@@ -1171,12 +1171,23 @@ mod tests {
         assert_eq!(params["supersedes"].as_str(), Some(predecessor_id.as_str()));
     }
 
+    /// A unit vector along `axis`: a real embedding, so the drawer is indexed
+    /// (the test app's noop embedder writes zero vectors, which are not).
+    fn unit_vector(axis: usize) -> Vec<f32> {
+        let mut vector = vec![0.0f32; ironrace_embed::EMBED_DIM];
+        vector[axis] = 1.0;
+        vector
+    }
+
     #[test]
     fn replayed_add_drawer_supersession_keeps_one_index_visible_successor() {
         let app = test_app();
-        let predecessor = handle_add_drawer(
+        let predecessor_args =
+            json!({"content": "index replay predecessor", "wing": "project", "room": "state"});
+        let predecessor = handle_add_drawer_with_embedding(
             &app,
-            &json!({"content": "index replay predecessor", "wing": "project", "room": "state"}),
+            validate_add_drawer_args(&predecessor_args).unwrap(),
+            unit_vector(6),
         )
         .unwrap();
         let predecessor_id = predecessor["id"].as_str().unwrap().to_owned();
@@ -1187,15 +1198,19 @@ mod tests {
             "supersedes": predecessor_id,
         });
 
-        let first = handle_add_drawer(&app, &replay).unwrap();
-        let second = handle_add_drawer(&app, &replay).unwrap();
+        let add_successor = || {
+            handle_add_drawer_with_embedding(
+                &app,
+                validate_add_drawer_args(&replay).unwrap(),
+                unit_vector(7),
+            )
+            .unwrap()
+        };
+        let first = add_successor();
+        let second = add_successor();
         let successor_id = first["id"].as_str().unwrap();
         assert_eq!(second["id"].as_str(), Some(successor_id));
 
-        // The noop embedder stores a zero vector, which is kept out of the
-        // vector index (#377), so this successor is not indexed at all. The
-        // no-duplicate rule for an indexed drawer is pinned by
-        // `replayed_index_insert_of_an_indexed_drawer_keeps_one_id_map_entry`.
         let state = app.index_state.read().unwrap();
         assert_eq!(
             state
@@ -1203,61 +1218,36 @@ mod tests {
                 .iter()
                 .filter(|id| id.as_str() == successor_id)
                 .count(),
-            0,
-            "a noop-embedded (zero-vector) drawer must not be in the HNSW index"
-        );
-        drop(state);
-
-        let results = handle_search(
-            &app,
-            &json!({
-                "query": "uniquely searchable",
-                "wing": "project",
-                "room": "state",
-                "limit": 10,
-            }),
-        )
-        .unwrap();
-        assert_eq!(
-            results["results"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|result| result["id"].as_str() == Some(successor_id))
-                .count(),
-            1,
-            "search must expose the replayed successor once"
-        );
-    }
-
-    /// `handle_add_drawer` calls `insert_into_index` again when a write is
-    /// replayed. The test embedder only produces zero vectors, which are not
-    /// indexed, so this drives the same call directly with a real vector: the
-    /// replay must leave exactly one `id_map` entry for the drawer.
-    #[test]
-    fn replayed_index_insert_of_an_indexed_drawer_keeps_one_id_map_entry() {
-        let app = test_app();
-        let mut embedding = vec![0.0f32; ironrace_embed::EMBED_DIM];
-        embedding[7] = 1.0;
-        let id = "replayed-indexed-drawer";
-        app.db
-            .insert_drawer(id, "replayed", &embedding, "project", "state", "", "test")
-            .unwrap();
-
-        app.insert_into_index(id, &embedding).unwrap();
-        app.insert_into_index(id, &embedding).unwrap();
-
-        let state = app.index_state.read().unwrap();
-        assert_eq!(
-            state
-                .id_map
-                .iter()
-                .filter(|entry| entry.as_str() == id)
-                .count(),
             1,
             "a replayed upsert must not append a duplicate HNSW id"
         );
         assert_eq!(state.index.len(), state.id_map.len());
+        // The predecessor is indexed too, so the search below has to drop it.
+        assert!(state.id_map.contains(&predecessor_id));
+        drop(state);
+
+        // Unscoped, the vector leg reads the HNSW index; scoped, it scores the
+        // scope's rows from SQLite. Either way the successor shows once and
+        // the superseded predecessor not at all.
+        for scope in [json!({}), json!({"wing": "project", "room": "state"})] {
+            let mut args = json!({"query": "uniquely searchable", "limit": 10});
+            args.as_object_mut()
+                .unwrap()
+                .extend(scope.as_object().unwrap().clone());
+            let results = handle_search(&app, &args).unwrap();
+            let ids: Vec<&str> = results["results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|result| result["id"].as_str())
+                .collect();
+            assert_eq!(
+                ids.iter().filter(|id| **id == successor_id).count(),
+                1,
+                "search must expose the replayed successor once: {args} -> {ids:?}"
+            );
+            assert!(!ids.contains(&predecessor_id.as_str()), "{args} -> {ids:?}");
+        }
     }
 
     #[test]
