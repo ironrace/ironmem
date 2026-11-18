@@ -818,7 +818,10 @@ fn refuse_another_spelling(
             limit,
         },
     })?;
-    let mut near: Vec<(String, RepoIdentity)> = Vec::new();
+    let mut near: Vec<String> = Vec::new();
+    // Only one side naming a host is the one case that may be two
+    // repositories, so the error says what is true if it is.
+    let mut host_ambiguous = false;
     let mut broken: Vec<BrokenGateConfig> = Vec::new();
     for row in stored {
         match row {
@@ -826,7 +829,8 @@ fn refuse_another_spelling(
                 let identity = RepoIdentity::of_stored(&name)
                     .filter(|identity| name != repo.as_str() && repo.identity.may_be(identity));
                 if let Some(identity) = identity {
-                    near.push((name, identity));
+                    host_ambiguous |= identity.host.is_some() != repo.identity.host.is_some();
+                    near.push(name);
                 }
             }
             StoredGateConfig::Broken(row) => {
@@ -837,14 +841,9 @@ fn refuse_another_spelling(
         }
     }
     if !near.is_empty() {
-        // Only one side naming a host is the one case that may be two
-        // repositories, so the error says what is true if it is.
-        let host_ambiguous = near
-            .iter()
-            .any(|(_, identity)| identity.host.is_some() != repo.identity.host.is_some());
         return Err(StatusError::StoredUnderAnotherName {
             asked: repo.clone(),
-            stored: near.into_iter().map(|(stored, _)| stored).collect(),
+            stored: near,
             host_ambiguous,
         });
     }
@@ -1570,11 +1569,7 @@ mod tests {
 
     #[test]
     fn reading_by_path_reports_a_stored_config() {
-        let (_dir, path) = on_disk_db();
-        {
-            let db = Database::open(&path).unwrap();
-            propose_gate_config(&db, "owner/repo", vec!["cargo test".into()], vec![]).unwrap();
-        }
+        let (_dir, path) = db_with_configs(&["owner/repo"]);
         let read = read_gate_config_status(&path, &repo("owner/repo")).unwrap();
         assert_eq!(read.repo.as_str(), "owner/repo");
         assert_eq!(read.db, path.display().to_string());
