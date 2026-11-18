@@ -200,8 +200,44 @@ fn validate_wall_clock_timeout(secs: Option<u64>) -> Result<(), String> {
     Ok(())
 }
 
+/// The logical-key prefix every gate config's key starts with.
+const GATE_CONFIG_KEY_PREFIX: &str = "gate-config:";
+
+/// How many stored gate configs [`stored_gate_config_repos_read_only`] will
+/// list. A listing that fills it may be incomplete, so it is an error.
+const STORED_GATE_CONFIG_LIMIT: usize = 1000;
+
 pub(super) fn gate_config_key(repo: &str) -> String {
-    format!("gate-config:{}", repo_slug(repo))
+    format!("{GATE_CONFIG_KEY_PREFIX}{}", repo_slug(repo))
+}
+
+/// The `repo` of every stored gate config, read-only (#420). A row that does
+/// not parse is skipped: it belongs to some other repo, and a read of that
+/// repo's own name reports it. An error when the listing reaches
+/// [`STORED_GATE_CONFIG_LIMIT`], since a possibly incomplete list cannot show
+/// that no near-match exists.
+pub fn stored_gate_config_repos_read_only(db: &ReadOnlyDb) -> Result<Vec<String>, MemoryError> {
+    let prefix = format!(
+        "{}{GATE_CONFIG_KEY_PREFIX}",
+        crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX
+    );
+    let drawers = db.get_drawers_by_source_prefix(
+        super::WING,
+        super::ROOM,
+        &prefix,
+        STORED_GATE_CONFIG_LIMIT,
+    )?;
+    if drawers.len() >= STORED_GATE_CONFIG_LIMIT {
+        return Err(MemoryError::Validation(format!(
+            "{STORED_GATE_CONFIG_LIMIT} or more gate configs are stored, so they cannot all be \
+             compared against the repo asked about"
+        )));
+    }
+    Ok(drawers
+        .iter()
+        .filter_map(|drawer| serde_json::from_str::<GateConfig>(&drawer.content).ok())
+        .map(|config| config.repo)
+        .collect())
 }
 
 /// Write a fresh `pending` proposal for `repo`, as the Onboarder would after
@@ -843,5 +879,35 @@ mod tests {
 
         assert!(matches!(err, MemoryError::Json(_)), "{err}");
         assert!(err.to_string().contains(EMPTY_GATE_COMMANDS_MSG), "{err}");
+    }
+
+    #[test]
+    fn stored_repos_lists_each_parseable_config_and_skips_a_broken_row() {
+        let (_dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(&db, "owner/one", vec!["cargo test".into()], vec![]).unwrap();
+            propose_gate_config(&db, "owner/two", vec!["cargo test".into()], vec![]).unwrap();
+            write_current(&db, &gate_config_key("owner/broken"), "not json").unwrap();
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let mut repos = stored_gate_config_repos_read_only(&ro).unwrap();
+        repos.sort();
+
+        assert_eq!(
+            repos,
+            vec!["owner/one".to_string(), "owner/two".to_string()]
+        );
+    }
+
+    #[test]
+    fn stored_repos_is_empty_for_a_database_with_no_gate_config() {
+        let (_dir, path) = on_disk_db();
+        let ro = Database::open_read_only(&path).unwrap();
+        assert_eq!(
+            stored_gate_config_repos_read_only(&ro).unwrap(),
+            Vec::<String>::new()
+        );
     }
 }

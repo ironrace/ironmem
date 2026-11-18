@@ -75,6 +75,19 @@ impl ReadOnlyDb {
         self.inner.get_drawers(wing, room, limit)
     }
 
+    /// Drawers in `wing`/`room` whose source file starts with `prefix`, newest
+    /// first (see [`Database::get_drawers_by_source_prefix`]).
+    pub fn get_drawers_by_source_prefix(
+        &self,
+        wing: &str,
+        room: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Drawer>, MemoryError> {
+        self.inner
+            .get_drawers_by_source_prefix(wing, room, prefix, limit)
+    }
+
     /// Exact-id drawer lookup.
     pub fn get_drawer(&self, id: &str) -> Result<Option<Drawer>, MemoryError> {
         self.inner.get_drawer(id)
@@ -114,6 +127,30 @@ mod tests {
         include_str!("../../migrations/015_collab_recovery_state.sql"),
         include_str!("../../migrations/016_collab_message_drawers.sql"),
     ];
+
+    #[test]
+    fn get_drawers_by_source_prefix_is_delegated_through_the_read_only_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.sqlite3");
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+            let emb = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+            for (content, source) in [("wanted", "logical:a:1"), ("other", "logical:b:1")] {
+                let id = crate::db::drawers::generate_id(content, "w", "r");
+                db.insert_drawer(&id, content, &emb, "w", "r", source, "test")
+                    .unwrap();
+            }
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let found = ro
+            .get_drawers_by_source_prefix("w", "r", "logical:a:", 10)
+            .unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content, "wanted");
+    }
 
     /// Documents that `ReadOnlyDb` exposes the read methods the dashboard needs
     /// and that they return the same data as the underlying `Database`.

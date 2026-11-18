@@ -17,7 +17,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file (SQLite may leave its `-wal`/`-shm` side files) and only asks `gh` to
   list labels. It exits 0 whenever it prints a report, including for a repo
   that is not onboarded, and 1 for an unreadable gate config or a malformed
-  repo name. A `gh` failure is reported as a failed label read, not as missing
+  repo name; a name that differs only in case or host prefix from an
+  onboarded repo is an error naming the stored name, not "not onboarded". A
+  `gh` failure is reported as a failed label read, not as missing
   labels. `/evaluate-issue` now reads the gate config from this command
   instead of from Autopilot's drawer.
 

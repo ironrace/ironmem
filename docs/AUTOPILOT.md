@@ -883,7 +883,7 @@ descriptions.
 | Exit status | Meaning |
 |---|---|
 | `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
-| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), each part made of letters, digits, `.`, `_` and `-` and not starting with `-`, the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
+| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), each part made of letters, digits, `.`, `_` and `-` and not starting with `-`, the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or a config is stored under a name that differs only in letter case or host prefix (the error names it), or the name ends in `.git`, or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
 | `2` | A usage error. An `ironmem` too old to know `status` also exits 2. |
 
 `--json` prints this shape:
@@ -911,11 +911,13 @@ descriptions.
 - `db` is the absolute path of the database that answered.
 - A repo that was never onboarded has `"onboarded": false` and
   `"gate_config": null`.
-- A repo name is matched as written: `github.com/owner/repo` and `owner/repo`
-  are different names, and so are names that differ in letter case, so ask
-  with the name the repo was onboarded under. A three-part name is read as
-  `host/owner/name`. Each part may hold only letters, digits, `.`, `_` and
-  `-` and may not start with `-`; any other name exits 1.
+- The name must be the one the repo was onboarded under. A name that differs
+  only in letter case or in a host prefix (`github.com/owner/repo`) from an
+  onboarded one exits 1 and names the stored one, because `gh` treats those
+  as the same repository. A three-part name is read as `host/owner/name`.
+  Each part may hold only letters, digits, `.`, `_` and `-` and may not start
+  with `-`. A `.git` suffix and a host with a port are refused (`gh` does not
+  resolve them), and so is a full URL.
 - A pending config has `"approved_at": null`.
 - `manifest_warnings` lists the problems recorded on the proposal; read them
   before running `approve`. It is empty when there are none.

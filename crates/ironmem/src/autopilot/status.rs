@@ -39,7 +39,9 @@ use crate::db::read_only::ReadOnlyDb;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
-use super::gate_config::{get_gate_config_read_only, GateConfigState};
+use super::gate_config::{
+    get_gate_config_read_only, stored_gate_config_repos_read_only, GateConfigState,
+};
 use super::gh::{repo_labels, GhRunner};
 use super::labels::AgentLabel;
 use super::validate_repo;
@@ -157,9 +159,14 @@ impl LabelStatus {
 
 /// Refuse a string that is not shaped like a repo name. The shape is
 /// `owner/name` or `host/owner/name`, each part non-empty, made only of ASCII
-/// letters, digits, `.`, `_` and `-`, and not starting with `-`. This does not
-/// know every name `gh` refuses, and letter case cannot be checked here, so
-/// `OWNER/REPO` is simply not onboarded.
+/// letters, digits, `.`, `_` and `-`, not starting with `-`, and with a name
+/// that does not end in `.git`. This does not know every name `gh` refuses.
+///
+/// Measured against `gh` 2.96.0 for `gh label list --repo`: a different
+/// letter case and a `github.com/` prefix both resolve to the same repository
+/// (which is why [`read_gate_config_status`] refuses them as near-misses of a
+/// stored name); a `.git` suffix and `host:port` do not resolve; and a
+/// dash-led value is read as a repo name, not as a flag.
 fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
     validate_repo(repo)?;
     let segments: Vec<&str> = repo.split('/').collect();
@@ -170,7 +177,17 @@ fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
     };
-    if (2..=3).contains(&segments.len()) && segments.iter().all(segment_ok) {
+    let shaped = (2..=3).contains(&segments.len()) && segments.iter().all(segment_ok);
+    if shaped
+        && segments[segments.len() - 1]
+            .to_ascii_lowercase()
+            .ends_with(".git")
+    {
+        return Err(MemoryError::Validation(format!(
+            "'{repo}' ends in `.git`, which `gh` does not resolve — drop the `.git` suffix"
+        )));
+    }
+    if shaped {
         Ok(())
     } else {
         Err(MemoryError::Validation(format!(
@@ -184,6 +201,12 @@ fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
 /// read-only. The repo is checked before the database is touched, so a bad
 /// repo is reported even when the database is missing, and a SQLite failure
 /// is explained rather than passed through bare.
+///
+/// `Ok(None)` means no gate config is stored under this name or under any
+/// spelling of it. When one is stored under a spelling `gh` treats as the same
+/// repository (a different letter case, or a host prefix on either side), this
+/// is an error naming the stored name instead, so a repo that is onboarded is
+/// never reported as "not onboarded".
 pub fn read_gate_config_status(
     db_path: &Path,
     repo: &str,
@@ -205,7 +228,49 @@ pub fn read_gate_config_status(
         }
         other => other.map_err(explain)?,
     };
-    gate_config_status(&db, repo).map_err(explain)
+    let status = gate_config_status(&db, repo).map_err(explain)?;
+    if status.is_some() {
+        return Ok(status);
+    }
+    // No config under this exact name. `gh` treats a different letter case or
+    // a host prefix as the same repository, so a config stored under one of
+    // those spellings means the repo IS onboarded, under another name.
+    let near: Vec<String> = stored_gate_config_repos_read_only(&db)
+        .map_err(explain)?
+        .into_iter()
+        .filter(|stored| stored != repo && same_repository(stored, repo))
+        .collect();
+    if near.is_empty() {
+        return Ok(None);
+    }
+    let names = near
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(MemoryError::Validation(format!(
+        "'{repo}' has no gate config under that exact name, but one is stored for {names}, \
+         which differs only in letter case or host prefix — ask with the stored name"
+    )))
+}
+
+/// The owner and name of `repo`: its last two `/`-separated segments, ASCII
+/// lowercased. A host prefix is dropped, so `github.com/Owner/Repo` and
+/// `owner/repo` have the same identity.
+fn repo_identity(repo: &str) -> Option<(String, String)> {
+    let mut segments = repo.rsplit('/');
+    let name = segments.next()?;
+    let owner = segments.next()?;
+    Some((owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+}
+
+/// Whether two repo strings could name the same repository: same owner and
+/// name ignoring ASCII case and any host prefix.
+fn same_repository(a: &str, b: &str) -> bool {
+    match (repo_identity(a), repo_identity(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
 }
 
 /// An I/O failure naming `db_path`, with a hint only for the SQLite errors the
@@ -791,6 +856,90 @@ mod tests {
             err.to_string()
                 .contains(crate::autopilot::EMPTY_GATE_COMMANDS_MSG),
             "{err}"
+        );
+    }
+
+    /// A database holding a gate config for each of `stored`.
+    fn db_with_configs(stored: &[&str]) -> (tempfile::TempDir, std::path::PathBuf) {
+        let (dir, path) = on_disk_db();
+        {
+            let db = Database::open(&path).unwrap();
+            for repo in stored {
+                propose_gate_config(&db, repo, vec!["cargo test".into()], vec![]).unwrap();
+            }
+        }
+        (dir, path)
+    }
+
+    fn near_miss_message(stored: &[&str], asked: &str) -> String {
+        let (_dir, path) = db_with_configs(stored);
+        match read_gate_config_status(&path, asked) {
+            Err(MemoryError::Validation(message)) => message,
+            other => {
+                panic!("{asked} against {stored:?}: expected the near-miss error, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn a_differently_cased_or_host_prefixed_name_is_refused_with_the_stored_one() {
+        for (stored, asked) in [
+            ("ironrace/ironmem", "IronRace/IronMem"),
+            ("ironrace/ironmem", "github.com/ironrace/ironmem"),
+            ("ghe.example.com/ironrace/ironmem", "ironrace/ironmem"),
+        ] {
+            let message = near_miss_message(&[stored], asked);
+            assert!(message.contains(&format!("'{asked}'")), "{message}");
+            assert!(message.contains(&format!("'{stored}'")), "{message}");
+            assert!(message.contains("ask with the stored name"), "{message}");
+        }
+    }
+
+    #[test]
+    fn every_matching_stored_name_is_listed() {
+        let message = near_miss_message(&["owner/repo", "github.com/owner/repo"], "OWNER/REPO");
+        assert!(message.contains("'owner/repo'"), "{message}");
+        assert!(message.contains("'github.com/owner/repo'"), "{message}");
+    }
+
+    #[test]
+    fn the_exact_name_wins_over_a_differently_cased_one() {
+        let (_dir, path) = db_with_configs(&["owner/repo", "Owner/Repo"]);
+        let status = read_gate_config_status(&path, "owner/repo").unwrap();
+        assert!(status.is_some());
+    }
+
+    #[test]
+    fn an_unrelated_or_longer_named_repo_is_not_a_near_miss() {
+        let (_dir, path) = db_with_configs(&["other/thing", "owner/repo"]);
+        assert_eq!(read_gate_config_status(&path, "owner/repo2").unwrap(), None);
+        assert_eq!(read_gate_config_status(&path, "xowner/repo").unwrap(), None);
+        let (_dir, path) = db_with_configs(&["other/thing"]);
+        assert_eq!(read_gate_config_status(&path, "owner/repo").unwrap(), None);
+    }
+
+    #[test]
+    fn a_git_suffix_is_refused_with_a_message_to_drop_it() {
+        let (_dir, path) = on_disk_db();
+        for bad in [
+            "owner/repo.git",
+            "owner/repo.GIT",
+            "github.com/owner/repo.git",
+        ] {
+            match read_gate_config_status(&path, bad) {
+                Err(MemoryError::Validation(message)) => {
+                    assert!(
+                        message.contains("drop the `.git` suffix"),
+                        "{bad}: {message}"
+                    )
+                }
+                other => panic!("{bad}: expected Validation, got {other:?}"),
+            }
+        }
+        // A name that merely contains `.git` is fine.
+        assert_eq!(
+            read_gate_config_status(&path, "owner/my.github").unwrap(),
+            None
         );
     }
 

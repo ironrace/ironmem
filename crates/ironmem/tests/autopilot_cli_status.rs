@@ -715,3 +715,48 @@ fn a_stored_config_that_does_not_parse_exits_one() {
 
     assert_unreadable(&fixture, &output, &["gate_commands must not be empty"]);
 }
+
+#[test]
+fn a_name_that_only_resembles_an_onboarded_repo_exits_one_and_names_the_stored_one() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    fixture.approve(REPO);
+
+    let output = fixture
+        .command(
+            "Owner/Repo",
+            &fixture.db_path(),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &["'Owner/Repo'", "'owner/repo'", "ask with the stored name"],
+    );
+}
+
+#[test]
+fn a_git_suffix_exits_one() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+
+    let output = fixture
+        .command(
+            "owner/repo.git",
+            &fixture.db_path(),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    assert_unreadable(&fixture, &output, &["drop the `.git` suffix"]);
+}

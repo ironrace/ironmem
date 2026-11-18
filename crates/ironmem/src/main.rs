@@ -991,10 +991,13 @@ enum AutopilotCmd {
     /// labels that could not be read (`"labels": {"read": "failed", ...}`).
     /// 1 when the gate config could not be read: the repo is not an
     /// `owner/name` (or `host/owner/name`), each part made of letters, digits,
-    /// `.`, `_` and `-` and not starting with `-`, the database is missing, not an ironmem database or not
+    /// `.`, `_` and `-` and not starting with `-` (a `.git` suffix is
+    /// refused too), the database is missing, not an ironmem database or not
     /// readable, the stored config does not parse or belongs to another repo
-    /// name, or an ironmem environment setting is invalid (for example
-    /// `IRONMEM_MCP_MODE`, as for every command). 2 for a usage error.
+    /// name, a config is stored under a name that differs only in letter case
+    /// or host prefix (the error names it), or an ironmem environment setting
+    /// is invalid (for example `IRONMEM_MCP_MODE`, as for every command).
+    /// 2 for a usage error.
     Status {
         /// Path to the database
         #[arg(long)]
