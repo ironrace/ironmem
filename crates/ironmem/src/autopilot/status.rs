@@ -441,8 +441,9 @@ pub enum StatusError {
     },
 
     /// A read that failed for a reason that is not SQLite's, reported as the
-    /// error it already is. No read returns one: every failure of the open
-    /// and of the two reads is a `MemoryError::Db`.
+    /// error it already is. As the open and the two reads are written, each
+    /// of their failures is a `MemoryError::Db`, so nothing produces this
+    /// variant; it keeps a read error of any other kind an error.
     #[error(transparent)]
     Other(MemoryError),
 }
@@ -1288,6 +1289,14 @@ mod tests {
         RepoName::parse(name).unwrap()
     }
 
+    /// A temporary directory and the path of `name` in it, spelled as
+    /// `std::path::absolute` spells it (see `on_disk_db`).
+    fn temp_path(name: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::absolute(dir.path().join(name)).unwrap();
+        (dir, path)
+    }
+
     /// `path` as a read names it, built the one way a [`DbPath`] is.
     fn db_at(path: impl AsRef<Path>) -> DbPath {
         absolute_db_path(path.as_ref()).unwrap()
@@ -1741,8 +1750,7 @@ mod tests {
 
     #[test]
     fn reading_by_path_explains_a_file_that_is_not_a_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memory.sqlite3");
+        let (_dir, path) = temp_path("memory.sqlite3");
         std::fs::write(
             &path,
             "this is not sqlite, it is a text file of some length\n".repeat(50),
@@ -1774,8 +1782,7 @@ mod tests {
 
     #[test]
     fn an_empty_sqlite_file_is_explained_as_not_an_ironmem_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("empty.sqlite3");
+        let (_dir, path) = temp_path("empty.sqlite3");
         rusqlite::Connection::open(&path).unwrap();
         let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
         assert!(
@@ -1892,8 +1899,7 @@ mod tests {
 
     #[test]
     fn a_missing_database_is_not_found_and_the_error_says_how_to_name_one() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.sqlite3");
+        let (_dir, path) = temp_path("absent.sqlite3");
         let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
         assert!(
             matches!(&err, StatusError::DatabaseNotFound { db } if db.as_path() == path),
@@ -2314,10 +2320,7 @@ mod tests {
     fn two_broken_rows_under_other_spellings_are_both_listed_with_a_quoted_database() {
         // A database path a shell would split, so the `--db` in the remedy
         // has to be quoted.
-        let dir = tempfile::tempdir().unwrap();
-        let path = std::path::absolute(dir.path().join("two words"))
-            .unwrap()
-            .join("memory.sqlite3");
+        let (_dir, path) = temp_path("two words/memory.sqlite3");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         {
             let db = Database::open(&path).unwrap();
@@ -3097,8 +3100,10 @@ mod tests {
 
     #[test]
     fn the_json_report_is_pinned_byte_for_byte() {
-        // `serde_json::Value` equality ignores key order, and the report is
-        // read as printed text, so the bytes are pinned too.
+        // `serde_json::Value` equality ignores key order, so the order of
+        // the keys is pinned here, on the compact form. The layout the
+        // command prints (indented, one trailing newline) is pinned from
+        // the binary, in `an_approved_repo_with_every_label_reports_the_pinned_json`.
         let reported = status_of(
             "/tmp/mem.db",
             Some(config_status(
@@ -3375,8 +3380,8 @@ mod tests {
 
     #[test]
     fn a_database_path_that_is_a_directory_is_refused_as_one_before_sqlite_reads_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = std::path::absolute(dir.path()).unwrap();
+        let (_dir, path) = temp_path("a-directory");
+        std::fs::create_dir(&path).unwrap();
 
         let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
 

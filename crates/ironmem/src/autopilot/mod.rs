@@ -569,9 +569,13 @@ pub(crate) mod testing {
 
     /// A migrated database on disk. `Database::open_read_only` refuses to
     /// create a file, so a test of a read-only read needs a real one.
+    ///
+    /// The path is spelled as `std::path::absolute` spells it, so a test
+    /// that compares it with a path the code made absolute passes under a
+    /// `TMPDIR` that holds `//` or `/./`.
     pub(crate) fn on_disk_db() -> (tempfile::TempDir, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("memory.sqlite3");
+        let path = std::path::absolute(dir.path().join("memory.sqlite3")).unwrap();
         let db = Database::open(&path).unwrap();
         db.migrate().unwrap();
         (dir, path)

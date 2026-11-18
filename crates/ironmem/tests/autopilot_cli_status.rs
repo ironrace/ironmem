@@ -50,22 +50,32 @@ const ALL_LABELS: &str = r#"[{"name":"bug"},{"name":"agent:blocked"},{"name":"ag
 const EXPECTED_GH_LOG: &str = "gh\nlabel\nlist\n--repo\nowner/repo\n--limit\n1000\n--json\nname\n";
 
 struct Fixture {
-    root: tempfile::TempDir,
+    /// Removes the directory when the fixture is dropped.
+    _dir: tempfile::TempDir,
+    root: PathBuf,
 }
 
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
-        let stubs = root.path().join("stubs");
+        let dir = tempfile::tempdir().unwrap();
+        // As `std::path::absolute` spells it, which is how `status` names a
+        // database: a `TMPDIR` holding `//` or `/./` then compares equal.
+        let root = std::path::absolute(dir.path()).unwrap();
+        let stubs = root.join("stubs");
         std::fs::create_dir_all(&stubs).unwrap();
         executable(&stubs.join("gh"), GH_STUB);
-        std::fs::create_dir_all(root.path().join("home")).unwrap();
-        Self { root }
+        std::fs::create_dir_all(root.join("home")).unwrap();
+        Self { _dir: dir, root }
+    }
+
+    /// The fixture's directory.
+    fn root(&self) -> &Path {
+        &self.root
     }
 
     /// The `HOME` every run gets: a directory that starts empty.
     fn home(&self) -> PathBuf {
-        self.root.path().join("home")
+        self.root().join("home")
     }
 
     /// The names of everything in [`Fixture::home`].
@@ -77,15 +87,15 @@ impl Fixture {
     }
 
     fn db_path(&self) -> PathBuf {
-        self.root.path().join("memory.sqlite3")
+        self.root().join("memory.sqlite3")
     }
 
     fn log_path(&self) -> PathBuf {
-        self.root.path().join("gh.log")
+        self.root().join("gh.log")
     }
 
     fn stubs(&self) -> PathBuf {
-        self.root.path().join("stubs")
+        self.root().join("stubs")
     }
 
     /// Open (creating and migrating if needed) the fixture database.
@@ -112,10 +122,12 @@ impl Fixture {
 
     /// The one place a run's environment is set: `path_var` as `PATH`, the
     /// fixture's empty directory as `HOME`, the stub answering `labels` (or
-    /// failing with `fail` on stderr), and `IRONMEM_DB_PATH`,
-    /// `IRONMEM_MCP_MODE` and `IRONMEM_EMBED_MODE` removed: the settings that
-    /// redirect the database or fail config loading, so a developer's shell
-    /// cannot change the result.
+    /// failing with `fail` on stderr), and five variables removed so that a
+    /// developer's shell cannot change the result. `IRONMEM_DB_PATH`,
+    /// `IRONMEM_MCP_MODE` and `IRONMEM_EMBED_MODE` redirect the database or
+    /// fail config loading. `BASH_ENV` names a file the stub's bash would
+    /// run first. `RUST_LOG` turns on log lines, and a run that reports must
+    /// print nothing on stderr.
     fn env(&self, command: &mut Command, path_var: &Path, labels: &str, fail: Option<&str>) {
         command
             .env("PATH", path_var)
@@ -124,7 +136,9 @@ impl Fixture {
             .env("GH_LABELS", labels)
             .env_remove("IRONMEM_DB_PATH")
             .env_remove("IRONMEM_MCP_MODE")
-            .env_remove("IRONMEM_EMBED_MODE");
+            .env_remove("IRONMEM_EMBED_MODE")
+            .env_remove("BASH_ENV")
+            .env_remove("RUST_LOG");
         if let Some(message) = fail {
             command.env("GH_FAIL", message);
         } else {
@@ -171,7 +185,7 @@ impl Fixture {
 
     /// `ironmem autopilot status owner/repo --json` against `db`.
     fn status_at(&self, db: &Path, path_var: &Path, labels: &str, fail: Option<&str>) -> Output {
-        self.command(REPO, db, self.root.path(), path_var, labels, fail)
+        self.command(REPO, db, self.root(), path_var, labels, fail)
             .output()
             .unwrap()
     }
@@ -187,7 +201,7 @@ impl Fixture {
         command
             .args(["autopilot", "status"])
             .args(args)
-            .current_dir(self.root.path());
+            .current_dir(self.root());
         self.env(
             &mut command,
             &isolated_path(&self.stubs()),
@@ -228,6 +242,23 @@ fn report(output: &Output) -> Value {
             String::from_utf8_lossy(&output.stdout)
         )
     })
+}
+
+/// The text report a successful run printed. As for [`report`], a run that
+/// reports prints nothing else: stderr is empty.
+fn text_report(output: &Output) -> String {
+    assert!(
+        output.status.success(),
+        "status exited {:?}: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "a successful run wrote to stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout.clone()).expect("the text report is UTF-8")
 }
 
 fn mode(path: &Path) -> u32 {
@@ -315,6 +346,19 @@ fn an_approved_repo_with_every_label_reports_the_pinned_json() {
 
     let output = fixture.status(ALL_LABELS, None);
 
+    // The layout, which parsing the report as JSON does not see: indented by
+    // two spaces, keys in the documented order, and one newline at the end.
+    let printed = String::from_utf8(output.stdout.clone()).unwrap();
+    assert!(
+        printed.starts_with(&format!(
+            "{{\n  \"repo\": \"owner/repo\",\n  \"db\": {},\n  \"onboarded\": true,\n  \
+             \"gate_config\": {{\n    \"state\": \"approved\",\n",
+            json!(fixture.db_path().display().to_string())
+        )),
+        "{printed}"
+    );
+    assert!(printed.ends_with("  }\n}\n"), "{printed}");
+    assert!(!printed.ends_with("\n\n"), "{printed}");
     assert_eq!(
         report(&output),
         json!({
@@ -465,7 +509,7 @@ fn a_missing_gh_is_a_failed_label_read_and_the_gate_config_is_still_reported() {
     fixture.propose(REPO, &["cargo test"]);
     fixture.approve(REPO);
     // A PATH holding one empty directory: no `gh` anywhere, real or stub.
-    let empty = fixture.root.path().join("empty");
+    let empty = fixture.root().join("empty");
     std::fs::create_dir_all(&empty).unwrap();
 
     let output = fixture.status_at(&fixture.db_path(), &empty, ALL_LABELS, None);
@@ -518,7 +562,7 @@ fn status_changes_nothing_in_the_database() {
 #[test]
 fn status_never_creates_a_missing_database() {
     let fixture = Fixture::new();
-    let absent_dir = fixture.root.path().join("absent");
+    let absent_dir = fixture.root().join("absent");
     let absent_db = absent_dir.join("memory.sqlite3");
 
     let output = fixture.status_at(
@@ -576,7 +620,7 @@ fn a_missing_database_is_created_by_the_onboard_its_error_names() {
     assert!(!db.exists(), "status created the database file");
 
     // What the error says is true: `onboard` creates the database.
-    let checkout = fixture.root.path().join("checkout");
+    let checkout = fixture.root().join("checkout");
     std::fs::create_dir_all(&checkout).unwrap();
     std::fs::write(checkout.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
     let mut onboard = ironmem();
@@ -606,7 +650,7 @@ fn the_text_report_is_the_default() {
         .plain(
             REPO,
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -614,8 +658,7 @@ fn the_text_report_is_the_default() {
         .output()
         .unwrap();
 
-    assert!(output.status.success());
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = text_report(&output);
     assert!(
         stdout.contains("owner/repo: gate config pending"),
         "{stdout}"
@@ -658,7 +701,7 @@ fn a_malformed_repo_name_exits_one_instead_of_reporting_not_onboarded() {
         .command(
             "not a repo",
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -679,7 +722,7 @@ fn a_config_stored_under_a_colliding_key_exits_one() {
         .command(
             "foo/bar-baz",
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -702,7 +745,7 @@ fn a_broken_config_of_the_colliding_name_exits_one_and_names_no_onboard_for_the_
         .command(
             "foo/bar-baz",
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -731,7 +774,7 @@ fn a_broken_config_of_the_colliding_name_exits_one_and_names_no_onboard_for_the_
 #[test]
 fn a_file_that_is_not_a_database_exits_one_and_names_the_path() {
     let fixture = Fixture::new();
-    let not_db = fixture.root.path().join("notes.txt");
+    let not_db = fixture.root().join("notes.txt");
     std::fs::write(
         &not_db,
         "this is not sqlite, it is a text file\n".repeat(100),
@@ -793,7 +836,7 @@ fn an_empty_ironmem_db_path_exits_one_and_the_error_names_the_variable() {
 fn a_relative_db_from_a_removed_working_directory_exits_one_and_says_what_is_missing() {
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
-    let gone = fixture.root.path().join("gone");
+    let gone = fixture.root().join("gone");
     std::fs::create_dir_all(&gone).unwrap();
 
     // The shell enters the directory, removes it, and becomes `ironmem`:
@@ -812,7 +855,7 @@ fn a_relative_db_from_a_removed_working_directory_exits_one_and_says_what_is_mis
             "memory.sqlite3",
         ])
         .arg("--path")
-        .arg(fixture.root.path());
+        .arg(fixture.root());
     autopilot_support::scrub_git_env(&mut command);
     fixture.env(
         &mut command,
@@ -837,13 +880,13 @@ fn a_relative_db_from_a_removed_working_directory_exits_one_and_says_what_is_mis
 #[test]
 fn a_malformed_repo_name_is_reported_before_a_missing_database() {
     let fixture = Fixture::new();
-    let absent_db = fixture.root.path().join("absent.sqlite3");
+    let absent_db = fixture.root().join("absent.sqlite3");
 
     let output = fixture
         .command(
             "not a repo",
             &absent_db,
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -897,10 +940,10 @@ fn path_is_the_directory_gh_runs_in() {
 
     let output = fixture.status(ALL_LABELS, None);
 
-    assert!(output.status.success());
+    report(&output);
     assert_eq!(
         fixture.gh_cwd(),
-        std::fs::canonicalize(fixture.root.path()).unwrap()
+        std::fs::canonicalize(fixture.root()).unwrap()
     );
 }
 
@@ -909,7 +952,7 @@ fn a_path_that_is_not_a_directory_is_a_failed_label_read_and_gh_does_not_run() {
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
     fixture.approve(REPO);
-    let missing = fixture.root.path().join("no-such-dir");
+    let missing = fixture.root().join("no-such-dir");
 
     let output = fixture
         .command(
@@ -936,7 +979,7 @@ fn a_path_that_is_not_a_directory_is_a_failed_label_read_and_gh_does_not_run() {
 fn a_path_that_is_a_regular_file_is_a_failed_label_read_and_gh_does_not_run() {
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
-    let file = fixture.root.path().join("a-file.txt");
+    let file = fixture.root().join("a-file.txt");
     std::fs::write(&file, "not a directory\n").unwrap();
 
     let output = fixture
@@ -964,7 +1007,7 @@ fn a_path_gh_cannot_be_started_in_is_a_failed_label_read_that_names_the_path() {
     fixture.propose(REPO, &["cargo test"]);
     // A directory this user can see and cannot enter: the check that it is
     // a directory passes, and starting `gh` in it fails.
-    let locked = fixture.root.path().join("locked");
+    let locked = fixture.root().join("locked");
     std::fs::create_dir_all(&locked).unwrap();
     std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
     // As root the directory can be entered and the case cannot arise.
@@ -1009,7 +1052,7 @@ fn a_path_gh_cannot_be_started_in_is_a_failed_label_read_that_names_the_path() {
 #[test]
 fn a_wal_database_in_a_read_only_directory_exits_one_and_explains_the_side_files() {
     let fixture = Fixture::new();
-    let dir = fixture.root.path().join("ro");
+    let dir = fixture.root().join("ro");
     std::fs::create_dir_all(&dir).unwrap();
     let db_path = dir.join("memory.sqlite3");
     {
@@ -1051,17 +1094,16 @@ fn hints_name_the_absolute_database_when_db_was_given_relative() {
         .plain(
             REPO,
             Path::new("memory.sqlite3"),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
         )
-        .current_dir(fixture.root.path())
+        .current_dir(fixture.root())
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = text_report(&output);
     let hint = hint_line(&stdout, "autopilot onboard");
     let value = hinted_db(hint);
     assert!(
@@ -1118,7 +1160,7 @@ fn a_stored_config_that_does_not_parse_exits_one_and_the_remedy_it_names_works()
     assert_eq!(hinted_db(hint_line(&stderr, "autopilot onboard")), db);
 
     // The remedy is real: `onboard`, run as the error says, replaces the row.
-    let checkout = fixture.root.path().join("checkout");
+    let checkout = fixture.root().join("checkout");
     std::fs::create_dir_all(&checkout).unwrap();
     std::fs::write(checkout.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
     let mut onboard = ironmem();
@@ -1135,11 +1177,32 @@ fn a_stored_config_that_does_not_parse_exits_one_and_the_remedy_it_names_works()
     let onboarded = onboard.output().unwrap();
     assert!(onboarded.status.success(), "{onboarded:?}");
 
+    let pending = report(&fixture.status(ALL_LABELS, None));
+    assert_eq!(pending["gate_config"]["state"], json!("pending"));
+    assert_eq!(
+        pending["gate_config"]["gate_commands"],
+        json!(["cargo test"])
+    );
+
+    // And so is the second command the error gives.
+    let mut approve = ironmem();
+    approve
+        .args(["autopilot", "approve", REPO, "--db"])
+        .arg(fixture.db_path());
+    fixture.env(
+        &mut approve,
+        &isolated_path(&fixture.stubs()),
+        ALL_LABELS,
+        None,
+    );
+    let approved = approve.output().unwrap();
+    assert!(approved.status.success(), "{approved:?}");
+
     let report = report(&fixture.status(ALL_LABELS, None));
-    assert_eq!(report["gate_config"]["state"], json!("pending"));
+    assert_eq!(report["gate_config"]["state"], json!("approved"));
     assert_eq!(
         report["gate_config"]["gate_commands"],
-        json!(["cargo test"])
+        pending["gate_config"]["gate_commands"]
     );
 }
 
@@ -1207,7 +1270,7 @@ fn a_name_that_only_resembles_an_onboarded_repo_exits_one_and_names_the_stored_o
         .command(
             "Owner/Repo",
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -1231,7 +1294,7 @@ fn a_git_suffix_exits_one() {
         .command(
             "owner/repo.git",
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -1260,7 +1323,7 @@ fn a_host_with_a_port_and_a_full_url_exit_one() {
             .command(
                 name,
                 &fixture.db_path(),
-                fixture.root.path(),
+                fixture.root(),
                 &isolated_path(&fixture.stubs()),
                 ALL_LABELS,
                 None,
@@ -1297,7 +1360,7 @@ fn status_without_db_reads_ironmem_db_path() {
     // `--path` defaults to the directory the command ran in.
     assert_eq!(
         fixture.gh_cwd(),
-        std::fs::canonicalize(fixture.root.path()).unwrap()
+        std::fs::canonicalize(fixture.root()).unwrap()
     );
     assert_eq!(
         fixture.home_entries(),
@@ -1310,7 +1373,7 @@ fn status_without_db_reads_ironmem_db_path() {
 fn db_flag_wins_over_ironmem_db_path() {
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
-    let absent = fixture.root.path().join("absent.sqlite3");
+    let absent = fixture.root().join("absent.sqlite3");
 
     let output = fixture
         .bare(&[REPO, "--json", "--db"])
@@ -1355,8 +1418,7 @@ fn no_db_is_hinted_when_the_database_came_from_the_environment() {
         .output()
         .unwrap();
 
-    assert!(output.status.success(), "{output:?}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = text_report(&output);
     assert!(
         stdout.contains("run `ironmem autopilot approve owner/repo`\n"),
         "{stdout}"
@@ -1398,29 +1460,91 @@ fn a_usage_error_exits_two_and_touches_nothing() {
 }
 
 #[test]
-fn an_invalid_ironmem_env_setting_exits_one() {
+fn a_non_utf8_argument_is_a_usage_error() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
-    fixture.approve(REPO);
+    let bytes_before = std::fs::read(fixture.db_path()).unwrap();
 
+    // Neither run creates a file, so a filesystem that refuses such a name
+    // does not matter.
+    let not_utf8_db = fixture
+        .bare(&[REPO, "--json", "--db"])
+        .arg(OsStr::from_bytes(b"/no-such-dir-\xff/memory.sqlite3"))
+        .output()
+        .unwrap();
+    let not_utf8_repo = fixture
+        .bare(&["--json", "--db"])
+        .arg(fixture.db_path())
+        .arg(OsStr::from_bytes(b"owner/re\xffpo"))
+        .output()
+        .unwrap();
+
+    for (what, output) in [("--db", not_utf8_db), ("the repo", not_utf8_repo)] {
+        assert_eq!(output.status.code(), Some(2), "{what}: {output:?}");
+        assert!(output.stdout.is_empty(), "{what}: no report on stdout");
+        assert_eq!(fixture.gh_log(), "", "{what}: gh is not asked");
+    }
+    assert!(
+        std::fs::read(fixture.db_path()).unwrap() == bytes_before,
+        "the database file's bytes changed"
+    );
+}
+
+#[test]
+fn a_default_database_under_a_non_utf8_home_exits_one() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let fixture = Fixture::new();
+
+    // No `--db` and no `IRONMEM_DB_PATH`: the database is the default one
+    // under `HOME`, which does not exist and is never created.
     let output = fixture
-        .command(
-            REPO,
-            &fixture.db_path(),
-            fixture.root.path(),
-            &isolated_path(&fixture.stubs()),
-            ALL_LABELS,
-            None,
-        )
-        .env("IRONMEM_MCP_MODE", "bogus")
+        .bare(&[REPO, "--json"])
+        .env("HOME", OsStr::from_bytes(b"/no-such-home-\xff"))
         .output()
         .unwrap();
 
     assert_unreadable(
         &fixture,
         &output,
-        &["Error: Config error: IRONMEM_MCP_MODE must be one of"],
+        &[
+            "Error: Validation error: the database path '/no-such-home-",
+            "/.ironrace-memory/memory.sqlite3' is not valid UTF-8, so the report could not name \
+             it exactly",
+        ],
     );
+}
+
+#[test]
+fn an_invalid_ironmem_env_setting_exits_one() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    fixture.approve(REPO);
+
+    for variable in ["IRONMEM_MCP_MODE", "IRONMEM_EMBED_MODE"] {
+        let output = fixture
+            .command(
+                REPO,
+                &fixture.db_path(),
+                fixture.root(),
+                &isolated_path(&fixture.stubs()),
+                ALL_LABELS,
+                None,
+            )
+            .env(variable, "bogus")
+            .output()
+            .unwrap();
+
+        assert_unreadable(
+            &fixture,
+            &output,
+            &[&format!("Error: Config error: {variable} must be one of")],
+        );
+    }
 }
 
 #[test]
@@ -1435,7 +1559,7 @@ fn a_report_that_cannot_be_written_exits_one_without_a_panic() {
         let mut command = fixture.plain(
             REPO,
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -1475,7 +1599,7 @@ fn status_changes_nothing_when_there_is_something_to_change() {
             native_session_id: None,
             invocation_artifacts: None,
             issue: IssueRef::new(REPO, 7),
-            worktree_path: fixture.root.path().join("wt").display().to_string(),
+            worktree_path: fixture.root().join("wt").display().to_string(),
             ic_session_name: "autopilot-ic-owner-repo-7".into(),
             dispatch_class: "documentation".into(),
             attempt_n: 1,
@@ -1506,7 +1630,7 @@ fn status_changes_nothing_when_there_is_something_to_change() {
             .command(
                 "never/onboarded",
                 &db,
-                fixture.root.path(),
+                fixture.root(),
                 &isolated_path(&fixture.stubs()),
                 "[]",
                 None,
@@ -1523,6 +1647,89 @@ fn status_changes_nothing_when_there_is_something_to_change() {
     );
     assert_eq!(wal_len(&db), 0, "status left a write in the -wal file");
     assert_eq!(drawer_dump(&db), drawers_before);
+}
+
+/// Every file under `dir` by its path relative to `dir`, with its bytes; a
+/// symlink with its target; a directory with nothing.
+fn tree_of(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, dir: &Path, into: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let kind = std::fs::symlink_metadata(&path).unwrap().file_type();
+            if kind.is_symlink() {
+                let target = std::fs::read_link(&path).unwrap();
+                into.insert(relative, target.into_os_string().into_encoded_bytes());
+            } else if kind.is_dir() {
+                into.insert(relative, Vec::new());
+                walk(root, &path, into);
+            } else {
+                into.insert(relative, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut tree = BTreeMap::new();
+    walk(dir, dir, &mut tree);
+    tree
+}
+
+#[test]
+fn status_changes_nothing_in_the_checkout_gh_runs_in() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    // A real checkout. Autopilot keeps each dispatch's invocation record in
+    // the checkout's git directory, under `ironmem/autopilot/<issue>/`, and
+    // later runs settle and prune those. A file is put where such a record
+    // lives, so a status that rewrote or removed one would show.
+    let checkout = fixture.root().join("checkout");
+    autopilot_support::make_repo(&checkout);
+    let record = checkout.join(".git/ironmem/autopilot/owner-repo-7/an-invocation");
+    std::fs::create_dir_all(&record).unwrap();
+    std::fs::write(record.join("exit.json"), r#"{"awaiting_quiet":{}}"#).unwrap();
+    let before = tree_of(&checkout);
+    assert!(
+        before.contains_key(Path::new(
+            ".git/ironmem/autopilot/owner-repo-7/an-invocation/exit.json"
+        )),
+        "{:?}",
+        before.keys().collect::<Vec<_>>()
+    );
+
+    let run = |json: bool| {
+        let mut command = fixture.plain(
+            REPO,
+            &fixture.db_path(),
+            &checkout,
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        );
+        if json {
+            command.arg("--json");
+        }
+        command.output().unwrap()
+    };
+    report(&run(true));
+    text_report(&run(false));
+
+    assert_eq!(
+        fixture.gh_cwd(),
+        std::fs::canonicalize(&checkout).unwrap(),
+        "gh did not run in the checkout"
+    );
+    let after = tree_of(&checkout);
+    assert_eq!(
+        after.keys().collect::<Vec<_>>(),
+        before.keys().collect::<Vec<_>>(),
+        "status added or removed a file in the checkout"
+    );
+    for (path, bytes) in &before {
+        assert!(
+            after[path] == *bytes,
+            "status changed {} in the checkout",
+            path.display()
+        );
+    }
 }
 
 // ── label and --db edge cases ───────────────────────────────────────────
@@ -1575,7 +1782,7 @@ fn a_host_qualified_repo_is_passed_to_gh_as_it_was_given() {
         .command(
             "GitHub.com/Owner/Repo",
             &fixture.db_path(),
-            fixture.root.path(),
+            fixture.root(),
             &isolated_path(&fixture.stubs()),
             ALL_LABELS,
             None,
@@ -1595,7 +1802,7 @@ fn a_host_qualified_repo_is_passed_to_gh_as_it_was_given() {
 #[test]
 fn a_db_path_that_is_a_directory_exits_one_and_is_not_called_missing() {
     let fixture = Fixture::new();
-    let dir = fixture.root.path().join("a-directory");
+    let dir = fixture.root().join("a-directory");
     std::fs::create_dir_all(&dir).unwrap();
 
     let output = fixture.status_at(&dir, &isolated_path(&fixture.stubs()), ALL_LABELS, None);
@@ -1625,14 +1832,66 @@ const ROUTER_SURFACES: [&str; 3] = [
     ".codex-plugin/prompts/evaluate-issue.md",
 ];
 
-/// The router sentences that say which parts of the report it reads, by
-/// their opening words: the approval condition, the parts it may use, and
-/// the fix line for a pending config. Each sits on one line in every router
-/// file, where the collab-template lint pins it.
-const ROUTER_REPORT_SENTENCES: [&str; 3] = [
-    "Approved only when it exits 0",
-    "Use only its exit status",
-    "gate config `\"pending\"` → review its",
+/// Where in the report a router sentence reads the keys it names.
+#[derive(Clone, Copy)]
+enum Reads {
+    /// Every key is a top-level key of the report.
+    TopLevel,
+    /// Every key is a key of the object under this top-level key.
+    Inside(&'static str),
+    /// The first key is a top-level key, and the rest are keys of the object
+    /// under it.
+    TopLevelThenInside,
+}
+
+/// The report a router sentence is about.
+#[derive(Clone, Copy)]
+enum About {
+    Approved,
+    Pending,
+    NotOnboarded,
+}
+
+/// A router sentence that names parts of the report.
+struct RouterSentence {
+    /// Words that find its line. The line is the whole sentence.
+    marker: &'static str,
+    about: About,
+    reads: Reads,
+    /// Where the report holds the value the sentence quotes (`"approved"`,
+    /// `null`), as a JSON pointer. `None` for a sentence that quotes none.
+    quotes: Option<&'static str>,
+}
+
+/// The router sentences that say which parts of the report it reads: the
+/// approval condition, the parts it may use, the fix line for a pending
+/// config, and what a `null` gate config means. Each sits on one line in
+/// every router file; the collab-template lint pins the first three.
+const ROUTER_REPORT_SENTENCES: [RouterSentence; 4] = [
+    RouterSentence {
+        marker: "Approved only when it exits 0",
+        about: About::Approved,
+        reads: Reads::TopLevelThenInside,
+        quotes: Some("/gate_config/state"),
+    },
+    RouterSentence {
+        marker: "Use only its exit status",
+        about: About::Approved,
+        reads: Reads::TopLevel,
+        quotes: None,
+    },
+    RouterSentence {
+        marker: "gate config `\"pending\"` → review its",
+        about: About::Pending,
+        reads: Reads::Inside("gate_config"),
+        quotes: Some("/gate_config/state"),
+    },
+    RouterSentence {
+        marker: "is a repo not onboarded",
+        about: About::NotOnboarded,
+        reads: Reads::TopLevel,
+        quotes: Some("/gate_config"),
+    },
 ];
 
 /// Backticked spans in those sentences that are not a part of the report: a
@@ -1650,17 +1909,71 @@ fn backticked(line: &str) -> Vec<&str> {
     pieces.into_iter().skip(1).step_by(2).collect()
 }
 
-/// Every object key anywhere in `value`.
-fn keys_in(value: &Value, into: &mut BTreeSet<String>) {
-    match value {
-        Value::Object(map) => {
-            for (key, inner) in map {
-                into.insert(key.clone());
-                keys_in(inner, into);
-            }
+/// What is wrong with `sentence` as a description of `report`: a key it
+/// names that the report does not hold where the sentence reads it (`reads`),
+/// a value it quotes that the report does not hold at `quotes`, or nothing
+/// named at all. A span is a value when it is `null` or a string in quotes,
+/// and a key otherwise.
+fn sentence_failures(
+    sentence: &str,
+    reads: Reads,
+    quotes: Option<&str>,
+    report: &Value,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mut named = 0;
+    let mut first_key: Option<&str> = None;
+    for span in backticked(sentence) {
+        if NOT_REPORT_PARTS.contains(&span) {
+            continue;
         }
-        Value::Array(items) => items.iter().for_each(|item| keys_in(item, into)),
-        _ => {}
+        named += 1;
+        let quoted = span.strip_prefix('"').and_then(|s| s.strip_suffix('"'));
+        let value = match (span, quoted) {
+            ("null", _) => Some(Value::Null),
+            (_, Some(text)) => Some(json!(text)),
+            _ => None,
+        };
+        if let Some(value) = value {
+            match quotes.map(|pointer| (pointer, report.pointer(pointer))) {
+                Some((_, Some(reported))) if *reported == value => {}
+                Some((pointer, reported)) => failures.push(format!(
+                    "`{span}` is quoted, and the report holds {reported:?} at {pointer}"
+                )),
+                None => failures.push(format!(
+                    "`{span}` is quoted, and this sentence is not expected to quote a value"
+                )),
+            }
+            continue;
+        }
+        let (holder, place) = match (reads, first_key) {
+            (Reads::TopLevel, _) | (Reads::TopLevelThenInside, None) => {
+                (Some(report), "the top level of the report".to_string())
+            }
+            (Reads::Inside(key), _) | (Reads::TopLevelThenInside, Some(key)) => {
+                (report.get(key), format!("the report's `{key}`"))
+            }
+        };
+        first_key.get_or_insert(span);
+        if holder.and_then(|holder| holder.get(span)).is_none() {
+            failures.push(format!("`{span}` is not a key of {place}"));
+        }
+    }
+    if named == 0 {
+        failures.push("names no part of the report".to_string());
+    }
+    failures
+}
+
+/// The JSON type of `value`.
+fn kind_of(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -1668,15 +1981,7 @@ fn keys_in(value: &Value, into: &mut BTreeSet<String>) {
 /// An array is one entry and is not descended into, so two reports with
 /// different numbers of gate commands have the same shape.
 fn shape_of(value: &Value, path: &str, into: &mut BTreeMap<String, &'static str>) {
-    let kind = match value {
-        Value::Null => "null",
-        Value::Bool(_) => "boolean",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    };
-    into.insert(path.to_string(), kind);
+    into.insert(path.to_string(), kind_of(value));
     if let Value::Object(map) = value {
         for (key, inner) in map {
             shape_of(inner, &format!("{path}.{key}"), into);
@@ -1684,13 +1989,34 @@ fn shape_of(value: &Value, path: &str, into: &mut BTreeMap<String, &'static str>
     }
 }
 
+/// The JSON types of the elements of every array in `value` that has any, by
+/// the array's path as [`shape_of`] writes it.
+fn element_kinds(value: &Value, path: &str, into: &mut BTreeMap<String, BTreeSet<&'static str>>) {
+    match value {
+        Value::Object(map) => {
+            for (key, inner) in map {
+                element_kinds(inner, &format!("{path}.{key}"), into);
+            }
+        }
+        Value::Array(items) if !items.is_empty() => {
+            into.insert(path.to_string(), items.iter().map(kind_of).collect());
+        }
+        _ => {}
+    }
+}
+
 /// The router is prose, and the report's keys are serde's: nothing but this
 /// test ties the names in one to the names in the other. A report key that
 /// was renamed would leave every pinned sentence in place and a router that
-/// never finds an approved gate config.
+/// never finds an approved gate config. Each sentence is checked against the
+/// report it is about and the level it reads: `state` has to be a key of
+/// `gate_config`, not merely a key somewhere.
 #[test]
 fn the_router_reads_keys_the_report_has() {
     let fixture = Fixture::new();
+    // Another repo's config, so the database exists before REPO is onboarded.
+    fixture.propose("other/repo", &["cargo test"]);
+    let not_onboarded = report(&fixture.status(ALL_LABELS, None));
     fixture.propose(REPO, &["cargo test"]);
     let pending = report(&fixture.status(ALL_LABELS, None));
     fixture.approve(REPO);
@@ -1704,64 +2030,108 @@ fn the_router_reads_keys_the_report_has() {
     assert_eq!(gate_config["state"], json!("approved"));
     assert_eq!(gate_config["gate_commands"], json!(["cargo test"]));
     assert!(approved["db"].is_string());
-
-    let mut keys = BTreeSet::new();
-    keys_in(&pending, &mut keys);
-    keys_in(&approved, &mut keys);
-    let states: Vec<&str> = [&pending, &approved]
-        .iter()
-        .map(|report| report["gate_config"]["state"].as_str().unwrap())
-        .collect();
+    assert_eq!(pending["gate_config"]["state"], json!("pending"));
+    assert_eq!(not_onboarded["gate_config"], Value::Null);
 
     let mut failures = Vec::new();
     for rel in ROUTER_SURFACES {
         let text = std::fs::read_to_string(repo_root().join(rel))
             .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
-        for opening in ROUTER_REPORT_SENTENCES {
-            let lines: Vec<&str> = text.lines().filter(|line| line.contains(opening)).collect();
+        for sentence in &ROUTER_REPORT_SENTENCES {
+            let marker = sentence.marker;
+            let lines: Vec<&str> = text.lines().filter(|line| line.contains(marker)).collect();
             let [line] = lines.as_slice() else {
                 failures.push(format!(
-                    "{rel}: {opening:?} is on {} lines; expected exactly one",
+                    "{rel}: {marker:?} is on {} lines; expected exactly one",
                     lines.len()
                 ));
                 continue;
             };
-            let sentence = &line[line.find(opening).unwrap()..];
-            let mut named = 0;
-            for span in backticked(sentence) {
-                if NOT_REPORT_PARTS.contains(&span) {
-                    continue;
-                }
-                named += 1;
-                // A quoted span is a value of `state`; anything else is a key.
-                let known = match span.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
-                    Some(state) => states.contains(&state),
-                    None => keys.contains(span),
-                };
-                if !known {
-                    failures.push(format!(
-                        "{rel}: `{span}` in the sentence starting {opening:?} is neither a key \
-                         of the report nor a `state` it reports"
-                    ));
-                }
-            }
-            if named == 0 {
-                failures.push(format!(
-                    "{rel}: the sentence starting {opening:?} names no part of the report"
-                ));
+            let report = match sentence.about {
+                About::Approved => &approved,
+                About::Pending => &pending,
+                About::NotOnboarded => &not_onboarded,
+            };
+            for failure in sentence_failures(line, sentence.reads, sentence.quotes, report) {
+                failures.push(format!("{rel}: the sentence holding {marker:?}: {failure}"));
             }
         }
     }
     assert!(
         failures.is_empty(),
         "the router names parts of the status report that the report does not have:\n{}\n\n\
-         report keys: {keys:?}\nreported states: {states:?}",
+         approved: {approved}\npending: {pending}\nnot onboarded: {not_onboarded}",
         failures.join("\n")
     );
 }
 
+/// [`sentence_failures`] on sentences this file makes up, against a real
+/// report: the router files are prose this test cannot change, so what the
+/// check catches is shown here.
+#[test]
+fn a_router_sentence_is_checked_against_the_level_and_the_value_it_reads() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    fixture.approve(REPO);
+    let approved = report(&fixture.status(ALL_LABELS, None));
+    let nested = (Reads::TopLevelThenInside, Some("/gate_config/state"));
+    let failures = |sentence: &str, (reads, quotes): (Reads, Option<&str>)| {
+        sentence_failures(sentence, reads, quotes, &approved)
+    };
+
+    assert_eq!(
+        failures(
+            "its JSON `gate_config` is an object whose `state` is `\"approved\"`; keep its \
+             `gate_commands`",
+            nested
+        ),
+        Vec::<String>::new()
+    );
+    // `read` is a key of the report, under `labels`, not under `gate_config`.
+    assert_eq!(
+        failures(
+            "`gate_config` is an object whose `read` is `\"approved\"`",
+            nested
+        ),
+        ["`read` is not a key of the report's `gate_config`"]
+    );
+    // `state` is a key of `gate_config`, not of the report.
+    assert_eq!(
+        failures("use `state` and `db`", (Reads::TopLevel, None)),
+        ["`state` is not a key of the top level of the report"]
+    );
+    assert_eq!(
+        failures("review its `db`", (Reads::Inside("gate_config"), None)),
+        ["`db` is not a key of the report's `gate_config`"]
+    );
+    // A value the report does not hold there, and one where none belongs.
+    assert_eq!(
+        failures("`gate_config` whose `state` is `\"pending\"`", nested),
+        ["`\"pending\"` is quoted, and the report holds Some(String(\"approved\")) at /gate_config/state"]
+    );
+    assert_eq!(
+        failures(
+            "a `gate_config` of `null`",
+            (Reads::TopLevel, Some("/gate_config"))
+        )
+        .len(),
+        1
+    );
+    assert_eq!(
+        failures("use `db`, never `\"approved\"`", (Reads::TopLevel, None)),
+        ["`\"approved\"` is quoted, and this sentence is not expected to quote a value"]
+    );
+    // A command is not a part of the report, and a sentence has to name one.
+    assert_eq!(
+        failures("run `onboard`, then `approve`", (Reads::TopLevel, None)),
+        ["names no part of the report"]
+    );
+}
+
 /// The `--json` example in `docs/AUTOPILOT.md` has exactly the report's keys,
-/// each holding the JSON type the report gives it.
+/// each holding the JSON type the report gives it; its lists hold what the
+/// report's lists hold; and the three values a reader branches on are the
+/// ones a report of the same repo (onboarded, approved, labels read) gives.
 #[test]
 fn the_documented_json_example_has_the_reports_shape() {
     let fixture = Fixture::new();
@@ -1788,5 +2158,62 @@ fn the_documented_json_example_has_the_reports_shape() {
     assert_eq!(
         documented, reported,
         "docs/AUTOPILOT.md's status example (left) and a real report (right) differ in shape"
+    );
+
+    // A string passes for any string above, so the values a consumer
+    // branches on are compared too: `"state": "APPROVED"` is the same shape.
+    for branched_on in ["/onboarded", "/gate_config/state", "/labels/read"] {
+        assert_eq!(
+            example.pointer(branched_on),
+            real.pointer(branched_on),
+            "docs/AUTOPILOT.md's status example gives {branched_on} a value no report of an \
+             approved repo whose labels were read gives"
+        );
+    }
+
+    // An array is one entry above, whatever it holds. Where the example and
+    // the report both list something, they list the same type of thing.
+    let (mut documented_lists, mut reported_lists) = (BTreeMap::new(), BTreeMap::new());
+    element_kinds(&example, "", &mut documented_lists);
+    element_kinds(&real, "", &mut reported_lists);
+    let mut compared = Vec::new();
+    for (path, documented_kinds) in &documented_lists {
+        if let Some(reported_kinds) = reported_lists.get(path) {
+            assert_eq!(
+                documented_kinds, reported_kinds,
+                "docs/AUTOPILOT.md's status example lists another type of value in {path}"
+            );
+            compared.push(path.as_str());
+        }
+    }
+    assert_eq!(
+        compared,
+        [".gate_config.gate_commands", ".labels.risk"],
+        "the example and the fixture's report should both list a gate command and a risk label"
+    );
+}
+
+#[test]
+fn element_kinds_tells_a_list_of_strings_from_a_list_of_anything_else() {
+    let mut kinds = BTreeMap::new();
+    element_kinds(
+        &json!({
+            "strings": ["a", "b"],
+            "numbers": [1],
+            "mixed": ["a", {}],
+            "empty": [],
+            "inner": { "objects": [{}] },
+        }),
+        "",
+        &mut kinds,
+    );
+    assert_eq!(
+        kinds,
+        BTreeMap::from([
+            (".strings".to_string(), BTreeSet::from(["string"])),
+            (".numbers".to_string(), BTreeSet::from(["number"])),
+            (".mixed".to_string(), BTreeSet::from(["object", "string"])),
+            (".inner.objects".to_string(), BTreeSet::from(["object"])),
+        ])
     );
 }

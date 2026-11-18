@@ -4246,6 +4246,37 @@ mod tests {
         "ironmem autopilot status <owner>/<repo> --db '<db>'",
     ];
 
+    /// Every other `ironmem` command line the router files hold, with the
+    /// subcommand each must parse as: the two AUTOPILOT commands, and the
+    /// spec's worked example of the recheck. clap is asked about these too.
+    const OTHER_ROUTER_COMMANDS: [(&str, &str); 3] = [
+        (
+            "ironmem autopilot lead --repo '<owner>/<repo>=<checkout>' --base 'origin/<default branch>'",
+            "lead",
+        ),
+        (
+            "ironmem autopilot advance --repo '<owner>/<repo>=<checkout>' --reviewer codex",
+            "advance",
+        ),
+        (
+            "ironmem autopilot status jeffreycrum/tenfourpro --db '<db>'",
+            "status",
+        ),
+    ];
+
+    /// A subcommand the router files name without its arguments, in a
+    /// heading. clap is asked only whether it exists.
+    const ROUTER_SUBCOMMAND_NAMES: [&str; 1] = ["ironmem autopilot lead"];
+
+    /// Every backticked span in `text` that starts an `ironmem` command line.
+    fn ironmem_spans(text: &str) -> Vec<&str> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("ironmem "))
+            .collect()
+    }
+
     const ROUTER_CHECKOUT: &str = "/srv/check out";
     const ROUTER_DB: &str = "/var/ironmem dbs/memory.sqlite3";
 
@@ -4257,6 +4288,7 @@ mod tests {
         let filled = command
             .replace("<owner>/<repo>", "owner/repo")
             .replace("<checkout>", ROUTER_CHECKOUT)
+            .replace("<default branch>", "main")
             .replace("<db>", ROUTER_DB);
         let mut argv = vec![String::new()];
         let mut quoted = false;
@@ -4353,6 +4385,93 @@ mod tests {
                 .is_err(),
             "`autopilot labels` accepted --db"
         );
+    }
+
+    /// The other direction: every `ironmem` command line in a router file is
+    /// one clap is asked about, here or in the test above. A command added
+    /// to a file and to neither list fails, so a router cannot gain a command
+    /// with a flag its subcommand does not have and stay green.
+    #[test]
+    fn clap_is_asked_about_every_ironmem_command_the_issue_router_holds() {
+        let known: Vec<&'static str> = ROUTER_COMMANDS
+            .into_iter()
+            .chain(
+                OTHER_ROUTER_COMMANDS
+                    .into_iter()
+                    .map(|(command, _)| command),
+            )
+            .chain(ROUTER_SUBCOMMAND_NAMES)
+            .collect();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for rel in ROUTER_SURFACES {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
+            assert!(
+                text.matches('`').count().is_multiple_of(2),
+                "{rel}: an unpaired backtick, so its code spans cannot be told apart"
+            );
+            for span in ironmem_spans(&text) {
+                assert!(
+                    known.contains(&span),
+                    "{rel} holds `{span}`, a command no test asks clap about: add it to \
+                     ROUTER_COMMANDS or OTHER_ROUTER_COMMANDS"
+                );
+                found.insert(span.to_string());
+            }
+        }
+        // Each list entry is still in some file, so neither list keeps a
+        // command the router dropped.
+        for command in &known {
+            assert!(
+                found.contains(*command),
+                "no router file holds `{command}` any more: drop it from its list"
+            );
+        }
+
+        for (command, subcommand) in OTHER_ROUTER_COMMANDS {
+            let cli = Cli::try_parse_from(router_argv(command))
+                .unwrap_or_else(|e| panic!("clap refuses the router's `{command}`: {e}"));
+            let Commands::Autopilot { cmd } = cli.command else {
+                panic!("`{command}` is not an autopilot command");
+            };
+            let parsed_as = match cmd {
+                AutopilotCmd::Lead { repos, base, .. } => {
+                    assert_eq!(
+                        repos,
+                        [format!("owner/repo={ROUTER_CHECKOUT}")],
+                        "{command}"
+                    );
+                    assert_eq!(base, "origin/main", "{command}");
+                    "lead"
+                }
+                AutopilotCmd::Advance { repos, .. } => {
+                    assert_eq!(
+                        repos,
+                        [format!("owner/repo={ROUTER_CHECKOUT}")],
+                        "{command}"
+                    );
+                    "advance"
+                }
+                AutopilotCmd::Status { db, repo, .. } => {
+                    assert_eq!(repo, "jeffreycrum/tenfourpro", "{command}");
+                    assert_eq!(db.as_deref(), Some(ROUTER_DB), "{command}");
+                    "status"
+                }
+                _ => panic!("`{command}` parsed as an unexpected autopilot subcommand"),
+            };
+            assert_eq!(parsed_as, subcommand, "{command}");
+        }
+        for name in ROUTER_SUBCOMMAND_NAMES {
+            let mut argv = router_argv(name);
+            argv.push("--help".to_string());
+            let asked = Cli::try_parse_from(argv).map(|_| ()).unwrap_err();
+            assert_eq!(
+                asked.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "`{name}` is not a subcommand clap knows: {asked}"
+            );
+        }
     }
 
     #[test]
