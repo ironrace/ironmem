@@ -178,6 +178,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   another thread drops a lock. The lock is now unlocked explicitly before
   its file is closed, and an unlock that fails is logged as a warning.
 
+- **Search no longer drops its keyword leg for hyphenated queries.** A query
+  containing `non-plugin`, `read-only` or an id like `handoff-issue-377` (or a
+  bare `AND`/`OR`/`NOT`/`NEAR`) was rejected by FTS5 and silently scored as zero
+  keyword hits. Each token is now quoted, so a hyphenated word matches as a
+  phrase (`non` then `plugin`, adjacent). A bare upper-case `AND`/`OR`/`NOT`/`NEAR`
+  and a token with no letter or digit are dropped from the keyword query.
+
 ## [0.7.0] - 2026-11-09
 
 ### Changed

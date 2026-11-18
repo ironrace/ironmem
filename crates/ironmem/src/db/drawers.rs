@@ -6,16 +6,25 @@ use sha2::{Digest, Sha256};
 
 /// Sanitize a query string for FTS5 MATCH syntax.
 ///
-/// Previous behaviour wrapped every token in double-quotes, making the query a
-/// strict AND-of-phrases. This caused empty BM25 hits on verbose questions
-/// (any absent token → zero results) and collapsed the hybrid pipeline to
-/// vector-only retrieval.
+/// Every cleaned token is emitted as an FTS5 string (wrapped in `"`, any inner
+/// `"` doubled) and the tokens are joined by spaces, so the implicit AND applies
+/// between tokens. A bare `handoff-issue-377` is not safe: FTS5 reads `-` as a
+/// column filter (`no such column: issue`), and a bare `AND`, `OR`, `NOT` or `NEAR`
+/// or a token starting with `-` or `^` is a syntax error. Either way the rejection
+/// was scored as zero keyword hits. Inside quotes they are plain text.
 ///
-/// New behaviour: strip FTS5 operator characters and emit bare stemmed tokens
-/// separated by spaces. FTS5 with `tokenize='porter ascii'` will apply the
-/// Porter stemmer so morphological variants still match, and the implicit AND
-/// applies at the token level (not phrase level) so partial overlap now returns
-/// results with appropriate BM25 scores rather than nothing.
+/// A quoted string is a phrase, so a hyphenated word such as `non-plugin` matches
+/// only where `non` and `plugin` are adjacent and in that order (the
+/// `porter ascii` tokenizer splits on `-` and stems each part). That is
+/// deliberately stricter than matching the two words anywhere; tokens still AND
+/// with one another, so partial overlap between *different* tokens is unchanged.
+///
+/// A token with no letter or digit (`-`, `'`) would become an empty phrase, so it
+/// is dropped. So is a bare upper-case `AND`, `OR`, `NOT` or `NEAR`: quoted, it
+/// would have to occur in the drawer (`hooks AND` would need the word `and`),
+/// whereas the writer meant an operator, not a term. FTS5 keywords are
+/// case-sensitive, so a lower-case `and` stays a word. If every token is dropped the result is empty, as it is for an
+/// empty query, and the caller returns no hits.
 fn fts5_sanitize(query: &str) -> String {
     query
         .split_whitespace()
@@ -24,10 +33,11 @@ fn fts5_sanitize(query: &str) -> String {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || matches!(c, '\'' | '-'))
                 .collect();
-            if clean.is_empty() {
-                None
+            let is_fts_keyword = matches!(clean.as_str(), "AND" | "OR" | "NOT" | "NEAR");
+            if !is_fts_keyword && clean.chars().any(char::is_alphanumeric) {
+                Some(format!("\"{}\"", clean.replace('"', "\"\"")))
             } else {
-                Some(clean)
+                None
             }
         })
         .collect::<Vec<_>>()
@@ -266,9 +276,10 @@ enum Bm25Rows<'a> {
     PromptRecall(Option<&'a RecallScope>),
 }
 
-/// Whether FTS5 rejected the query text itself, which a user's prompt can do: a
-/// syntax error, or a `-` it reads as a column filter (`needle - note` asks for
-/// column `note`). Only ever raised while stepping a statement that already
+/// Whether FTS5 rejected the query text itself. `fts5_sanitize` quotes every token,
+/// so this is now a backstop rather than an expected path: a syntax error, or a `-`
+/// it reads as a column filter (`needle - note` asks for column `note`), should no
+/// longer reach FTS5. Only ever raised while stepping a statement that already
 /// prepared, so a "no such column" here is the query's, not the schema's. Any other
 /// failure (a busy or locked database, I/O, corruption) is not "no hits".
 fn is_fts_query_rejection(error: &rusqlite::Error) -> bool {
@@ -1026,6 +1037,11 @@ impl Database {
             return Ok(vec![]);
         }
         let fts_query = fts5_sanitize(query);
+        // Nothing left to match (a query of only punctuation): `MATCH ''` is a
+        // syntax error, not an empty result.
+        if fts_query.is_empty() {
+            return Ok(vec![]);
+        }
         let limit_i64 = limit as i64;
         // A pre-v17 database has no physical `superseded_by`, so the filter must
         // be omitted there rather than referencing an absent column. (Reads of
@@ -2650,6 +2666,93 @@ mod tests {
                 "scope ({wing:?}, {room:?}) must return the matching drawer"
             );
         }
+    }
+
+    fn bm25_ids(db: &Database, query: &str, wing: Option<&str>) -> Vec<String> {
+        db.bm25_search(query, 10, wing, None)
+            .unwrap_or_else(|e| panic!("{query:?} must not error: {e}"))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn bm25_finds_hyphenated_words() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "b".repeat(32);
+        db.insert_drawer(
+            &id,
+            "the non-plugin hooks run read-only",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        for query in ["non-plugin hooks", "read-only"] {
+            assert_eq!(bm25_ids(&db, query, None), vec![id.clone()], "{query:?}");
+        }
+        // A quoted string is a phrase: the two halves must be adjacent and in order.
+        assert!(bm25_ids(&db, "plugin-non", None).is_empty());
+    }
+
+    #[test]
+    fn bm25_finds_an_id_shaped_query() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "c".repeat(32);
+        db.insert_drawer(
+            &id,
+            "resume with handoff-issue-377 hook doctor",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(bm25_ids(&db, "handoff-issue-377", None), vec![id.clone()]);
+    }
+
+    #[test]
+    fn bm25_treats_fts_keywords_and_operator_prefixes_as_words() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "d".repeat(32);
+        db.insert_drawer(&id, "the hooks are wired", &emb, "w", "r", "", "test")
+            .unwrap();
+        for query in ["hooks AND", "NOT hooks", "NEAR hooks", "-hooks", "^hooks"] {
+            // Each must be accepted; the first three keep their keyword hit.
+            let ids = bm25_ids(&db, query, None);
+            if !query.starts_with(['-', '^']) {
+                assert_eq!(ids, vec![id.clone()], "{query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn bm25_punctuation_only_query_is_accepted_and_matches_nothing() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer("e", "the hooks are wired", &emb, "w", "r", "", "test")
+            .unwrap();
+        for query in ["-", "^", "- ^", "!!! ???", "***", "AND", "NOT NEAR"] {
+            assert!(bm25_ids(&db, query, None).is_empty(), "{query:?}");
+        }
+    }
+
+    #[test]
+    fn bm25_hyphenated_query_keeps_its_hit_in_a_wing_scope() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "f".repeat(32);
+        db.insert_drawer(&id, "the non-plugin hooks", &emb, "w", "r", "", "test")
+            .unwrap();
+        db.insert_drawer("g", "the non-plugin hooks", &emb, "other", "r", "", "test")
+            .unwrap();
+        assert_eq!(bm25_ids(&db, "non-plugin", Some("w")), vec![id]);
     }
 
     /// The supersession filter has to hold in every scoped branch, not just the
