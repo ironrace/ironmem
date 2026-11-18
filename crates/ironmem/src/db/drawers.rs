@@ -341,16 +341,24 @@ pub struct SearchFilters {
     pub include_superseded: bool,
 }
 
-/// One drawer's scope columns and embedding, as [`Database::scope_vectors`]
-/// reads them for an exact scoped vector search.
+/// One drawer's scope columns and stored embedding, as
+/// [`Database::scope_vectors`] reads them for an exact scoped vector search.
+/// The embedding stays undecoded until [`ScopeVector::embedding`] is called,
+/// so rows the caller filters out are never decoded.
 pub(crate) struct ScopeVector {
     pub id: String,
     pub wing: String,
     pub room: String,
     pub superseded_by: Option<String>,
-    /// `None` when the stored blob is missing, not a whole number of `f32`s,
-    /// or holds a non-finite value.
-    pub embedding: Option<Vec<f32>>,
+    embedding_blob: Option<Vec<u8>>,
+}
+
+impl ScopeVector {
+    /// The decoded embedding, or `None` when the stored blob is missing, not a
+    /// whole number of `f32`s, or holds a non-finite value.
+    pub(crate) fn embedding(&self) -> Option<Vec<f32>> {
+        self.embedding_blob.as_deref().and_then(decode_embedding)
+    }
 }
 
 /// The message of the `NotFound` error [`Database::mark_drawer_superseded_tx`]
@@ -873,16 +881,10 @@ impl Database {
                 skipped_malformed += 1;
                 continue;
             };
-            let dot_product: f32 = embedding
-                .iter()
-                .zip(&candidate)
-                .map(|(query, stored)| query * stored)
-                .sum();
-            let score = dot_product / (query_norm * candidate_norm);
-            if !score.is_finite() {
+            let Some(score) = cosine(embedding, query_norm, &candidate, candidate_norm) else {
                 skipped_malformed += 1;
                 continue;
-            }
+            };
             if score < NEAR_DUPLICATE_THRESHOLD {
                 continue;
             }
@@ -905,8 +907,9 @@ impl Database {
         Ok(best)
     }
 
-    /// Every drawer in `wing` and/or `room`, ordered by id, with the columns
-    /// the search filters read and the decoded embedding. One `SELECT`, after
+    /// Every drawer in `wing` and/or `room`, in no particular order, with the
+    /// columns the search filters read and the stored embedding. One `SELECT`
+    /// (unsorted: sorting would make SQLite sort the embedding blobs), after
     /// the `PRAGMA table_info` column probe the other drawer reads also make.
     /// It narrows by scope only; the caller applies the filter rules.
     pub(crate) fn scope_vectors(
@@ -930,16 +933,14 @@ impl Database {
             sql.push_str(" AND room = ?");
             values.push(room);
         }
-        sql.push_str(" ORDER BY id");
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
-            let blob: Option<Vec<u8>> = row.get(4)?;
             Ok(ScopeVector {
                 id: row.get(0)?,
                 wing: row.get(1)?,
                 room: row.get(2)?,
                 superseded_by: row.get(3)?,
-                embedding: blob.as_deref().and_then(decode_embedding),
+                embedding_blob: row.get(4)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -1483,6 +1484,15 @@ pub(crate) fn vector_norm(embedding: &[f32]) -> Option<f32> {
     let squared_sum: f32 = embedding.iter().map(|value| value * value).sum();
     let norm = squared_sum.sqrt();
     (norm.is_finite() && norm > 0.0).then_some(norm)
+}
+
+/// Cosine similarity of `a` and `b`, given their norms (from [`vector_norm`]),
+/// or `None` when the result is not finite. The caller must check that the
+/// lengths match: the dot product stops at the shorter of the two.
+pub(crate) fn cosine(a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> Option<f32> {
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let score = dot / (a_norm * b_norm);
+    score.is_finite().then_some(score)
 }
 
 #[cfg(test)]

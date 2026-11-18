@@ -445,11 +445,11 @@ fn search_index_ids(
 /// Vector candidates for a wing/room-scoped search, scored exactly.
 ///
 /// One `SELECT` (after the column probe `scope_vectors` makes, as the other
-/// drawer reads do) fetches the scope's drawers in id order. A drawer is kept
-/// when `row_matches_filters` keeps it (the same rules as the final filter)
-/// and its embedding is usable: decodable, as long as the query, and with a
-/// non-zero, finite norm. Each is scored by cosine similarity with the query;
-/// the content-word variant is scored the same way and merged with
+/// drawer reads do) fetches the scope's drawers, in no particular order. A
+/// drawer is kept when `row_matches_filters` keeps it (the same rules as the
+/// final filter) and its embedding decodes and has a non-zero, finite norm;
+/// only kept rows are decoded. Each is scored by cosine similarity with the
+/// query; the content-word variant is scored the same way and merged with
 /// `union_hnsw`, as the unscoped path merges it. Returns at most `overfetch`
 /// ids, highest score first, ties broken by drawer id. The cost grows with
 /// the scope: every in-scope row is read and scored, with no cap or cache.
@@ -463,60 +463,86 @@ fn scoped_vector_candidates(
     let rows = app
         .db
         .scope_vectors(filters.wing.as_deref(), filters.room.as_deref())?;
-    let mut unusable = 0usize;
-    let mut ids: Vec<String> = Vec::new();
-    let mut vectors: Vec<(Vec<f32>, f32)> = Vec::new();
+    let mut malformed = 0usize;
+    let mut candidates: Vec<ScopeCandidate> = Vec::new();
     for row in rows {
         if !row_matches_filters(&row.wing, &row.room, row.superseded_by.is_some(), filters) {
             continue;
         }
-        let Some(embedding) = row.embedding.filter(|e| e.len() == primary.len()) else {
-            unusable += 1;
+        let Some(embedding) = row.embedding() else {
+            malformed += 1;
             continue;
         };
         // A zero vector (Autopilot and collab rows) has no direction to score.
         let Some(norm) = crate::db::drawers::vector_norm(&embedding) else {
             continue;
         };
-        ids.push(row.id);
-        vectors.push((embedding, norm));
+        candidates.push(ScopeCandidate {
+            id: row.id,
+            embedding,
+            norm,
+        });
     }
-    if unusable > 0 {
+    if malformed > 0 {
         tracing::warn!(
-            unusable,
-            "scoped search skipped drawers whose embedding is malformed or of the wrong dimension"
+            malformed,
+            "scoped search skipped drawers whose stored embedding is malformed"
         );
     }
+    // `union_hnsw` breaks ties by position, so positions must follow id order.
+    candidates.sort_unstable_by(|a, b| a.id.cmp(&b.id));
 
-    let primary_top = exact_top_k(&vectors, primary, overfetch);
+    let primary_top = exact_top_k(&candidates, primary, overfetch);
     let top = match content {
-        Some(cv) => union_hnsw(primary_top, exact_top_k(&vectors, cv, overfetch), overfetch),
+        Some(cv) => union_hnsw(
+            primary_top,
+            exact_top_k(&candidates, cv, overfetch),
+            overfetch,
+        ),
         None => primary_top,
     };
-    Ok(top.into_iter().map(|(pos, _)| ids[pos].clone()).collect())
+    Ok(top
+        .into_iter()
+        .map(|(pos, _)| candidates[pos].id.clone())
+        .collect())
 }
 
-/// The top `k` of `vectors` (each with its norm) by cosine similarity with
-/// `query`, as (position, score), highest first, ties by position. A vector
-/// of another length is skipped. A zero-norm query scores every vector 0.
-fn exact_top_k(vectors: &[(Vec<f32>, f32)], query: &[f32], k: usize) -> Vec<(usize, f32)> {
+/// An in-scope drawer the scoped vector leg can score: its id, its decoded
+/// embedding and that embedding's (non-zero, finite) norm.
+struct ScopeCandidate {
+    id: String,
+    embedding: Vec<f32>,
+    norm: f32,
+}
+
+/// The top `k` of `candidates` by cosine similarity with `query`, as
+/// (position, score), highest first, ties broken by drawer id whatever order
+/// `candidates` is in. A candidate of another length than `query` is skipped,
+/// as is one whose score is not finite. A zero-norm query scores every
+/// candidate 0.
+fn exact_top_k(candidates: &[ScopeCandidate], query: &[f32], k: usize) -> Vec<(usize, f32)> {
     let query_norm = crate::db::drawers::vector_norm(query);
-    let mut scored: Vec<(usize, f32)> = vectors
+    let mut scored: Vec<(usize, f32)> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, (vector, _))| vector.len() == query.len())
-        .map(|(pos, (vector, norm))| {
+        .filter(|(_, candidate)| candidate.embedding.len() == query.len())
+        .filter_map(|(pos, candidate)| {
             let score = match query_norm {
-                Some(query_norm) => {
-                    let dot: f32 = vector.iter().zip(query).map(|(a, b)| a * b).sum();
-                    dot / (query_norm * norm)
-                }
+                Some(query_norm) => crate::db::drawers::cosine(
+                    query,
+                    query_norm,
+                    &candidate.embedding,
+                    candidate.norm,
+                )?,
                 None => 0.0,
             };
-            (pos, score)
+            Some((pos, score))
         })
         .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    scored.sort_by(|a, b| {
+        b.1.total_cmp(&a.1)
+            .then_with(|| candidates[a.0].id.cmp(&candidates[b.0].id))
+    });
     scored.truncate(k);
     scored
 }
@@ -1290,6 +1316,83 @@ mod tests {
             hnsw_candidates(&app, &zero, None, 3, &wing_o).unwrap(),
             ["o0", "o1", "o2"]
         );
+    }
+
+    /// Rows reach the scoped leg in whatever order SQLite returns them
+    /// (here insertion order, the reverse of id order). Equal scores still
+    /// come out in id order, for the primary query and for the union with
+    /// the content-word variant.
+    #[test]
+    fn scoped_candidates_break_ties_by_id_whatever_order_the_rows_arrive_in() {
+        let app = App::open_for_test().unwrap();
+        let v = at_similarity(0.5, 1.0);
+        for id in ["t4", "t3", "t2", "t1", "t0"] {
+            add(&app, id, "t", "r", &v);
+        }
+        let wing_t = scope(Some("t"), None);
+        let q = query_vec();
+        assert_eq!(
+            hnsw_candidates(&app, &q, None, 30, &wing_t).unwrap(),
+            ["t0", "t1", "t2", "t3", "t4"]
+        );
+        let cv = at_similarity(0.5, 1.0);
+        assert_eq!(
+            hnsw_candidates(&app, &q, Some(&cv), 3, &wing_t).unwrap(),
+            ["t0", "t1", "t2"]
+        );
+    }
+
+    /// A score that is not finite is dropped, not ranked: `total_cmp` would
+    /// put a NaN or +inf first. Decoded embeddings are finite and their norms
+    /// finite and non-zero, so the scoped leg cannot itself produce one; this
+    /// feeds the scorer a norm too small for its vector to force one.
+    #[test]
+    fn exact_top_k_drops_a_non_finite_score() {
+        let mut extreme = vec![0.0; DIM];
+        extreme[0] = f32::MAX;
+        extreme[1] = f32::MAX;
+        let mut query = vec![0.0; DIM];
+        query[0] = 1.0;
+        query[1] = 1.0;
+        let candidates = [
+            candidate_of("extreme", extreme, 1.0),
+            candidate_of("plain", at_similarity(0.5, 1.0), 1.0),
+        ];
+        let top = exact_top_k(&candidates, &query, 10);
+        assert_eq!(top.len(), 1, "{top:?}");
+        assert_eq!(candidates[top[0].0].id, "plain");
+    }
+
+    fn candidate_of(id: &str, embedding: Vec<f32>, norm: f32) -> ScopeCandidate {
+        ScopeCandidate {
+            id: id.to_string(),
+            embedding,
+            norm,
+        }
+    }
+
+    /// `exact_top_k` itself breaks ties by id, not by its input order.
+    #[test]
+    fn exact_top_k_breaks_ties_by_id_not_input_order() {
+        let v = at_similarity(0.5, 1.0);
+        let candidates = [
+            candidate_of("c", v.clone(), 1.0),
+            candidate_of("a", v.clone(), 1.0),
+            candidate_of("top", at_similarity(0.9, 1.0), 1.0),
+            candidate_of("b", v, 1.0),
+        ];
+        let order: Vec<&str> = exact_top_k(&candidates, &query_vec(), 10)
+            .into_iter()
+            .map(|(pos, _)| candidates[pos].id.as_str())
+            .collect();
+        assert_eq!(order, ["top", "a", "b", "c"]);
+        // With a zero query every score is 0 and the id order alone decides.
+        let zero = vec![0.0; DIM];
+        let order: Vec<&str> = exact_top_k(&candidates, &zero, 2)
+            .into_iter()
+            .map(|(pos, _)| candidates[pos].id.as_str())
+            .collect();
+        assert_eq!(order, ["a", "b"]);
     }
 
     #[test]
