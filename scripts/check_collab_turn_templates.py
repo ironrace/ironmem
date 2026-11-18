@@ -539,10 +539,14 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 # cover:
 #   - the Step 1 stop when the issue or its labels cannot be read;
 #   - the three Step 2 prerequisite reads (the `ironmem autopilot status`
-#     command, both `gh label list` commands), the gate-config fail-closed
-#     rule, the status-read rule (a non-zero exit is reported as a failed
-#     read, never as a repo that is not onboarded) and the label-read rule (a
-#     failed read is reported as one, never as a missing label);
+#     command, both `gh label list` commands), the gate-config approval
+#     condition and fail-closed rule, that only the status exit status and
+#     `gate_config` are used (never the report's `labels` section), the
+#     status-read rule (a non-zero exit is reported as a failed read, never
+#     as a repo that is not onboarded), rule 1's failed-read fix line (a
+#     failed `status` read gets neither onboard nor approve) and the
+#     label-read rule (a failed read is reported as one, never as a missing
+#     label);
 #   - rule 1's unreadable-labels rule, its unsure-class-is-`logic` rule, and
 #     the requirement that the `risk:*` label survive until `advance`;
 #   - both missing-prerequisite lines;
@@ -589,9 +593,17 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "Anything else — a non-zero exit, output that is not JSON, a `null` "
     "`gate_config`, another `state`, or a `gate_commands` that is missing, "
     "empty or has a blank entry — means not approved.",
-    "A non-zero exit is a failed read: the router reports it as one, naming "
-    "the command and its error, never as a repo that is not onboarded and "
-    "with no onboard fix line.",
+    "A non-zero exit, a run that could not be made, or output that is not "
+    "JSON is a failed read: the router reports it as one, naming the command "
+    "and its error, never as a repo that is not onboarded and with no "
+    "onboard fix line.",
+    "Use only its exit status and `gate_config`: the label requirements come "
+    "from the two `gh label list` reads below, never from its `labels` "
+    "section.",
+    "Approved only when it exits 0 and its JSON `gate_config` is an object "
+    "whose `state` is `\"approved\"`; keep that object's `gate_commands`.",
+    "A failed `status` read gets neither command: its fix line gives the "
+    "command that was run, its exit status and its error.",
     "Never infer gate commands from the repo.",
     "For both `gh label list` reads, a non-zero exit, an auth error or a rate "
     "limit is a failed read: it counts as not meeting the requirement, and the "
