@@ -6,32 +6,33 @@ use sha2::{Digest, Sha256};
 
 /// Sanitize a query string for FTS5 MATCH syntax.
 ///
-/// Every cleaned token is emitted as an FTS5 string (wrapped in `"`, any inner
-/// `"` doubled) and the tokens are joined by spaces, so the implicit AND applies
-/// between tokens. A bare `handoff-issue-377` is not safe: FTS5 reads `-` as a
-/// column filter (`no such column: issue`), and a token starting with `-` or `^`
-/// is a syntax error. Either way the rejection was scored as zero keyword hits.
-/// Inside quotes they are plain text.
+/// The query is split on whitespace and each token keeps only its letters, digits,
+/// `'` and `-`. Every cleaned token is emitted as an FTS5 string (wrapped in `"`,
+/// any inner `"` doubled) and the tokens are joined by spaces, so FTS5's implicit
+/// AND applies: a drawer must contain every token.
+///
+/// The quoting is what makes `-` safe. Bare, FTS5 reads it as a column filter
+/// (`handoff-issue-377` gives `no such column: issue`, `-hooks` gives
+/// `no such column: hooks`), and the caller scores that rejection as zero keyword
+/// hits. Inside quotes `-` is plain text.
 ///
 /// A quoted string is a phrase, so a hyphenated word such as `non-plugin` matches
 /// only where `non` and `plugin` are adjacent and in that order (the
-/// `porter ascii` tokenizer splits on `-` and stems each part). That is
-/// deliberately stricter than matching the two words anywhere; tokens still AND
-/// with one another, so partial overlap between *different* tokens is unchanged.
+/// `porter ascii` tokenizer splits on `-` and stems each part).
 ///
-/// A token with no letter or digit (`-`, `'`) would become an empty phrase, so it
-/// is dropped.
+/// A token with no letter or digit (`-`, `'`) is dropped.
 ///
-/// The four upper-case words `AND`, `OR`, `NOT` and `NEAR` are dropped when they
-/// are bare in the query, so a query is always plain words. At the start or end of
-/// a query FTS5 rejected them, and the rejection was scored as zero keyword hits.
-/// Between two words the first three used to act as operators (`a OR b` matched
-/// either word, `a NOT b` excluded `b`); that is given up on purpose, because
-/// queries are natural-language text (the prompt-recall hook passes raw prompts,
-/// where "do NOT ..." is ordinary English) and nothing documents operator syntax.
-/// Lower-case `and`, `or`, `not` and `near` stay ordinary words, and so does a
-/// word the writer put in double quotes (`"NOT"`). If every token is dropped the
-/// result is empty, as it is for an empty query, and the caller returns no hits.
+/// A token that is exactly `AND`, `OR`, `NOT` or `NEAR` once cleaned (`NOT`,
+/// `NOT,`) is dropped, not quoted, so it is neither an FTS5 operator nor a word
+/// the drawer must contain: `a OR b` requires both words and `a NOT b` does not
+/// exclude `b`. That is on purpose, because queries are natural-language text
+/// (the prompt-recall hook passes the user's prompt, where "do NOT ..." is
+/// ordinary English). Lower-case `and`, `or`, `not` and `near` stay ordinary
+/// words, and so does a token that starts and ends with `"` (`"NOT"`). Only a
+/// whole whitespace-separated token counts as quoted, so the word is still
+/// dropped inside a quoted phrase (`"NOT here"`) or with punctuation outside the
+/// quotes (`"NOT",`). If every token is dropped the result is empty, and the
+/// caller returns no hits without querying FTS5.
 fn fts5_sanitize(query: &str) -> String {
     query
         .split_whitespace()
@@ -285,12 +286,13 @@ enum Bm25Rows<'a> {
     PromptRecall(Option<&'a RecallScope>),
 }
 
-/// Whether FTS5 rejected the query text itself. `fts5_sanitize` quotes every token,
-/// so this is now a backstop rather than an expected path: a syntax error, or a `-`
-/// it reads as a column filter (`needle - note` asks for column `note`), should no
-/// longer reach FTS5. Only ever raised while stepping a statement that already
-/// prepared, so a "no such column" here is the query's, not the schema's. Any other
-/// failure (a busy or locked database, I/O, corruption) is not "no hits".
+/// Whether FTS5 rejected the query text itself: a syntax error, or a `-` it reads
+/// as a column filter (`needle - note` asks for column `note`). `fts5_sanitize`
+/// quotes every token, so neither should reach FTS5 and this is a backstop. Only
+/// ever raised while stepping a statement that already prepared, so a "no such
+/// column" here is the query's, not the schema's. Any other failure (a busy or
+/// locked database, I/O, corruption) is not a rejection, and the prompt-recall
+/// search returns it as an error rather than as no hits.
 fn is_fts_query_rejection(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -2726,18 +2728,15 @@ mod tests {
     }
 
     #[test]
-    fn bm25_treats_fts_keywords_and_operator_prefixes_as_words() {
+    fn bm25_accepts_fts_keywords_and_operator_prefixes() {
         let db = Database::open_in_memory().unwrap();
         let emb = dummy_embedding();
         let id = "d".repeat(32);
         db.insert_drawer(&id, "the hooks are wired", &emb, "w", "r", "", "test")
             .unwrap();
         for query in ["hooks AND", "NOT hooks", "NEAR hooks", "-hooks", "^hooks"] {
-            // Each must be accepted; the first three keep their keyword hit.
-            let ids = bm25_ids(&db, query, None);
-            if !query.starts_with(['-', '^']) {
-                assert_eq!(ids, vec![id.clone()], "{query:?}");
-            }
+            // Each must be accepted and keep its keyword hit.
+            assert_eq!(bm25_ids(&db, query, None), vec![id.clone()], "{query:?}");
         }
     }
 
@@ -2771,10 +2770,12 @@ mod tests {
     #[test]
     fn bm25_ignores_upper_case_operator_words_so_every_term_is_required() {
         let db = Database::open_in_memory().unwrap();
-        let (_only_hooks, both) = two_drawers(&db);
+        let (only_hooks, both) = two_drawers(&db);
         // `OR` and `NOT` no longer act as operators: both words are required.
         assert_eq!(bm25_ids(&db, "hooks OR doctor", None), vec![both.clone()]);
         assert_eq!(bm25_ids(&db, "hooks NOT doctor", None), vec![both.clone()]);
+        // The check is made after punctuation is stripped, so `NOT,` is dropped too.
+        assert_eq!(bm25_ids(&db, "wired NOT,", None), vec![only_hooks]);
     }
 
     #[test]
@@ -2792,11 +2793,16 @@ mod tests {
     }
 
     #[test]
-    fn bm25_keeps_an_upper_case_operator_word_the_writer_quoted() {
+    fn bm25_keeps_an_operator_word_only_when_its_whole_token_is_quoted() {
         let db = Database::open_in_memory().unwrap();
-        let (_only_hooks, both) = two_drawers(&db);
+        let (only_hooks, both) = two_drawers(&db);
         // `"NOT"` is the word, so the drawer lacking "not" is not a hit.
         assert_eq!(bm25_ids(&db, "hooks \"NOT\"", None), vec![both]);
+        // Only a whole whitespace-separated token counts as quoted, so the word is
+        // still dropped inside a quoted phrase or with punctuation outside the quotes.
+        let phrase = "hooks \"NOT wired\"";
+        assert_eq!(bm25_ids(&db, phrase, None), vec![only_hooks.clone()]);
+        assert_eq!(bm25_ids(&db, "wired \"NOT\",", None), vec![only_hooks]);
     }
 
     #[test]

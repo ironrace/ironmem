@@ -185,8 +185,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   word matches as a phrase (`non` then `plugin`, adjacent). A token with no
   letter or digit is dropped. Upper-case `AND`, `OR`, `NOT` and `NEAR` in a query
   are now ignored, so `a OR b` requires both words and `a NOT b` no longer
-  excludes `b`; a word in double quotes (`"NOT"`) and lower-case `and`, `or`,
-  `not`, `near` stay ordinary words.
+  excludes `b`. Lower-case `and`, `or`, `not` and `near` stay ordinary words,
+  and so does a single word in its own double quotes (`"NOT"`). Only a whole
+  space-separated token counts as quoted, so the word is still ignored inside a
+  quoted phrase (`"NOT here"`) or with punctuation outside the quotes (`"NOT",`).
 
 ## [0.7.0] - 2026-11-09
 
