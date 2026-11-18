@@ -11,7 +11,7 @@
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use ironmem::autopilot::dispatch_state::{self, DispatchState};
 use ironmem::autopilot::gate_config::{self, GateConfig};
@@ -1225,6 +1225,41 @@ fn an_invalid_ironmem_env_setting_exits_one() {
         &output,
         &["Error: Config error: IRONMEM_MCP_MODE must be one of"],
     );
+}
+
+#[test]
+fn a_report_that_cannot_be_written_exits_one_without_a_panic() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    // A pipe whose reading end is closed: every write to it fails.
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+
+    for json in [true, false] {
+        let mut command = fixture.plain(
+            REPO,
+            &fixture.db_path(),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        );
+        if json {
+            command.arg("--json");
+        }
+        let output = command
+            .stdout(Stdio::from(writer.try_clone().unwrap()))
+            .output()
+            .unwrap();
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(1), "json={json}: {stderr}");
+        assert!(
+            stderr.contains("Error: IO error: could not write the report to stdout: "),
+            "json={json}: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "json={json}: {stderr}");
+    }
 }
 
 // ── read-only when there is something to change ─────────────────────────

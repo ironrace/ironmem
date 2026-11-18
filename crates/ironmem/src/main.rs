@@ -3583,6 +3583,8 @@ after {n} attempt(s)",
                 path,
                 json,
             } => {
+                use std::io::Write;
+
                 use ironmem::autopilot::status::{read_gate_config_status, render_text, RepoName};
 
                 let cfg = config::Config::load(db.clone())?;
@@ -3595,13 +3597,25 @@ after {n} attempt(s)",
                 // Never an error: a label read that fails is part of the
                 // report, and the gate config is still reported.
                 let status = read.with_labels_read_in(std::path::Path::new(&path));
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&status)?);
+                let report = if json {
+                    format!("{}\n", serde_json::to_string_pretty(&status)?)
                 } else {
                     // Hint `--db` only when one was given; the hint carries the
                     // report's absolute path, so it works from any directory.
-                    print!("{}", render_text(&status, db.is_some()));
-                }
+                    render_text(&status, db.is_some())
+                };
+                // Not `print!`, which panics (exit 101) when stdout is a
+                // closed pipe or a full disk: a report that could not be
+                // written is exit 1, like every other failure to report.
+                let mut stdout = std::io::stdout().lock();
+                write!(stdout, "{report}")
+                    .and_then(|()| stdout.flush())
+                    .map_err(|err| {
+                        MemoryError::Io(std::io::Error::new(
+                            err.kind(),
+                            format!("could not write the report to stdout: {err}"),
+                        ))
+                    })?;
                 Ok(())
             }
         },
