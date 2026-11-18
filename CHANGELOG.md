@@ -9,23 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`ironmem doctor` reports hooks that leave a store stale (#377).** Three new
-  lines: `hooks` names any of the plugin's four Claude Code hooks missing from
-  `~/.claude/settings.json` (or reports that the enabled plugin supplies them);
-  `hook_mining` says whether Stop/PreCompact can mine, with each hook's
-  effective `IRONMEM_MCP_MODE` and where it came from; `mined_rows` shows how
-  old the newest mined row (a chunk of a workspace file) is and warns past 7
-  days, which an unchanged workspace also triggers. Problems are warnings and
-  never fail `doctor` (exit 0). `scripts/install-ironmem.sh` now appends the
-  four hooks to `$CLAUDE_HOME/settings.json` (override with
-  `CLAUDE_SETTINGS_JSON`) unless the ironmem plugin is enabled. Hooks already
-  wired and all other hooks and keys are left alone; `--skip-wiring` skips
-  this, and without `jq` it prints the four entries to add by hand. If
-  settings.json cannot be read or written it warns, wires nothing, and the
-  install continues (a write that fails partway can leave the file incomplete,
-  and the warning says so). A hand-wired command with a flag before the hook
-  name (`ironmem hook --harness claude-code stop`) is not recognized and gets
-  a second copy. The wired hooks run read-only, so they don't mine; a cheaper
+- **`ironmem doctor` reports hooks that leave a store stale (#377).** Three
+  new lines: `hooks` names any of the plugin's four Claude Code hooks missing
+  from `~/.claude/settings.json` (or reports that the enabled plugin supplies
+  them) and warns when a hook fails or may fail to start; `hook_mining` says
+  whether Stop/PreCompact can mine, with each hook's effective
+  `IRONMEM_MCP_MODE` and where it came from; `mined_rows` shows how old the
+  newest mined row (a chunk of a workspace file) is and warns past 7 days,
+  which an unchanged workspace also triggers. Problems are warnings and never
+  fail `doctor` (exit 0). `scripts/install-ironmem.sh` now appends the four
+  hooks to `$CLAUDE_HOME/settings.json` (override with `CLAUDE_SETTINGS_JSON`)
+  unless the ironmem plugin is enabled. Hooks already wired and all other
+  hooks and keys are left alone; `--skip-wiring` skips this, and without `jq`
+  it prints the four entries to add by hand. If settings.json cannot be read
+  or written it warns, wires nothing, and the install continues (a write that
+  fails partway can leave the file incomplete, and the warning says so). A
+  hand-wired command with a flag before the hook name
+  (`ironmem hook --harness claude-code stop`) is not recognized and gets a
+  second copy. The wired hooks run read-only, so they don't mine; a cheaper
   way to mine outside the plugin is #418.
 
 ### Changed
@@ -135,10 +136,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its source and excerpt, so one imported row can't flood the prompt.
   On a fixed five-prompt fixture, one of whose ids is a 209-byte import, the
   injected text grew from 1,700 to 2,398 bytes.
-- **Search's keyword leg ignores upper-case `AND`, `OR`, `NOT` and `NEAR`.**
-  Unless quoted on their own (`"NOT"`), they are dropped from the query, so
-  `a OR b` requires both words and `a NOT b` no longer excludes `b`; lower-case
-  forms stay ordinary words.
+- **Search's keyword leg ignores upper-case `AND`, `OR`, `NOT` and `NEAR`
+  (#377).** Unless quoted on their own (`"NOT"`), they are dropped from the
+  query, so `a OR b` requires both words and `a NOT b` no longer excludes `b`;
+  lower-case forms stay ordinary words.
 
 ### Fixed
 
@@ -182,26 +183,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ironmem autopilot` commands are not known to start a process while
   another thread drops a lock. The lock is now unlocked explicitly before
   its file is closed, and an unlock that fails is logged as a warning.
-- **Search no longer drops its keyword leg for hyphenated queries.** A query
-  containing `non-plugin`, `read-only` or an id like `handoff-issue-377` was
-  rejected by FTS5, which read the `-` as a column filter, and the rejection was
-  silently scored as zero keyword hits. Each token is now quoted, so a hyphenated
-  word matches as a phrase (`non` then `plugin`, adjacent). A token with no
-  letter or digit is dropped.
-- **Wing/room-scoped search scores the drawers in its scope directly.** Scope
-  was applied after taking the top vector candidates across every wing, so a
-  scoped search could come back empty while matching drawers existed. The vector
-  leg of a scoped search now reads the scope's drawers and ranks them by exact
-  cosine similarity to the query instead of filtering the global top vector
-  results.
-- **Drawers stored without a real embedding are no longer in the vector index.**
-  Autopilot backlog-lineage and collab session rows are stored with an all-zero
-  vector, which matched every query perfectly and pushed real results out of
-  the vector leg. They are left out of the index. Autopilot backlog-lineage rows
-  and collab plans and task lists are still found by keyword search; collab
-  messages were never keyword-indexed and are read by id. Everything the noop
-  embedder (`IRONMEM_EMBED_MODE=noop`) writes is an all-zero vector too, so
-  search over a store it wrote is keyword-only.
+- **Search no longer drops its keyword leg for hyphenated queries (#377).** A
+  query containing `non-plugin`, `read-only` or an id like `handoff-issue-377`
+  was rejected by FTS5, which read the `-` as a column filter, and the
+  rejection was silently scored as zero keyword hits. Each token is now
+  quoted, so a hyphenated word matches as a phrase (`non` then `plugin`,
+  adjacent). A token with no letter or digit is dropped.
+- **Wing/room-scoped search scores the drawers in its scope directly (#377).**
+  Scope was applied after taking the top vector candidates across every wing,
+  so a scoped search could come back empty while matching drawers existed. The
+  vector leg of a scoped search now reads the scope's drawers and ranks them
+  by exact cosine similarity to the query instead of filtering the global top
+  vector results.
+- **Drawers stored without a real embedding are no longer in the vector index
+  (#377).** Autopilot backlog-lineage and collab session rows are stored with
+  an all-zero vector, which matched every query perfectly and pushed real
+  results out of the vector leg. They are left out of the index. Autopilot
+  backlog-lineage rows and collab plans and task lists are still found by
+  keyword search; collab messages were never keyword-indexed and are read by
+  id. Everything the noop embedder (`IRONMEM_EMBED_MODE=noop`) writes is an
+  all-zero vector too, so search over a store it wrote is keyword-only.
 
 ## [0.7.0] - 2026-11-09
 

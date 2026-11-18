@@ -7,9 +7,10 @@ use sha2::{Digest, Sha256};
 /// Sanitize a query string for FTS5 MATCH syntax.
 ///
 /// The query is split on whitespace and each token keeps only its letters, digits,
-/// `'` and `-`. Every cleaned token is emitted as an FTS5 string (wrapped in `"`,
-/// any inner `"` doubled) and the tokens are joined by spaces, so FTS5's implicit
-/// AND applies: a drawer must contain every token.
+/// `'` and `-`. Every cleaned token is emitted as an FTS5 string (wrapped in `"`;
+/// cleaning has already removed every `"`, so none needs escaping) and the tokens
+/// are joined by spaces, so FTS5's implicit AND applies: a drawer must contain
+/// every token.
 ///
 /// The quoting is what makes `-` safe. Bare, FTS5 reads it as a column filter
 /// (`handoff-issue-377` gives `no such column: issue`, `-hooks` gives
@@ -45,7 +46,7 @@ fn fts5_sanitize(query: &str) -> String {
             let is_fts_keyword =
                 !was_quoted && matches!(clean.as_str(), "AND" | "OR" | "NOT" | "NEAR");
             if !is_fts_keyword && clean.chars().any(char::is_alphanumeric) {
-                Some(format!("\"{}\"", clean.replace('"', "\"\"")))
+                Some(format!("\"{clean}\""))
             } else {
                 None
             }

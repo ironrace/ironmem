@@ -11,16 +11,18 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::hook_command::{
-    best_result, hook_mode_with_raw, hook_modes_with_raw, mode_label, runs_hook, source_label,
-    ModeError, ModeSource, RawModeResult,
+    best_result, hook_mode_with_raw, hook_modes_with_raw, runs_hook, source_label, ModeError,
+    ModeSource, RawModeResult,
 };
 use super::{Check, CheckStatus};
 use crate::config::McpAccessMode;
 
-/// The Claude Code event and `ironmem hook` name of each plugin hook, in the
-/// order `.claude-plugin/hooks/hooks.json` lists them. A unit test pins it to
-/// that file, and scripts/install-ironmem.sh's `CLAUDE_HOOK_EVENTS` mirrors it.
-pub(super) const PLUGIN_HOOKS: [(&str, &str); 4] = [
+/// The Claude Code event and `ironmem hook` name of each plugin hook. A unit
+/// test pins its events and each one's command to
+/// `.claude-plugin/hooks/hooks.json`, but not their order; the order here is
+/// the one doctor reports them in.
+/// scripts/install-ironmem.sh's `CLAUDE_HOOK_EVENTS` mirrors it.
+const PLUGIN_HOOKS: [(&str, &str); 4] = [
     ("SessionStart", "session-start"),
     ("UserPromptSubmit", "user-prompt-submit"),
     ("Stop", "stop"),
@@ -805,7 +807,7 @@ fn mining_check(
             Ok(mode) => {
                 not_mined.push(*event);
                 add_cause(&mut causes, NoMineCause::of(source, raw, plugin), event);
-                format!("{event}: {} ({label}) -> not mined", mode_label(mode))
+                format!("{event}: {} ({label}) -> not mined", mode.as_str())
             }
             Err(ModeError::Invalid(raw)) => {
                 not_mined.push(*event);
@@ -1555,7 +1557,12 @@ mod tests {
             "{}",
             c.summary
         );
-        assert!(!c.summary.contains("new transcripts are not mined"));
+        // The whole line: the trusted PreCompact is not lumped in with Stop.
+        assert_eq!(
+            c.summary,
+            "PreCompact is mined; Stop is not — Stop: read-only (IRONMEM_MCP_MODE unset, so \
+             the default) -> not mined; PreCompact: trusted (set in the hook command) -> mined"
+        );
         assert_eq!(
             c.hint.as_deref(),
             Some(read_only_text("Stop command").as_str())

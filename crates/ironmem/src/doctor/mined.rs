@@ -19,7 +19,7 @@ use crate::db::schema::Database;
 use crate::MemoryError;
 
 /// A newest mined row older than this many days is reported as a `Warn`.
-pub(super) const MINED_STALE_AFTER_DAYS: i64 = 7;
+const MINED_STALE_AFTER_DAYS: i64 = 7;
 
 /// `filed_at` is SQLite `datetime('now')`: UTC, `YYYY-MM-DD HH:MM:SS`.
 const FILED_AT_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
@@ -46,10 +46,7 @@ pub(super) fn check_mined_rows(db_path: &Path, database_usable: bool, now: Naive
 
 /// Decide the `mined_rows` check from the newest mined `filed_at` and `now`
 /// (both UTC). Pure, so the thresholds are unit-tested without a clock.
-pub(super) fn mined_rows_check(
-    newest: Result<Option<String>, MemoryError>,
-    now: NaiveDateTime,
-) -> Check {
+fn mined_rows_check(newest: Result<Option<String>, MemoryError>, now: NaiveDateTime) -> Check {
     let filed_at = match newest {
         // The `database` line usually already reports a busy store; a second
         // hintless warning here would just repeat it.

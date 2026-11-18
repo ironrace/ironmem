@@ -489,11 +489,12 @@ fn check_model_cache(model_dir: &Path, embed_mode: EmbedMode) -> Check {
 }
 
 fn check_mcp_mode(mode: McpAccessMode) -> Check {
-    let (label, writes) = match mode {
-        McpAccessMode::Trusted => ("trusted", "writes allowed"),
-        McpAccessMode::ReadOnly => ("read-only", "writes blocked"),
-        McpAccessMode::Restricted => ("restricted", "writes blocked, sensitive content redacted"),
+    let writes = match mode {
+        McpAccessMode::Trusted => "writes allowed",
+        McpAccessMode::ReadOnly => "writes blocked",
+        McpAccessMode::Restricted => "writes blocked, sensitive content redacted",
     };
+    let label = mode.as_str();
     Check::new(
         "mcp_access",
         CheckStatus::Info,

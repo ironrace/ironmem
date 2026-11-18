@@ -42,6 +42,16 @@ impl McpAccessMode {
         }
     }
 
+    /// The canonical `IRONMEM_MCP_MODE` spelling of this mode, which
+    /// [`Self::parse`] reads back.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::ReadOnly => "read-only",
+            Self::Restricted => "restricted",
+        }
+    }
+
     pub fn allows_writes(self) -> bool {
         matches!(self, Self::Trusted)
     }
@@ -350,6 +360,18 @@ mod tests {
             state_dir,
             mcp_access_mode: McpAccessMode::ReadOnly,
             embed_mode: EmbedMode::Noop,
+        }
+    }
+
+    #[test]
+    fn mcp_access_mode_as_str_is_the_spelling_parse_reads_back() {
+        for (mode, text) in [
+            (McpAccessMode::Trusted, "trusted"),
+            (McpAccessMode::ReadOnly, "read-only"),
+            (McpAccessMode::Restricted, "restricted"),
+        ] {
+            assert_eq!(mode.as_str(), text);
+            assert_eq!(McpAccessMode::parse(mode.as_str()).unwrap(), mode);
         }
     }
 

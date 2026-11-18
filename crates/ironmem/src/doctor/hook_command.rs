@@ -48,14 +48,6 @@ pub(super) fn source_label(source: ModeSource) -> &'static str {
     }
 }
 
-pub(super) fn mode_label(mode: McpAccessMode) -> &'static str {
-    match mode {
-        McpAccessMode::Trusted => "trusted",
-        McpAccessMode::ReadOnly => "read-only",
-        McpAccessMode::Restricted => "restricted",
-    }
-}
-
 /// One word of a shell command after quote removal.
 #[derive(Debug, Clone)]
 struct Word {

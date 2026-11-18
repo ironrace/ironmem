@@ -1230,22 +1230,14 @@ fn ensure_tool_allowed(app: &App, name: &str, args: &Value) -> Result<(), Memory
                  when IRONMEM_MCP_MODE={}; call it without that argument to read \
                  without writing",
                 entry.trigger,
-                mode_label(app.config.mcp_access_mode),
+                app.config.mcp_access_mode.as_str(),
             )));
         }
     }
     Err(MemoryError::Permission(format!(
         "Tool '{name}' is disabled when IRONMEM_MCP_MODE={}",
-        mode_label(app.config.mcp_access_mode)
+        app.config.mcp_access_mode.as_str()
     )))
-}
-
-fn mode_label(mode: McpAccessMode) -> &'static str {
-    match mode {
-        McpAccessMode::Trusted => "trusted",
-        McpAccessMode::ReadOnly => "read-only",
-        McpAccessMode::Restricted => "restricted",
-    }
 }
 
 #[cfg(test)]
