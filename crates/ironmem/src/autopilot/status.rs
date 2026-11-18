@@ -59,8 +59,8 @@ use crate::db::schema::Database;
 use crate::error::MemoryError;
 
 use super::gate_config::{
-    get_gate_config_read_only, stored_gate_configs_read_only, BrokenGateConfig, GateConfig,
-    GateConfigState, StoredGateConfig, StoredGateConfigsError,
+    gate_config_key, get_gate_config_read_only, stored_gate_configs_read_only, BrokenGateConfig,
+    GateConfig, GateConfigState, StoredGateConfig, StoredGateConfigsError,
 };
 use super::gh::{repo_labels, GhCli, GhRunner};
 use super::labels::AgentLabel;
@@ -137,6 +137,16 @@ impl RepoName {
         &self.raw
     }
 
+    /// Whether another repo name can reduce to this name's storage key. A
+    /// key is the name with each `/` written as `-`, so a name shares its
+    /// key when the `/` could have been somewhere else: it holds a `-`, or it
+    /// has a host, whose `/` a two-part name would spell `-`. A name for
+    /// which no second spelling is itself a repo name (`a-/b`) is counted
+    /// too; the warning this decides is the safe side.
+    fn shares_its_storage_key(&self) -> bool {
+        self.raw.contains('-') || self.identity.host.is_some()
+    }
+
     /// Whether a stored row that does not parse could be this repo's. The
     /// row is judged by the `repo` its content still holds, as a row that
     /// parses is. When it holds none that names an owner, only the slug in
@@ -144,7 +154,7 @@ impl RepoName {
     /// that comparison also matches some names of other repos, which is the
     /// safe direction: the read fails instead of reporting "not onboarded".
     fn may_be_stored_as(&self, row: &BrokenGateConfig) -> bool {
-        match row.repo.as_deref().and_then(RepoIdentity::of_stored) {
+        match row.repo().and_then(RepoIdentity::of_stored) {
             Some(identity) => self.identity.may_be(&identity),
             None => slugs_may_match(&repo_slug(&self.raw), row.slug()),
         }
@@ -184,14 +194,15 @@ struct RepoIdentity {
 
 impl RepoIdentity {
     /// The identity of a stored repo name. Stored names are not shape-checked,
-    /// so this reads leniently: the last three `/`-separated segments, and
-    /// `None` for a string with no `/`.
+    /// so this reads leniently: the last three `/`-separated segments. `None`
+    /// for a string that names no owner: one with no `/`, or one whose owner
+    /// or name segment is empty (`/repo`, `owner/`).
     fn of_stored(repo: &str) -> Option<Self> {
         let mut segments = repo.rsplit('/');
         let name = segments.next()?.to_ascii_lowercase();
         let owner = segments.next()?.to_ascii_lowercase();
         let host = segments.next().map(str::to_ascii_lowercase);
-        Some(Self { host, owner, name })
+        (!owner.is_empty() && !name.is_empty()).then_some(Self { host, owner, name })
     }
 
     /// Whether two names could name the same repository: the same owner and
@@ -294,24 +305,47 @@ pub enum StatusError {
     /// The config stored under the asked name's storage key is another
     /// repo's.
     #[error(
-        "the gate config stored under this key belongs to '{stored}', not '{asked}' — two repo \
-         names that reduce to the same storage key share one config, so this status cannot be \
-         reported"
+        "the gate config stored under the key '{storage_key}' in {} belongs to '{stored}', not \
+         '{asked}' — two repo names that reduce to the same storage key share one config, so \
+         this status cannot be reported. Do not onboard '{asked}' into this database: that \
+         would replace the config of '{stored}' (#421); use a separate database (`--db`) for \
+         one of the two",
+        .db.display()
     )]
-    KeyCollision { asked: RepoName, stored: String },
+    KeyCollision {
+        asked: RepoName,
+        /// The `repo` the stored config holds.
+        stored: String,
+        /// The key both names are stored under.
+        storage_key: String,
+        /// The absolute path of the database that holds the config.
+        db: PathBuf,
+    },
 
-    /// The config stored under the asked name does not parse.
-    #[error(
-        "the gate config stored for '{repo}' in {} does not parse: {source}. To replace it, {}",
-        .db.display(),
-        replace_commands(.repo, .db)
-    )]
+    /// The row under the asked name's storage key does not parse, and
+    /// nothing in it says it is another repo's: its `repo` is the asked name,
+    /// or it holds none that names an owner. Every name that reduces to the
+    /// same slug shares the key, so in the second case the row may still be
+    /// another repo's, and the message says so before it gives a command.
+    #[error("{}", stored_config_does_not_parse(.repo, .db, .row))]
     StoredConfigDoesNotParse {
         repo: RepoName,
         /// The absolute path of the database that holds the config.
         db: PathBuf,
-        #[source]
-        source: serde_json::Error,
+        row: BrokenGateConfig,
+    },
+
+    /// The row under the asked name's storage key does not parse, and the
+    /// `repo` it holds names another repo: the two names share the key. The
+    /// message gives no command that onboards the asked name, because that
+    /// command would overwrite the other repo's row.
+    #[error("{}", broken_key_collision(.asked, .db, .row))]
+    BrokenKeyCollision {
+        asked: RepoName,
+        /// The absolute path of the database that holds the config.
+        db: PathBuf,
+        /// The row, whose `repo` names an owner and is not the asked name.
+        row: BrokenGateConfig,
     },
 
     /// No config is stored under the name asked about, and a stored config
@@ -384,9 +418,62 @@ fn stored_under_another_name(asked: &RepoName, stored: &[String], host_ambiguous
     )
 }
 
+/// The message of [`StatusError::StoredConfigDoesNotParse`].
+fn stored_config_does_not_parse(repo: &RepoName, db: &Path, row: &BrokenGateConfig) -> String {
+    let shown_db = db.display();
+    let error = row.error();
+    let replace = replace_commands(repo, db);
+    if row.repo() == Some(repo.as_str()) {
+        return format!(
+            "the gate config stored for '{repo}' in {shown_db} does not parse: {error}. To \
+             replace it, {replace}"
+        );
+    }
+    let key = row.storage_key();
+    let remedy = if repo.shares_its_storage_key() {
+        format!(
+            "The config does not say which repo it was written for, and every repo name that \
+             differs from '{repo}' only in `/` versus `-` is stored under this key, so it may \
+             belong to another repo: check which repo was onboarded into this database before \
+             replacing it (#421). To replace it as '{repo}', {replace}"
+        )
+    } else {
+        format!("To replace it, {replace}")
+    };
+    format!("the gate config stored under the key '{key}' in {shown_db} does not parse: {error}. {remedy}")
+}
+
+/// The message of [`StatusError::BrokenKeyCollision`].
+fn broken_key_collision(asked: &RepoName, db: &Path, row: &BrokenGateConfig) -> String {
+    let held = row.repo().unwrap_or_default();
+    // Onboarding the held name replaces this row only when this is the key
+    // that name is stored under; a row whose `repo` belongs under another
+    // key gets no command.
+    let repair = RepoName::parse(held)
+        .ok()
+        .filter(|held| row.is_stored_under_the_key_of(held.as_str()))
+        .map(|held| {
+            format!(
+                " To replace the config that does not parse, {}",
+                replace_commands(&held, db)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "the gate config stored under the key '{}' in {} does not parse ({}), and its `repo` is \
+         {held:?}, not '{asked}' — two repo names that reduce to the same storage key share one \
+         config, so this status cannot be reported. Do not onboard '{asked}' into this database: \
+         that would replace the config of {held:?} (#421); use a separate database (`--db`) for \
+         one of the two.{repair}",
+        row.storage_key(),
+        db.display(),
+        row.error()
+    )
+}
+
 /// The commands that replace `repo`'s stored gate config in the database at
-/// `db`, as a clause: `onboard` writes a new proposal over a row that does
-/// not parse, and `approve` approves it.
+/// `db`, as a clause: `onboard` writes a new proposal over whatever row is
+/// under `repo`'s storage key, and `approve` approves it.
 fn replace_commands(repo: &RepoName, db: &Path) -> String {
     let db = shell_quote(&db.display().to_string());
     format!(
@@ -400,13 +487,14 @@ fn broken_under_another_name(asked: &RepoName, db: &Path, rows: &[BrokenGateConf
     let listed = rows
         .iter()
         .map(|row| {
-            let named = match &row.repo {
+            let named = match row.repo() {
                 Some(repo) => format!(", whose `repo` is {repo:?},"),
                 None => String::new(),
             };
             format!(
                 "the config stored under the key '{}'{named} does not parse: {}",
-                row.storage_key, row.error
+                row.storage_key(),
+                row.error()
             )
         })
         .collect::<Vec<_>>()
@@ -504,6 +592,7 @@ impl From<StatusError> for MemoryError {
                 MemoryError::Io(std::io::Error::new(source.kind(), message))
             }
             StatusError::StoredConfigDoesNotParse { .. }
+            | StatusError::BrokenKeyCollision { .. }
             | StatusError::BrokenUnderAnotherName { .. } => {
                 MemoryError::Json(serde::de::Error::custom(message))
             }
@@ -732,8 +821,17 @@ fn bare_message(err: MemoryError) -> String {
 /// on one side only), this is an error naming the stored name instead, so a
 /// repo onboarded under another spelling is not reported as "not onboarded".
 /// A stored config that does not parse and could be this repo's is an error
-/// too, whether it is stored under this name or another spelling. Two names
-/// with different hosts are different repositories and never match.
+/// too, whether it is under this name's storage key or under another
+/// spelling. Two stored names with different hosts are different
+/// repositories and never match. A config that does not parse and holds no
+/// name is matched by the slug in its key instead
+/// ([`RepoName::may_be_stored_as`]), and that can match a name on another
+/// host.
+///
+/// Under this name's own storage key, a config is this repo's only when the
+/// `repo` it holds says so, because every name that reduces to the same slug
+/// shares the key: one that names another repo is an error naming that repo,
+/// whether or not it parses.
 ///
 /// The exact name is read first and needs no listing, so it is still
 /// answered when more configs are stored than can be compared.
@@ -857,33 +955,49 @@ fn refuse_another_spelling(
     Ok(())
 }
 
-/// Read `repo`'s gate config, whatever state it is in. `Ok(None)` is no
-/// config stored under this exact name; an `Err` is a read that failed, a
-/// stored config that does not parse, or one that belongs to another repo
+/// Read `repo`'s gate config, whatever state it is in. `Ok(None)` is nothing
+/// stored under this name's storage key; an `Err` is a read that failed, a
+/// stored row that does not parse, or one that belongs to another repo
 /// name. `db_path` is the absolute path the errors name.
+///
+/// The row is found by storage key, and every name that reduces to the same
+/// slug shares a key, so a row is this repo's only when the `repo` it holds
+/// says so. That is checked for a row that does not parse as it is for one
+/// that does.
 fn gate_config_status(
     db: &ReadOnlyDb,
     db_path: &Path,
     repo: &RepoName,
 ) -> Result<Option<GateConfigStatus>, StatusError> {
-    let config = match get_gate_config_read_only(db, repo.as_str()) {
-        Ok(Some(config)) => config,
-        Ok(None) => return Ok(None),
-        // The read parses nothing but the stored config, so a JSON error is
-        // that config's.
-        Err(MemoryError::Json(source)) => {
-            return Err(StatusError::StoredConfigDoesNotParse {
-                repo: repo.clone(),
-                db: db_path.to_path_buf(),
-                source,
+    let stored = get_gate_config_read_only(db, repo.as_str())
+        .map_err(|err| StatusError::from_read(db_path, err))?;
+    let config = match stored {
+        None => return Ok(None),
+        Some(Ok(config)) => config,
+        Some(Err(row)) => {
+            let (asked, db) = (repo.clone(), db_path.to_path_buf());
+            // A `repo` that names no owner says nothing about whose row it
+            // is, as in `RepoName::may_be_stored_as`.
+            let names_another_repo = row.repo().is_some_and(|held| {
+                held != repo.as_str() && RepoIdentity::of_stored(held).is_some()
+            });
+            return Err(if names_another_repo {
+                StatusError::BrokenKeyCollision { asked, db, row }
+            } else {
+                StatusError::StoredConfigDoesNotParse {
+                    repo: asked,
+                    db,
+                    row,
+                }
             });
         }
-        Err(err) => return Err(StatusError::from_read(db_path, err)),
     };
     if config.repo != repo.as_str() {
         return Err(StatusError::KeyCollision {
             asked: repo.clone(),
             stored: config.repo,
+            storage_key: gate_config_key(repo.as_str()),
+            db: db_path.to_path_buf(),
         });
     }
     Ok(Some(GateConfigStatus::from(config)))
@@ -1622,15 +1736,18 @@ mod tests {
             StatusError::StoredConfigDoesNotParse {
                 repo: named,
                 db,
-                source,
+                row,
             } => {
                 assert_eq!(named.as_str(), "owner/repo");
                 assert_eq!(db, &path);
+                assert_eq!(row.storage_key(), "gate-config:owner-repo");
+                assert_eq!(row.repo(), Some("owner/repo"));
                 assert!(
-                    source
+                    row.error()
                         .to_string()
                         .contains(crate::autopilot::EMPTY_GATE_COMMANDS_MSG),
-                    "{source}"
+                    "{}",
+                    row.error()
                 );
             }
             other => panic!("expected the parse failure, got {other:?}"),
@@ -1659,6 +1776,147 @@ mod tests {
         let shown = MemoryError::from(err);
         assert!(matches!(shown, MemoryError::Json(_)), "{shown:?}");
         assert_eq!(shown.to_string(), format!("JSON error: {message}"));
+    }
+
+    // `foo-bar/baz` and `foo/bar-baz` reduce to one storage key,
+    // `gate-config:foo-bar-baz`, so a read by either name finds the same row.
+
+    #[test]
+    fn a_broken_row_that_names_another_repo_under_the_asked_key_is_a_collision_with_no_remedy() {
+        let (_dir, path) = db_with_raw_config("foo-bar/baz", &no_gate("foo-bar/baz"));
+
+        let err = read_gate_config_status(&path, &repo("foo/bar-baz")).unwrap_err();
+
+        match &err {
+            StatusError::BrokenKeyCollision { asked, db, row } => {
+                assert_eq!(asked.as_str(), "foo/bar-baz");
+                assert_eq!(db, &path);
+                assert_eq!(row.storage_key(), "gate-config:foo-bar-baz");
+                assert_eq!(row.repo(), Some("foo-bar/baz"));
+            }
+            other => panic!("expected the collision of a broken row, got {other:?}"),
+        }
+        let message = err.to_string();
+        let shown_db = path.display().to_string();
+        assert!(
+            message.starts_with(&format!(
+                "the gate config stored under the key 'gate-config:foo-bar-baz' in {shown_db} \
+                 does not parse ("
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains(crate::autopilot::EMPTY_GATE_COMMANDS_MSG),
+            "{message}"
+        );
+        assert!(
+            message.contains("its `repo` is \"foo-bar/baz\", not 'foo/bar-baz'"),
+            "{message}"
+        );
+        // Following an `onboard foo/bar-baz` would overwrite the row of
+        // `foo-bar/baz`, so the error must not print one.
+        assert!(!message.contains("onboard foo/bar-baz"), "{message}");
+        assert!(
+            message.contains("Do not onboard 'foo/bar-baz' into this database"),
+            "{message}"
+        );
+        let shown = MemoryError::from(err);
+        assert!(matches!(shown, MemoryError::Json(_)), "{shown:?}");
+        assert_eq!(shown.to_string(), format!("JSON error: {message}"));
+
+        // The row is `foo-bar/baz`'s and is stored under that name's key, so
+        // the command that replaces it is given for that name.
+        let quoted = shell_quote(&shown_db);
+        assert!(
+            message.ends_with(&format!(
+                " To replace the config that does not parse, run `ironmem autopilot onboard \
+                 foo-bar/baz --path . --db {quoted}` from the repo's checkout, then `ironmem \
+                 autopilot approve foo-bar/baz --db {quoted}`"
+            )),
+            "{message}"
+        );
+
+        // Asked by the name the row holds, it is that repo's own config and
+        // the remedy is safe.
+        let err = read_gate_config_status(&path, &repo("foo-bar/baz")).unwrap_err();
+        assert!(
+            matches!(&err, StatusError::StoredConfigDoesNotParse { row, .. }
+                if row.repo() == Some("foo-bar/baz")),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "the gate config stored for 'foo-bar/baz' in {shown_db} does not parse: "
+            )),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(&format!(
+                "To replace it, run `ironmem autopilot onboard foo-bar/baz --path . --db \
+                 {quoted}` from the repo's checkout, then `ironmem autopilot approve foo-bar/baz \
+                 --db {quoted}`"
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_broken_row_that_names_no_repo_under_a_key_names_can_share_warns_before_the_remedy() {
+        let warning = "it may belong to another repo";
+        // Not JSON, and three `repo` values that name no owner.
+        for content in [
+            "not json".to_string(),
+            no_gate("baz"),
+            no_gate("/baz"),
+            no_gate("foo-bar/"),
+        ] {
+            let (_dir, path) = db_with_raw_config("foo-bar/baz", &content);
+
+            let err = read_gate_config_status(&path, &repo("foo/bar-baz")).unwrap_err();
+
+            assert!(
+                matches!(&err, StatusError::StoredConfigDoesNotParse { repo, row, .. }
+                    if repo.as_str() == "foo/bar-baz"
+                        && row.storage_key() == "gate-config:foo-bar-baz"
+                        && row.repo() != Some("foo/bar-baz")),
+                "{content}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "the gate config stored under the key 'gate-config:foo-bar-baz' in {} does \
+                     not parse: ",
+                    path.display()
+                )),
+                "{content}: {message}"
+            );
+            // The row does not say whose it is, so the message must not.
+            assert!(
+                !message.contains("stored for 'foo/bar-baz'"),
+                "{content}: {message}"
+            );
+            let warned = message
+                .find(warning)
+                .unwrap_or_else(|| panic!("{content}: no warning in: {message}"));
+            let remedy = message
+                .find("ironmem autopilot onboard foo/bar-baz")
+                .unwrap_or_else(|| panic!("{content}: no remedy in: {message}"));
+            assert!(warned < remedy, "{content}: {message}");
+            let shown = MemoryError::from(err);
+            assert_eq!(shown.to_string(), format!("JSON error: {message}"));
+        }
+
+        // `owner/repo` is the only repo name that reduces to its key, so a
+        // row there that names no repo gets the remedy with no warning.
+        let (_dir, path) = db_with_raw_config("owner/repo", "not json");
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+        let message = err.to_string();
+        assert!(!message.contains(warning), "{message}");
+        assert!(
+            message.contains("To replace it, run `ironmem autopilot onboard owner/repo --path . "),
+            "{message}"
+        );
     }
 
     #[test]
@@ -1719,9 +1977,9 @@ mod tests {
                     assert_eq!(named.as_str(), asked);
                     assert_eq!(db, &path);
                     assert_eq!(rows.len(), 1, "{rows:?}");
-                    assert_eq!(rows[0].storage_key, key);
-                    assert_eq!(rows[0].repo.as_deref(), held);
-                    rows[0].error.to_string()
+                    assert_eq!(rows[0].storage_key(), key);
+                    assert_eq!(rows[0].repo(), held);
+                    rows[0].error().to_string()
                 }
                 other => panic!("{stored} / {asked}: expected the broken row, got {other:?}"),
             };
@@ -1788,18 +2046,107 @@ mod tests {
         let err = read_gate_config_status(&path, &repo("bar/baz")).unwrap_err();
         assert!(
             matches!(&err, StatusError::BrokenUnderAnotherName { rows, .. }
-                if rows.len() == 1 && rows[0].storage_key == "gate-config:foo-bar-baz"),
+                if rows.len() == 1 && rows[0].storage_key() == "gate-config:foo-bar-baz"),
             "{err:?}"
         );
 
-        // A `repo` that names no owner cannot be compared as a name either.
-        let (_dir, path) = db_with_raw_config("Owner/Repo", &no_gate("repo"));
-        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+        // A `repo` that names no owner cannot be compared as a name either:
+        // one with no `/`, and one whose owner or name part is empty.
+        for held in ["repo", "/Repo", "Owner/", "/", "a//Repo"] {
+            let (_dir, path) = db_with_raw_config("Owner/Repo", &no_gate(held));
+            let err = match read_gate_config_status(&path, &repo("owner/repo")) {
+                Err(err) => err,
+                Ok(read) => panic!("{held:?}: expected the broken row, got {read:?}"),
+            };
+            assert!(
+                matches!(&err, StatusError::BrokenUnderAnotherName { rows, .. }
+                    if rows.len() == 1 && rows[0].repo() == Some(held)),
+                "{held:?}: {err:?}"
+            );
+        }
+    }
+
+    /// Row content that parses as `repo`'s pending gate config.
+    fn parsing(repo: &str) -> String {
+        serde_json::json!({
+            "repo": repo,
+            "state": "pending",
+            "gate_commands": ["cargo test"],
+            "proposed_at": "2026-01-01T00:00:00+00:00",
+            "approved_at": null,
+        })
+        .to_string()
+    }
+
+    /// Rewrite the one stored gate config row in place, as a hand edit or an
+    /// import could leave it: under `source_file`, and under `id` when one is
+    /// given.
+    fn rekey_the_gate_config_row(path: &Path, source_file: &str, id: Option<&str>) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE drawers SET source_file = ?1, id = COALESCE(?2, id) \
+                 WHERE wing = 'autopilot' AND room = 'backlog-lineage' \
+                 AND source_file LIKE 'logical:gate-config:%'",
+                rusqlite::params![source_file, id],
+            )
+            .unwrap();
+        assert_eq!(changed, 1, "the UPDATE must hit the gate config row");
+    }
+
+    #[test]
+    fn a_row_no_read_by_name_can_return_is_not_a_stored_gate_config() {
+        // A read by name looks a row up by the id of `gate-config:<slug>`.
+        // The listing asks for rows by `source_file`, with a `LIKE` that
+        // ignores letter case, so it also returns a row under another id:
+        // one keyed `Gate-Config:` (the id of that key is not the id of any
+        // name's key), and one whose id is not its key's at all. Neither is
+        // a config the Lead can read, so neither makes a name a near-miss.
+        for (source_file, id) in [
+            ("logical:Gate-Config:Owner-Repo", "the-id-of-another-key"),
+            ("logical:gate-config:Owner-Repo", "not-the-id-of-its-key"),
+        ] {
+            for content in [parsing("Owner/Repo"), "not json".to_string()] {
+                let (_dir, path) = db_with_raw_config("Owner/Repo", &content);
+                rekey_the_gate_config_row(&path, source_file, Some(id));
+                for asked in ["owner/repo", "Owner/Repo", "github.com/owner/repo"] {
+                    let read = read_gate_config_status(&path, &repo(asked));
+                    assert!(
+                        matches!(&read, Ok(read) if read.config.is_none()),
+                        "{source_file} / {content} / {asked}: {read:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_row_under_its_keys_id_is_listed_whatever_the_letter_case_of_its_key_prefix() {
+        // The id is what a read by name finds the row by, so this is still
+        // the stored config of `Owner/Repo`, and still a near-miss of
+        // `owner/repo`, with the key a read by name uses.
+        let (_dir, path) = db_with_raw_config("Owner/Repo", "not json");
+        rekey_the_gate_config_row(&path, "Logical:Gate-Config:Owner-Repo", None);
+
+        let err = read_gate_config_status(&path, &repo("Owner/Repo")).unwrap_err();
         assert!(
-            matches!(&err, StatusError::BrokenUnderAnotherName { rows, .. }
-                if rows.len() == 1 && rows[0].repo.as_deref() == Some("repo")),
+            matches!(&err, StatusError::StoredConfigDoesNotParse { .. }),
             "{err:?}"
         );
+        let err = match read_gate_config_status(&path, &repo("owner/repo")) {
+            Err(err) => err,
+            Ok(read) => panic!("expected the broken row, got {read:?}"),
+        };
+        assert!(
+            matches!(&err, StatusError::BrokenUnderAnotherName { rows, .. }
+                if rows.len() == 1 && rows[0].storage_key() == "gate-config:Owner-Repo"),
+            "{err:?}"
+        );
+
+        let (_dir, path) = db_with_raw_config("Owner/Repo", &parsing("Owner/Repo"));
+        rekey_the_gate_config_row(&path, "Logical:Gate-Config:Owner-Repo", None);
+        let near = near_miss_at(&path, "owner/repo");
+        assert_eq!(near.stored, vec!["Owner/Repo".to_string()]);
     }
 
     #[test]
@@ -2120,10 +2467,25 @@ mod tests {
         let err = gate_config_status(&ro, &path, &repo("foo/bar-baz")).unwrap_err();
 
         let message = err.to_string();
-        assert!(message.contains("'foo-bar/baz'"), "{message}");
-        assert!(message.contains("'foo/bar-baz'"), "{message}");
+        assert!(
+            message.starts_with(&format!(
+                "the gate config stored under the key 'gate-config:foo-bar-baz' in {} belongs to \
+                 'foo-bar/baz', not 'foo/bar-baz'",
+                path.display()
+            )),
+            "{message}"
+        );
+        // What the reader must not do next, and no command that does it.
+        assert!(
+            message.ends_with(
+                "Do not onboard 'foo/bar-baz' into this database: that would replace the config \
+                 of 'foo-bar/baz' (#421); use a separate database (`--db`) for one of the two"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("onboard foo/bar-baz"), "{message}");
         match err {
-            StatusError::KeyCollision { asked, stored } => {
+            StatusError::KeyCollision { asked, stored, .. } => {
                 assert_eq!(asked.as_str(), "foo/bar-baz");
                 assert_eq!(stored, "foo-bar/baz");
             }
@@ -2720,6 +3082,8 @@ mod tests {
             StatusError::KeyCollision {
                 asked: repo("foo/bar-baz"),
                 stored: "foo-bar/baz".into(),
+                storage_key: "gate-config:foo-bar-baz".into(),
+                db: PathBuf::from("/x/m.db"),
             },
         ] {
             let explained = err.to_string();

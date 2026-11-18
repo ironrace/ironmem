@@ -651,6 +651,44 @@ fn a_config_stored_under_a_colliding_key_exits_one() {
 }
 
 #[test]
+fn a_broken_config_of_the_colliding_name_exits_one_and_names_no_onboard_for_the_asked_name() {
+    let fixture = Fixture::new();
+    // Onboarded as `foo-bar/baz`; the row is then overwritten with one that
+    // does not parse and still names that repo.
+    fixture.propose("foo-bar/baz", &["cargo test"]);
+    overwrite_the_gate_config(&fixture.db_path(), &no_gate("foo-bar/baz"));
+
+    let output = fixture
+        .command(
+            "foo/bar-baz",
+            &fixture.db_path(),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &[
+            "Error: JSON error: the gate config stored under the key 'gate-config:foo-bar-baz' in ",
+            &fixture.db_path().display().to_string(),
+            "gate_commands must not be empty",
+            "its `repo` is \"foo-bar/baz\", not 'foo/bar-baz'",
+        ],
+    );
+    // That command would overwrite the row of `foo-bar/baz`.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("autopilot onboard foo/bar-baz"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn a_file_that_is_not_a_database_exits_one_and_names_the_path() {
     let fixture = Fixture::new();
     let not_db = fixture.root.path().join("notes.txt");

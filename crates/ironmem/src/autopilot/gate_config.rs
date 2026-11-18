@@ -8,13 +8,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::db::drawers::Drawer;
 use crate::db::read_only::ReadOnlyDb;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
 use super::{
-    read_current, read_current_read_only, repo_slug, validate_repo, write_current,
-    EMPTY_GATE_COMMANDS_MSG,
+    logical_drawer_id, read_current, read_current_read_only, repo_slug, validate_repo,
+    write_current, EMPTY_GATE_COMMANDS_MSG,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,7 +219,9 @@ const GATE_CONFIG_KEY_PREFIX: &str = "gate-config:";
 /// listed is one fewer.
 const STORED_GATE_CONFIG_LIMIT: usize = 1000;
 
-fn gate_config_key(repo: &str) -> String {
+/// The logical key `repo`'s gate config is stored under. Every name that
+/// reduces to the same [`repo_slug`] has the same key.
+pub(super) fn gate_config_key(repo: &str) -> String {
     format!("{GATE_CONFIG_KEY_PREFIX}{}", repo_slug(repo))
 }
 
@@ -231,27 +234,59 @@ pub(super) enum StoredGateConfig {
     Broken(BrokenGateConfig),
 }
 
-/// A stored gate config row that does not parse as a [`GateConfig`].
+/// A stored gate config row that does not parse as a [`GateConfig`]. Built
+/// only by the two read-only reads in this module, from a row and the key it
+/// is stored under.
 #[derive(Debug)]
 pub struct BrokenGateConfig {
-    /// The logical key the row is stored under: `gate-config:` followed by
-    /// the slug of the repo name it was written for.
-    pub(super) storage_key: String,
-    /// The row's own `repo`, when its content is a JSON object that holds one
-    /// as a string. `None` for content that is not JSON, or has no such field.
-    pub(super) repo: Option<String>,
-    /// Why the row does not parse.
-    pub(super) error: serde_json::Error,
+    /// [`GATE_CONFIG_KEY_PREFIX`] followed by the slug of the repo name the
+    /// row was written for. [`BrokenGateConfig::new`] writes the prefix, so
+    /// [`BrokenGateConfig::slug`] can always take it off again.
+    storage_key: String,
+    /// See [`BrokenGateConfig::repo`].
+    repo: Option<String>,
+    error: serde_json::Error,
 }
 
 impl BrokenGateConfig {
+    /// The row stored under the key of `slug`, whose `content` failed to
+    /// parse with `error`.
+    fn new(slug: &str, content: &str, error: serde_json::Error) -> Self {
+        Self {
+            storage_key: format!("{GATE_CONFIG_KEY_PREFIX}{slug}"),
+            repo: held_repo(content),
+            error,
+        }
+    }
+
+    /// The logical key the row is stored under: `gate-config:` followed by
+    /// [`BrokenGateConfig::slug`].
+    pub fn storage_key(&self) -> &str {
+        &self.storage_key
+    }
+
     /// The slug in the row's storage key: the repo name the row was written
     /// for with every character outside `[A-Za-z0-9_.-]` replaced by `-`, so
     /// the name cannot be read back from it exactly.
-    pub(super) fn slug(&self) -> &str {
-        self.storage_key
-            .strip_prefix(GATE_CONFIG_KEY_PREFIX)
-            .unwrap_or(&self.storage_key)
+    pub fn slug(&self) -> &str {
+        &self.storage_key[GATE_CONFIG_KEY_PREFIX.len()..]
+    }
+
+    /// The row's own `repo`, when its content is a JSON object that holds one
+    /// as a string. `None` for content that is not JSON, or has no such field.
+    pub fn repo(&self) -> Option<&str> {
+        self.repo.as_deref()
+    }
+
+    /// Why the row does not parse.
+    pub fn error(&self) -> &serde_json::Error {
+        &self.error
+    }
+
+    /// Whether `repo` is a name this row's key is the storage key of, so
+    /// that a proposal for `repo` would be written over this row.
+    pub fn is_stored_under_the_key_of(&self, repo: &str) -> bool {
+        gate_config_key(repo) == self.storage_key
     }
 }
 
@@ -272,15 +307,24 @@ pub(super) enum StoredGateConfigsError {
 /// superseded is listed, because the read by name
 /// ([`get_gate_config_read_only`]) is a lookup by id that returns such a row
 /// too.
+///
+/// A row is listed only when it is the row a read by name returns for the
+/// key in its `source_file` ([`listed_slug`]). The query matches the key
+/// prefix with SQLite's `LIKE`, which ignores ASCII letter case, so it also
+/// returns rows no read by name can reach; those are not stored gate configs
+/// and are passed over.
 pub(super) fn stored_gate_configs_read_only(
     db: &ReadOnlyDb,
 ) -> Result<Vec<StoredGateConfig>, StoredGateConfigsError> {
-    let source_prefix = crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX;
+    let source_prefix = format!(
+        "{}{GATE_CONFIG_KEY_PREFIX}",
+        crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX
+    );
     let drawers = db
         .get_drawers_by_source_prefix(
             super::WING,
             super::ROOM,
-            &format!("{source_prefix}{GATE_CONFIG_KEY_PREFIX}"),
+            &source_prefix,
             STORED_GATE_CONFIG_LIMIT,
         )
         .map_err(StoredGateConfigsError::Read)?;
@@ -290,22 +334,39 @@ pub(super) fn stored_gate_configs_read_only(
         });
     }
     Ok(drawers
-        .into_iter()
-        .map(
-            |drawer| match serde_json::from_str::<GateConfig>(&drawer.content) {
+        .iter()
+        .filter_map(|drawer| {
+            let slug = listed_slug(drawer, &source_prefix)?;
+            Some(match parse_stored(slug, &drawer.content) {
                 Ok(config) => StoredGateConfig::Parsed(config.repo),
-                Err(error) => StoredGateConfig::Broken(BrokenGateConfig {
-                    storage_key: drawer
-                        .source_file
-                        .strip_prefix(source_prefix)
-                        .unwrap_or(&drawer.source_file)
-                        .to_string(),
-                    repo: held_repo(&drawer.content),
-                    error,
-                }),
-            },
-        )
+                Err(broken) => StoredGateConfig::Broken(broken),
+            })
+        })
         .collect())
+}
+
+/// The slug of the key `drawer` is stored under, when `drawer` is the row a
+/// read by name returns for that key: its `source_file` is `source_prefix`
+/// (compared without regard to ASCII letter case, as the listing's `LIKE`
+/// compares it) followed by the slug, and its id is the id of that slug's
+/// key. `None` for any other row.
+fn listed_slug<'a>(drawer: &'a Drawer, source_prefix: &str) -> Option<&'a str> {
+    let source = &drawer.source_file;
+    let prefix = source.get(..source_prefix.len())?;
+    if !prefix.eq_ignore_ascii_case(source_prefix) {
+        return None;
+    }
+    let slug = &source[source_prefix.len()..];
+    let key = format!("{GATE_CONFIG_KEY_PREFIX}{slug}");
+    (drawer.id == logical_drawer_id(&key)).then_some(slug)
+}
+
+/// Row `content` stored under the key of `slug`, as a [`GateConfig`] or as
+/// the broken row it is. The one place a stored row is classified, so the
+/// read by name and the listing cannot disagree about a row.
+fn parse_stored(slug: &str, content: &str) -> Result<GateConfig, BrokenGateConfig> {
+    serde_json::from_str::<GateConfig>(content)
+        .map_err(|error| BrokenGateConfig::new(slug, content, error))
 }
 
 /// The `repo` that row content holds, read without [`GateConfig`]'s guard:
@@ -492,19 +553,21 @@ pub fn get_gate_config(db: &Database, repo: &str) -> Result<Option<GateConfig>, 
     }
 }
 
-/// [`get_gate_config`] over a read-only handle (#420), for
-/// `ironmem autopilot status`.
+/// What is stored under `repo`'s storage key, read over a read-only handle
+/// (#420) for `ironmem autopilot status`: `None` when nothing is, the config
+/// when the row parses, and the row itself when it does not.
 ///
 /// Goes through the same `GateConfig` deserialize guard as every other read:
-/// a stored row with no real gate is an `Err`, never a config.
+/// a stored row with no real gate is a [`BrokenGateConfig`], never a config.
+/// The broken row is returned and not only its parse error, because a storage
+/// key is shared by every name that reduces to the same slug, and the `repo`
+/// the row still holds is what says whose it is.
 pub(super) fn get_gate_config_read_only(
     db: &ReadOnlyDb,
     repo: &str,
-) -> Result<Option<GateConfig>, MemoryError> {
-    match read_current_read_only(db, &gate_config_key(repo))? {
-        None => Ok(None),
-        Some(drawer) => Ok(Some(serde_json::from_str(&drawer.content)?)),
-    }
+) -> Result<Option<Result<GateConfig, BrokenGateConfig>>, MemoryError> {
+    Ok(read_current_read_only(db, &gate_config_key(repo))?
+        .map(|drawer| parse_stored(&repo_slug(repo), &drawer.content)))
 }
 
 /// Whether `repo` currently has an `approved` gate config — the check the
@@ -963,10 +1026,11 @@ mod tests {
 
         let ro = Database::open_read_only(&path).unwrap();
 
-        assert_eq!(
-            get_gate_config_read_only(&ro, "owner/repo").unwrap(),
-            Some(stored)
-        );
+        let read = get_gate_config_read_only(&ro, "owner/repo")
+            .unwrap()
+            .expect("a row is stored under the name")
+            .expect("the stored row parses");
+        assert_eq!(read, stored);
     }
 
     #[test]
@@ -979,13 +1043,17 @@ mod tests {
 
         let ro = Database::open_read_only(&path).unwrap();
 
-        assert_eq!(get_gate_config_read_only(&ro, "owner/repo").unwrap(), None);
+        assert!(get_gate_config_read_only(&ro, "owner/repo")
+            .unwrap()
+            .is_none());
     }
 
     #[test]
-    fn the_read_only_read_refuses_a_stored_config_with_no_gate() {
+    fn the_read_only_read_returns_a_stored_config_with_no_gate_as_a_broken_row() {
         // The same deserialize guard every other read path goes through: a
-        // row with no gate commands is an error, never an approved config.
+        // row with no gate commands is never an approved config. It comes
+        // back as the broken row, with the key it is stored under and the
+        // `repo` it holds, so the caller can tell whose row it is.
         let (_dir, path) = on_disk_db();
         {
             let db = Database::open(&path).unwrap();
@@ -998,10 +1066,21 @@ mod tests {
         }
 
         let ro = Database::open_read_only(&path).unwrap();
-        let err = get_gate_config_read_only(&ro, "owner/repo").unwrap_err();
+        let broken = match get_gate_config_read_only(&ro, "owner/repo").unwrap() {
+            Some(Err(broken)) => broken,
+            other => panic!("expected the broken row, got {other:?}"),
+        };
 
-        assert!(matches!(err, MemoryError::Json(_)), "{err}");
-        assert!(err.to_string().contains(EMPTY_GATE_COMMANDS_MSG), "{err}");
+        assert_eq!(broken.storage_key(), "gate-config:owner-repo");
+        assert_eq!(broken.slug(), "owner-repo");
+        assert_eq!(broken.repo(), Some("owner/repo"));
+        assert!(broken.is_stored_under_the_key_of("owner/repo"));
+        assert!(!broken.is_stored_under_the_key_of("owner/repo2"));
+        assert!(
+            broken.error().to_string().contains(EMPTY_GATE_COMMANDS_MSG),
+            "{}",
+            broken.error()
+        );
     }
 
     /// The parsed repo names in `listing`, sorted, and its broken rows by

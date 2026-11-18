@@ -550,11 +550,11 @@ pub(crate) fn read_current(db: &Database, key: &str) -> Result<Option<Drawer>, M
 
 /// [`read_current`] over a read-only handle (#420).
 ///
-/// Same id, same lookup. It exists as a separate function rather than a
-/// generic one because [`ReadOnlyDb`] is the guarantee: its methods are
-/// reads, and the connection under it is opened `SQLITE_OPEN_READ_ONLY`,
-/// which is what refuses a write, so `ironmem autopilot status` cannot write
-/// even by mistake.
+/// Same id, same lookup. It is a separate function rather than a generic one
+/// so that `ironmem autopilot status` reads through a [`ReadOnlyDb`]. The
+/// connection under that handle is opened `SQLITE_OPEN_READ_ONLY`, and that
+/// flag is what refuses a write. The handle's own methods are reads, but it
+/// also lends its raw connection, so the type is not the guarantee.
 pub(crate) fn read_current_read_only(
     db: &ReadOnlyDb,
     key: &str,
