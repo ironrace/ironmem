@@ -9,6 +9,7 @@
 
 #![cfg(unix)]
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -1422,4 +1423,179 @@ fn a_db_path_that_is_a_directory_exits_one_and_is_not_called_missing() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!stderr.contains("not found"), "{stderr}");
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+}
+
+// ── the router's prose and the documented example against the real report ──
+
+/// The three files that state the `/evaluate-issue` router.
+const ROUTER_SURFACES: [&str; 3] = [
+    "docs/EVALUATE_ISSUE.md",
+    ".claude-plugin/commands/evaluate-issue.md",
+    ".codex-plugin/prompts/evaluate-issue.md",
+];
+
+/// The router sentences that say which parts of the report it reads, by
+/// their opening words: the approval condition, the parts it may use, and
+/// the fix line for a pending config. Each sits on one line in every router
+/// file, where the collab-template lint pins it.
+const ROUTER_REPORT_SENTENCES: [&str; 3] = [
+    "Approved only when it exits 0",
+    "Use only its exit status",
+    "gate config `\"pending\"` → review its",
+];
+
+/// Backticked spans in those sentences that are not a part of the report: a
+/// `gh` command and two `ironmem autopilot` subcommands.
+const NOT_REPORT_PARTS: [&str; 3] = ["gh label list", "onboard", "approve"];
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+/// The text inside each pair of backticks on `line`.
+fn backticked(line: &str) -> Vec<&str> {
+    let pieces: Vec<&str> = line.split('`').collect();
+    assert!(pieces.len() % 2 == 1, "unpaired backtick in: {line}");
+    pieces.into_iter().skip(1).step_by(2).collect()
+}
+
+/// Every object key anywhere in `value`.
+fn keys_in(value: &Value, into: &mut BTreeSet<String>) {
+    match value {
+        Value::Object(map) => {
+            for (key, inner) in map {
+                into.insert(key.clone());
+                keys_in(inner, into);
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|item| keys_in(item, into)),
+        _ => {}
+    }
+}
+
+/// The JSON type of every path in `value`: `gate_config.state` → `string`.
+/// An array is one entry and is not descended into, so two reports with
+/// different numbers of gate commands have the same shape.
+fn shape_of(value: &Value, path: &str, into: &mut BTreeMap<String, &'static str>) {
+    let kind = match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    };
+    into.insert(path.to_string(), kind);
+    if let Value::Object(map) = value {
+        for (key, inner) in map {
+            shape_of(inner, &format!("{path}.{key}"), into);
+        }
+    }
+}
+
+/// The router is prose, and the report's keys are serde's: nothing but this
+/// test ties the names in one to the names in the other. A report key that
+/// was renamed would leave every pinned sentence in place and a router that
+/// never finds an approved gate config.
+#[test]
+fn the_router_reads_keys_the_report_has() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    let pending = report(&fixture.status(ALL_LABELS, None));
+    fixture.approve(REPO);
+    let approved = report(&fixture.status(ALL_LABELS, None));
+
+    // The approval condition, read from a real report with the keys the
+    // router's sentence names.
+    let gate_config = approved["gate_config"]
+        .as_object()
+        .expect("an approved repo's `gate_config` is an object");
+    assert_eq!(gate_config["state"], json!("approved"));
+    assert_eq!(gate_config["gate_commands"], json!(["cargo test"]));
+    assert!(approved["db"].is_string());
+
+    let mut keys = BTreeSet::new();
+    keys_in(&pending, &mut keys);
+    keys_in(&approved, &mut keys);
+    let states: Vec<&str> = [&pending, &approved]
+        .iter()
+        .map(|report| report["gate_config"]["state"].as_str().unwrap())
+        .collect();
+
+    let mut failures = Vec::new();
+    for rel in ROUTER_SURFACES {
+        let text = std::fs::read_to_string(repo_root().join(rel))
+            .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
+        for opening in ROUTER_REPORT_SENTENCES {
+            let lines: Vec<&str> = text.lines().filter(|line| line.contains(opening)).collect();
+            let [line] = lines.as_slice() else {
+                failures.push(format!(
+                    "{rel}: {opening:?} is on {} lines; expected exactly one",
+                    lines.len()
+                ));
+                continue;
+            };
+            let sentence = &line[line.find(opening).unwrap()..];
+            let mut named = 0;
+            for span in backticked(sentence) {
+                if NOT_REPORT_PARTS.contains(&span) {
+                    continue;
+                }
+                named += 1;
+                // A quoted span is a value of `state`; anything else is a key.
+                let known = match span.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+                    Some(state) => states.contains(&state),
+                    None => keys.contains(span),
+                };
+                if !known {
+                    failures.push(format!(
+                        "{rel}: `{span}` in the sentence starting {opening:?} is neither a key \
+                         of the report nor a `state` it reports"
+                    ));
+                }
+            }
+            if named == 0 {
+                failures.push(format!(
+                    "{rel}: the sentence starting {opening:?} names no part of the report"
+                ));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "the router names parts of the status report that the report does not have:\n{}\n\n\
+         report keys: {keys:?}\nreported states: {states:?}",
+        failures.join("\n")
+    );
+}
+
+/// The `--json` example in `docs/AUTOPILOT.md` has exactly the report's keys,
+/// each holding the JSON type the report gives it.
+#[test]
+fn the_documented_json_example_has_the_reports_shape() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    fixture.approve(REPO);
+    let real = report(&fixture.status(ALL_LABELS, None));
+
+    let doc = std::fs::read_to_string(repo_root().join("docs/AUTOPILOT.md")).unwrap();
+    let after = doc
+        .split_once("`--json` prints this shape:")
+        .expect("docs/AUTOPILOT.md introduces the status JSON example")
+        .1;
+    let block = after
+        .split_once("```json\n")
+        .and_then(|(_, rest)| rest.split_once("\n```"))
+        .expect("a ```json block follows the introduction")
+        .0;
+    let example: Value = serde_json::from_str(block)
+        .unwrap_or_else(|e| panic!("the documented example is not JSON ({e}):\n{block}"));
+
+    let (mut documented, mut reported) = (BTreeMap::new(), BTreeMap::new());
+    shape_of(&example, "", &mut documented);
+    shape_of(&real, "", &mut reported);
+    assert_eq!(
+        documented, reported,
+        "docs/AUTOPILOT.md's status example (left) and a real report (right) differ in shape"
+    );
 }

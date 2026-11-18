@@ -4223,6 +4223,133 @@ mod tests {
         }
     }
 
+    /// The three files that state the `/evaluate-issue` router.
+    const ROUTER_SURFACES: [&str; 3] = [
+        "docs/EVALUATE_ISSUE.md",
+        ".claude-plugin/commands/evaluate-issue.md",
+        ".codex-plugin/prompts/evaluate-issue.md",
+    ];
+
+    /// The `ironmem` commands the router runs or prints for the gate-config
+    /// read and its fix lines, spelled as its files spell them: the Step 2
+    /// read, the three fix-line commands, and the phase-2 GOAL recheck.
+    const ROUTER_COMMANDS: [&str; 5] = [
+        "ironmem autopilot status <owner>/<repo> --json",
+        "ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'",
+        "ironmem autopilot approve <owner>/<repo> --db '<db>'",
+        "ironmem autopilot labels <owner>/<repo>",
+        "ironmem autopilot status <owner>/<repo> --db '<db>'",
+    ];
+
+    const ROUTER_CHECKOUT: &str = "/srv/check out";
+    const ROUTER_DB: &str = "/var/ironmem dbs/memory.sqlite3";
+
+    /// A router command as a shell would hand it to `ironmem`: its
+    /// placeholders filled in, then split at the spaces outside single
+    /// quotes. The checkout and database paths hold a space, so a
+    /// placeholder the router did not quote splits into two arguments.
+    fn router_argv(command: &str) -> Vec<String> {
+        let filled = command
+            .replace("<owner>/<repo>", "owner/repo")
+            .replace("<checkout>", ROUTER_CHECKOUT)
+            .replace("<db>", ROUTER_DB);
+        let mut argv = vec![String::new()];
+        let mut quoted = false;
+        for ch in filled.chars() {
+            match ch {
+                '\'' => quoted = !quoted,
+                ' ' if !quoted => argv.push(String::new()),
+                other => argv.last_mut().unwrap().push(other),
+            }
+        }
+        assert!(!quoted, "unbalanced quote in {command:?}");
+        argv
+    }
+
+    /// Every `ironmem` command the `/evaluate-issue` router names for the
+    /// gate-config read and its fix lines is in all three router files as
+    /// written here, and clap accepts it as written, with each flag's value
+    /// on the field it names.
+    #[test]
+    fn clap_accepts_the_commands_the_issue_router_names() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for rel in ROUTER_SURFACES {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
+            for command in ROUTER_COMMANDS {
+                assert!(
+                    text.contains(&format!("`{command}`")),
+                    "{rel} does not name `{command}`: if the router's command changed, \
+                     change ROUTER_COMMANDS with it so clap is asked about the new one"
+                );
+            }
+        }
+
+        let mut seen = Vec::new();
+        for command in ROUTER_COMMANDS {
+            let cli = Cli::try_parse_from(router_argv(command))
+                .unwrap_or_else(|e| panic!("clap refuses the router's `{command}`: {e}"));
+            let Commands::Autopilot { cmd } = cli.command else {
+                panic!("`{command}` is not an autopilot command");
+            };
+            let wants_db = command.contains("--db '<db>'");
+            let expected_db = wants_db.then(|| ROUTER_DB.to_string());
+            match cmd {
+                AutopilotCmd::Status {
+                    db,
+                    repo,
+                    path,
+                    json,
+                } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(db, expected_db, "{command}");
+                    assert_eq!(path, ".", "{command}");
+                    assert_eq!(json, command.ends_with("--json"), "{command}");
+                    seen.push("status");
+                }
+                AutopilotCmd::Onboard {
+                    db,
+                    repo,
+                    path,
+                    json,
+                } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(db, expected_db, "{command}");
+                    assert_eq!(path, ROUTER_CHECKOUT, "{command}");
+                    assert!(!json, "{command}");
+                    seen.push("onboard");
+                }
+                AutopilotCmd::Approve { db, repo, json } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(db, expected_db, "{command}");
+                    assert!(!json, "{command}");
+                    seen.push("approve");
+                }
+                AutopilotCmd::Labels { repo, path, json } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(path, ".", "{command}");
+                    assert!(!json, "{command}");
+                    seen.push("labels");
+                }
+                _ => panic!("`{command}` parsed as an unexpected autopilot subcommand"),
+            }
+        }
+        assert_eq!(
+            seen,
+            ["status", "onboard", "approve", "labels", "status"],
+            "each router command must parse as the subcommand it names"
+        );
+
+        // `labels` takes no `--db`, which is why the router's `labels` fix
+        // line carries none. This is also the check that the parser above
+        // refuses a flag a subcommand does not have.
+        assert!(
+            Cli::try_parse_from(["ironmem", "autopilot", "labels", "owner/repo", "--db", "x"])
+                .is_err(),
+            "`autopilot labels` accepted --db"
+        );
+    }
+
     #[test]
     fn autopilot_onboard_defaults_path_to_current_directory() {
         let cli = Cli::try_parse_from(["ironmem", "autopilot", "onboard", "owner/repo"])
