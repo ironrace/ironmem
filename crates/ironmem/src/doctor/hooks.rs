@@ -1517,6 +1517,28 @@ mod tests {
     }
 
     #[test]
+    fn a_quoted_mode_prefix_is_not_an_assignment_so_the_hook_is_missing() {
+        // The shell runs a program named `IRONMEM_MCP_MODE=trusted` (exit
+        // 127), so Stop is not wired, and nothing says it mines.
+        let home = home_with_settings(&all_four_with("Stop", r#""IRONMEM_MCP_MODE=trusted""#));
+        let c = claude_hook_checks(Some(home.path()), None);
+        let path = home.path().join(".claude").join("settings.json");
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: missing Stop in {} (workspace files are not mined when a \
+                 session stops)",
+                path.display()
+            )
+        );
+        assert_eq!(
+            c[1].summary,
+            "no wired hook mines — PreCompact: read-only (IRONMEM_MCP_MODE unset, so the \
+             default) -> not mined"
+        );
+    }
+
+    #[test]
     fn an_invalid_session_start_names_its_own_effect_not_recall() {
         let home = home_with_settings(&all_four_with("SessionStart", "IRONMEM_MCP_MODE=bogus"));
         let c = claude_hook_checks(Some(home.path()), None);

@@ -89,6 +89,22 @@ struct Word {
     /// Contains an unquoted or double-quoted `$` or backtick: the shell
     /// decides its value, not us.
     dynamic: bool,
+    /// The byte offset in `text` where the first quoted or backslash-escaped
+    /// character went, if any. The shell reads a `NAME=value` word as an
+    /// assignment only when nothing up to its first `=` was quoted.
+    first_quoted: Option<usize>,
+}
+
+impl Word {
+    /// True when a quote or backslash came before the first `=` (or there is
+    /// no `=`), so the shell does not read the word as an assignment.
+    fn quoted_name(&self) -> bool {
+        match (self.first_quoted, self.text.find('=')) {
+            (None, _) => false,
+            (Some(q), Some(eq)) => q <= eq,
+            (Some(_), None) => true,
+        }
+    }
 }
 
 /// Accumulates the words and simple commands of [`split_commands`].
@@ -100,6 +116,8 @@ struct Splitter {
     in_word: bool,
     dynamic: bool,
     quoted: bool,
+    /// See [`Word::first_quoted`].
+    first_quoted: Option<usize>,
     /// The next word is a redirection target and is dropped.
     skip_next: bool,
 }
@@ -110,6 +128,7 @@ impl Splitter {
             let word = Word {
                 text: std::mem::take(&mut self.cur),
                 dynamic: self.dynamic,
+                first_quoted: self.first_quoted,
             };
             if self.skip_next {
                 self.skip_next = false;
@@ -120,6 +139,12 @@ impl Splitter {
         self.in_word = false;
         self.dynamic = false;
         self.quoted = false;
+        self.first_quoted = None;
+    }
+
+    /// Note that the next character pushed to `cur` is quoted or escaped.
+    fn mark_quoted(&mut self) {
+        self.first_quoted.get_or_insert(self.cur.len());
     }
 
     fn end_command(&mut self) {
@@ -154,6 +179,7 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
             '\'' => {
                 sp.in_word = true;
                 sp.quoted = true;
+                sp.mark_quoted();
                 for q in chars.by_ref() {
                     if q == '\'' {
                         break;
@@ -164,6 +190,7 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
             '"' => {
                 sp.in_word = true;
                 sp.quoted = true;
+                sp.mark_quoted();
                 while let Some(q) = chars.next() {
                     match q {
                         '"' => break,
@@ -180,6 +207,7 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
                 Some('\n') | None => {}
                 Some(n) => {
                     sp.in_word = true;
+                    sp.mark_quoted();
                     sp.cur.push(n);
                 }
             },
@@ -208,6 +236,7 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
                     sp.cur.clear();
                     sp.in_word = false;
                     sp.dynamic = false;
+                    sp.first_quoted = None;
                 } else {
                     sp.end_word();
                 }
@@ -276,8 +305,13 @@ fn basename(token: &str) -> &str {
     token.rsplit('/').next().unwrap_or(token)
 }
 
-/// A `NAME=value` word, if it is one.
-fn assignment(word: &Word) -> Option<(&str, &str)> {
+/// A `NAME=value` word, if it is one. `to_shell` says the shell itself reads
+/// the word (a leading assignment), which rejects a quoted name; `env` and
+/// `export` read their arguments after quote removal, so they don't.
+fn assignment(word: &Word, to_shell: bool) -> Option<(&str, &str)> {
+    if to_shell && word.quoted_name() {
+        return None;
+    }
     let (name, value) = word.text.split_once('=')?;
     let mut chars = name.chars();
     let first_ok = chars
@@ -293,8 +327,8 @@ struct ModeValue {
     dynamic: bool,
 }
 
-fn mode_assignment(word: &Word) -> Option<ModeValue> {
-    match assignment(word) {
+fn mode_assignment(word: &Word, to_shell: bool) -> Option<ModeValue> {
+    match assignment(word, to_shell) {
         Some((MODE_VAR, value)) => Some(ModeValue {
             raw: value.to_owned(),
             dynamic: word.dynamic,
@@ -337,11 +371,11 @@ const SHELL_ARG_FLAGS: [&str; 4] = ["-o", "+o", "-O", "+O"];
 fn take_assignments(rest: &mut &[Word], inline: &mut Option<ModeValue>, env: bool) {
     while let Some(word) = rest.first() {
         let mut taken = 1;
-        if let Some(value) = mode_assignment(word) {
+        if let Some(value) = mode_assignment(word, !env) {
             *inline = Some(value);
         } else if env && ENV_ARG_FLAGS.contains(&word.text.as_str()) {
             taken = 2;
-        } else if !(assignment(word).is_some() || env && word.text.starts_with('-')) {
+        } else if !(assignment(word, !env).is_some() || env && word.text.starts_with('-')) {
             return;
         }
         *rest = rest.get(taken..).unwrap_or(&[]);
@@ -371,7 +405,7 @@ fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
         };
         let program = basename(&program.text);
         if program == "export" {
-            if let Some(value) = args.iter().find_map(mode_assignment) {
+            if let Some(value) = args.iter().find_map(|w| mode_assignment(w, false)) {
                 exported = Some(value);
             }
             continue;
@@ -865,6 +899,60 @@ mod tests {
                 ModeSource::Environment
             )
         );
+    }
+
+    #[test]
+    fn a_quoted_name_is_not_an_assignment_to_the_shell() {
+        // The shell runs a program named `IRONMEM_MCP_MODE=trusted`, so
+        // neither command runs the hook.
+        for cmd in [
+            r#""IRONMEM_MCP_MODE=trusted" ironmem hook stop"#,
+            "'IRONMEM_MCP_MODE'=trusted ironmem hook stop",
+            r"IRONMEM_MCP_MODE\=trusted ironmem hook stop",
+        ] {
+            assert!(!runs_hook(cmd, "stop"), "{cmd}");
+        }
+        // A later simple command can still run it, in the default mode.
+        let later = r#""IRONMEM_MCP_MODE=trusted" true; ironmem hook stop"#;
+        assert_eq!(
+            hook_mode(later, "stop", ModeEnv::default()),
+            (Ok(McpAccessMode::ReadOnly), ModeSource::Default)
+        );
+    }
+
+    #[test]
+    fn a_quoted_value_is_still_an_assignment() {
+        for cmd in [
+            r#"A="1" ironmem hook stop"#,
+            "A='1' ironmem hook stop",
+            "A=1 ironmem hook stop",
+        ] {
+            assert!(runs_hook(cmd, "stop"), "{cmd}");
+        }
+        assert_eq!(
+            hook_mode(
+                r#"IRONMEM_MCP_MODE="trusted" ironmem hook stop"#,
+                "stop",
+                ModeEnv::default()
+            ),
+            (Ok(McpAccessMode::Trusted), ModeSource::Inline)
+        );
+    }
+
+    #[test]
+    fn env_and_export_read_a_quoted_assignment_after_quote_removal() {
+        // `env` and `export` see the word without its quotes, so to them
+        // it is an assignment.
+        for cmd in [
+            r#"env "IRONMEM_MCP_MODE=trusted" ironmem hook stop"#,
+            r#"export "IRONMEM_MCP_MODE=trusted"; ironmem hook stop"#,
+        ] {
+            assert_eq!(
+                hook_mode(cmd, "stop", ModeEnv::default()),
+                (Ok(McpAccessMode::Trusted), ModeSource::Inline),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]
