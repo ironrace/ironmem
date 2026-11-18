@@ -997,20 +997,27 @@ enum AutopilotCmd {
     /// characters, each part made of letters, digits, `.`, `_` and `-`, not
     /// starting with `-` and not made only of `.`; or it ends in `.git`.
     ///
-    /// The database is missing, cannot be reached or opened, or is not an
-    /// ironmem database; its path cannot be made absolute (an empty `--db`);
-    /// or its absolute path is not UTF-8.
+    /// The database is missing, is a directory, cannot be reached, opened
+    /// or read (a file that is not an ironmem database, a database another
+    /// process holds locked); its path is empty (an empty `--db`, or an
+    /// empty `IRONMEM_DB_PATH` with no `--db`); a relative path cannot be
+    /// made absolute; or its absolute path is not UTF-8.
     ///
-    /// The stored config does not parse, whether it is stored under this
-    /// name or under another spelling of it, or it belongs to another repo
-    /// name; a config is stored under a name that differs only in letter case
-    /// or in whether it names a host (the error names it; two names with
-    /// different hosts never match); or 1000 or more configs are stored and
-    /// none is under this exact name.
+    /// The config stored under this name's storage key does not parse, or
+    /// belongs to another repo name (two names that differ only in `/`
+    /// versus `-` share a key; the error names the other repo and gives no
+    /// command for this one). A config is stored under a name that differs
+    /// only in letter case or in whether it names a host (the error names
+    /// it; a stored name never matches a name on another host). A config
+    /// that does not parse could be this repo's under another spelling (one
+    /// that holds no name is matched by its storage key, which can match a
+    /// name on another host). Or 1000 or more configs are stored and none is
+    /// under this exact name.
     ///
-    /// An ironmem environment setting is invalid (`IRONMEM_MCP_MODE` or
-    /// `IRONMEM_EMBED_MODE`, as for every command that loads the ironmem
-    /// config), or the report could not be written to stdout.
+    /// The ironmem config cannot be loaded, as for every command that loads
+    /// it (`IRONMEM_MCP_MODE` or `IRONMEM_EMBED_MODE` holds a value it does
+    /// not accept, or the home directory cannot be determined), or the
+    /// report could not be written to stdout.
     Status {
         /// Path to the database
         #[arg(long)]
@@ -1637,13 +1644,10 @@ fn open_controller_db(db: Option<String>) -> Result<ironmem::db::schema::Databas
     open_migrated_db(db)
 }
 
-/// Load config, open, and migrate the database — the sequence every
-/// `Autopilot` subcommand handler but `status` needs before touching storage
-/// (`status` reads through a read-only open and never migrates). Several
-/// other command handlers in this file repeat the same three-line sequence
-/// inline rather than through a shared helper; that pre-existing duplication
-/// is out of scope here, but the new `Autopilot` arms at least don't add
-/// to it.
+/// Load config, open, and migrate the database: what every `Autopilot`
+/// subcommand that touches storage needs first, except `status`, which
+/// reads through a read-only open and never migrates. Some command handlers
+/// outside `Autopilot` repeat the same three lines inline.
 fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
     let cfg = config::Config::load(db)?;
     let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
@@ -3608,8 +3612,6 @@ after {n} attempt(s)",
                 // migrates: this command must not create a missing database
                 // or migrate an old one.
                 let read = read_gate_config_status(&cfg.db_path, &repo)?;
-                // Never an error: a label read that fails is part of the
-                // report, and the gate config is still reported.
                 let status = read.with_labels_read_in(std::path::Path::new(&path));
                 let report = if json {
                     format!("{}\n", serde_json::to_string_pretty(&status)?)

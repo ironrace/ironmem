@@ -895,52 +895,98 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   `-`, does not start with `-`, and is not made only of `.`: `owner/..` is
   refused, while `owner/.github`, `owner/a..b` and `owner/repo.` are accepted.
   A name that ends in `.git`, a host with a port and a full URL are refused
-  (`gh` does not resolve the first two). So is a name longer than 200
-  characters or one holding a control character, each with its own message.
-  The name is checked before the database is opened.
+  (`gh` does not resolve the first two). An empty name is refused the same
+  way, and a control character in a refused name is shown escaped (`\n`,
+  `\u{1b}`). A name longer than 200 characters is refused with a message that
+  gives the limit and the name's length and does not repeat the name. The
+  name is checked before the database is opened. A name that starts with `-`
+  is exit 1 only when `--` comes before it; without `--` it is read as a
+  flag, a usage error.
 - **The database cannot be read.** A path with no file at it is
-  `db not found at <path>`, and the message points at `--db <path>` and
-  `IRONMEM_DB_PATH`. A path that cannot be examined (a parent directory this
-  user may not search, say) is `could not reach the database at <path>:
-  <os error>`. A file that is there and cannot be opened is
-  `could not open the database at <path>`. Any other SQLite failure is
-  `could not read the database at <path>: <SQLite's error>`: a file that is
-  not a database, and a database without ironmem's tables, fail this way.
-  Each of these names the database by its absolute path, even when `--db`
-  was relative. A `--db` that names a directory fails with whatever SQLite
-  says about it, which differs by platform. Reading a WAL database from a
-  read-only directory fails when its `-wal`/`-shm` side files are missing,
-  because SQLite cannot create them.
-- **The database path cannot be reported exactly.** An empty `--db` cannot be
-  made absolute. A path whose absolute form is not valid UTF-8 is refused
-  before it is opened: that is a default database under a home directory, or
-  a relative path under a working directory, whose own path is not UTF-8. A
-  `--db` argument that is itself not UTF-8 never gets this far: it is a usage
-  error, exit 2.
-- **The stored config does not parse.** Under the exact name, the error names
-  the repo and the database and gives the `onboard` and `approve` commands,
-  with `--db`, that replace the config. A config that does not parse and
-  could be this repo's under another spelling of its name is an error too,
-  naming the key it is stored under and the database. It is matched by the
-  `repo` the stored config still holds, under the letter-case and host rule
-  below. A config that holds no `repo` naming an owner is matched by the name
-  in its storage key instead, which can also match the name of an unrelated
-  repo: a config that is not JSON, stored for `foo-bar/baz`, makes
-  `status bar/baz` exit 1.
+  `db not found at <path>`; the message points at `--db <path>` and
+  `IRONMEM_DB_PATH`, and says that `onboard` creates a database Autopilot was
+  never set up with. A path that names a directory is
+  `<path> is a directory, not a database file`. A path that cannot be
+  examined (a parent directory this user may not search, say) is
+  `could not reach the database at <path>: <os error>`. A file that is there
+  and cannot be opened is `could not open the database at <path>`. Any other
+  SQLite failure is `could not read the database at <path>: <SQLite's error>`:
+  a file that is not a database, a database without ironmem's tables, and a
+  database another process holds locked all fail this way, the last with
+  `database is locked` and the advice to run the command again. Each of these
+  names the database by its absolute path, even when `--db` was relative.
+  Reading a WAL database from a read-only directory fails when its
+  `-wal`/`-shm` side files are missing, because SQLite cannot create them.
+- **The database path cannot be reported exactly.** An empty path is refused
+  (`the database path is empty`): an empty `--db`, or an empty
+  `IRONMEM_DB_PATH` when `--db` is not given. A relative path cannot be made
+  absolute when the working directory cannot be read (one that was removed,
+  say); the message says to pass an absolute `--db`. A path whose absolute
+  form is not valid UTF-8 is refused before it is opened: that is a default
+  database under a home directory, or a relative path under a working
+  directory, whose own path is not UTF-8. A `--db` argument that is itself
+  not UTF-8 never gets this far: it is a usage error, exit 2.
+- **The stored config does not parse.** A config is stored under a key made
+  from the repo name with each `/` written as `-`, so two names that differ
+  only in `/` versus `-` (`foo-bar/baz` and `foo/bar-baz`) share one key, and
+  the `repo` the stored config still holds is what says whose it is. The
+  error for a config under the asked name's key depends on that `repo`:
+  - It is the name asked about. The error names the repo and the database
+    and gives the `onboard` and `approve` commands, with `--db`, that replace
+    the config.
+  - It names another repo. The error names the key, the database, the parse
+    error and that repo, and says not to onboard the name asked about into
+    this database, because that would replace the other repo's config
+    (#421). It gives no command for the name asked about. When the other
+    name is a repo name stored under that key, the error ends with the
+    `onboard` and `approve` commands that replace the config under that
+    name.
+  - It names no owner: the config is not JSON, holds no `repo` string, or
+    holds one with no `/` or with an empty owner or name part (`/repo`,
+    `owner/`). The error names the key and the database and gives the
+    `onboard` and `approve` commands for the name asked about. When that name
+    holds a `-` or names a host, so that another name could share its key,
+    the error first says that the config may belong to another repo and to
+    check which repo was onboarded into this database before replacing it
+    (#421).
+- **A config that does not parse could be this repo's under another spelling
+  of its name.** This is an error when no config is stored under the asked
+  name's own key. It names each such config by the key it is stored under,
+  gives its parse error and names the database. A config is matched by the
+  `repo` it still holds, under the letter-case and host rule below. One whose
+  `repo` names no owner is matched by the name in its storage key instead,
+  which can also match the name of an unrelated repo, one on another host
+  included: a config that is not JSON, stored for `foo-bar/baz`, makes
+  `status bar/baz` exit 1, and one stored for `my-ghe/owner/repo` makes
+  `status ghe/owner/repo` exit 1. The error ends with how to replace each
+  config. For one whose `repo` is a repo name stored under that key, it is
+  `ironmem autopilot onboard <that name> --path . --db <db>`, run from that
+  repo's checkout. For any other, it is `onboard` with the name the repo was
+  onboarded under, which the key gives only as `gate-config:` followed by
+  that name with each `/` written as `-`.
 - **A config is stored under another spelling of the name**: one that differs
   only in letter case, or in whether it names a host. The error names the
   stored name. When a config that parses and one that does not both match,
   this is the error reported.
-- **The stored config belongs to another repo name.** Two names that differ
-  only in `/` versus `-` share one storage key.
+- **The stored config belongs to another repo name.** The config under the
+  asked name's key parses, and its `repo` is not the name asked about: two
+  names that differ only in `/` versus `-` share one storage key. The error
+  names the key, the database and the repo the config belongs to, and says
+  not to onboard the name asked about into this database, because that would
+  replace the other repo's config (#421); use a separate database (`--db`)
+  for one of the two. A config under that key that does not parse and names
+  another repo is refused the same way, as described above.
 - **1000 or more gate configs are stored and none is under the exact name.**
   `status` compares fewer than that with the name, so it cannot rule out a
   config stored under another spelling (#426). A repo asked about by the exact
   name it was onboarded under is still answered.
-- **An ironmem environment setting is invalid**: `IRONMEM_MCP_MODE` or
-  `IRONMEM_EMBED_MODE`, as for every command that loads the ironmem config.
+- **The ironmem config cannot be loaded**, as for every command that loads
+  it: `IRONMEM_MCP_MODE` or `IRONMEM_EMBED_MODE` holds a value it does not
+  accept, or the home directory cannot be determined.
 - **The report cannot be written to stdout** (a closed pipe, a full disk):
-  `could not write the report to stdout: <os error>`.
+  `could not write the report to stdout: <os error>`. A stdout that was
+  closed before `status` started (`>&-`) is not noticed: the report is
+  discarded and the exit is 0.
 
 `--json` prints this shape:
 
@@ -975,10 +1021,13 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   names a host (`github.com/owner/repo` and `owner/repo`), exits 1 and names
   the stored one, because `gh` can read those as the same repository: it
   reads a name without a host against its default host, which `GH_HOST`
-  changes. Two names with different hosts are different repositories and are
-  never confused, so a same-named repo on another host is asked about with
-  its host. When the error is about a host on one side only and the repo
-  asked about is on another host, it is not onboarded; the error says so.
+  changes. A stored name and an asked name with different hosts are
+  different repositories and never match, so a same-named repo on another
+  host is asked about with its host. That holds for stored names: a config
+  that does not parse and holds no name is matched by its storage key, which
+  can match a name on another host (see exit 1 above). When the error is
+  about a host on one side only and the repo asked about is on another host,
+  it is not onboarded; the error says so.
   A three-part name is read as `host/owner/name`. The characters a name may
   hold are listed under exit 1 above.
 - A pending config has `"approved_at": null`. Both fields are reported as
@@ -992,16 +1041,21 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   `{"read": "failed", "error": "<what failed>"}` with no `agent` or `risk`
   key. A failed read says nothing about which labels exist. That is the
   report when `gh` is missing, exits non-zero (authentication, a rate limit,
-  an unknown repo), is killed by a signal, prints something that is not the
-  expected JSON, lists a label with no name, or returns 1000 or more labels,
-  a list long enough to have been cut off (#426). It is also the report when
-  `--path` is missing, is not a directory or cannot be examined: `gh` is then
-  not run, and the error says so.
+  an unknown repo), is killed by a signal, exits 0 without printing a label
+  list (nothing at all, something that is not the expected JSON, or a label
+  with no name), or returns 1000 or more labels, a list long enough to have
+  been cut off (#426). It is also the report when `--path` is missing, is not
+  a directory or cannot be examined: `gh` is then not run, and the error says
+  so. A `--path` that is a directory this user cannot enter is a failed read
+  of another kind: `gh` is started there and the start fails, and the error
+  names the directory.
 - `labels.error` is a plain sentence, with no `Not found:` or
   `Validation error:` in front. For a `gh` that exited non-zero it gives the
   exit code and what `gh` printed on stderr, and points at `gh auth status`.
-  For a list that may have been cut off it gives the command that checks one
-  label, `gh label list --repo <repo> --search <label> --json name`.
+  For a `gh` that exited 0 without a label list it says what was wrong with
+  the output and adds what `gh` printed on stderr, if anything. For a list
+  that may have been cut off it gives the command that checks one label,
+  `gh label list --repo <repo> --search <label> --json name`.
 - `labels.agent` keys are always the three lowercase names. `labels.risk`
   entries are spelled as they are on GitHub, not lowercased: a repo's
   `Risk:Logic` label is listed as `Risk:Logic`. GitHub label names are
