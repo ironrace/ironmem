@@ -995,7 +995,8 @@ enum AutopilotCmd {
     /// refused too), the database is missing, not an ironmem database or not
     /// readable, the stored config does not parse or belongs to another repo
     /// name, a config is stored under a name that differs only in letter case
-    /// or host prefix (the error names it), or an ironmem environment setting
+    /// or in whether it names a host (the error names it; two names with
+    /// different hosts never match), or an ironmem environment setting
     /// is invalid (for example `IRONMEM_MCP_MODE`, as for every command).
     /// 2 for a usage error.
     Status {

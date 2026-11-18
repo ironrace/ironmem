@@ -212,8 +212,10 @@ pub(super) fn gate_config_key(repo: &str) -> String {
 }
 
 /// The `repo` of every stored gate config, read-only (#420). A row that does
-/// not parse is skipped: it belongs to some other repo, and a read of that
-/// repo's own name reports it. An error when the listing reaches
+/// not parse is skipped: its repo name cannot be read, and a read of the name
+/// it is stored under reports it. A row marked superseded is listed, because
+/// the read by name ([`get_gate_config_read_only`]) is a lookup by id that
+/// returns such a row too. An error when the listing reaches
 /// [`STORED_GATE_CONFIG_LIMIT`], since a possibly incomplete list cannot show
 /// that no near-match exists.
 pub fn stored_gate_config_repos_read_only(db: &ReadOnlyDb) -> Result<Vec<String>, MemoryError> {

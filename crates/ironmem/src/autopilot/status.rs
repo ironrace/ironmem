@@ -165,8 +165,9 @@ impl LabelStatus {
 /// Measured against `gh` 2.96.0 for `gh label list --repo`: a different
 /// letter case and a `github.com/` prefix both resolve to the same repository
 /// (which is why [`read_gate_config_status`] refuses them as near-misses of a
-/// stored name); a `.git` suffix and `host:port` do not resolve; and a
-/// dash-led value is read as a repo name, not as a flag.
+/// stored name); a name without a host is read against `GH_HOST` when that is
+/// set; a `.git` suffix and `host:port` do not resolve; and a dash-led value
+/// is read as a repo name, not as a flag.
 fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
     validate_repo(repo)?;
     let segments: Vec<&str> = repo.split('/').collect();
@@ -202,11 +203,12 @@ fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
 /// repo is reported even when the database is missing, and a SQLite failure
 /// is explained rather than passed through bare.
 ///
-/// `Ok(None)` means no gate config is stored under this name or under any
-/// spelling of it. When one is stored under a spelling `gh` treats as the same
-/// repository (a different letter case, or a host prefix on either side), this
-/// is an error naming the stored name instead, so a repo that is onboarded is
-/// never reported as "not onboarded".
+/// `Ok(None)` means no gate config is stored under this name, and none that
+/// parses under another spelling of it. When one is stored under a spelling
+/// `gh` can read as the same repository (a different letter case, or a host
+/// on one side only), this is an error naming the stored name instead, so a
+/// repo onboarded under another spelling is not reported as "not onboarded".
+/// Two names with different hosts are different repositories and never match.
 pub fn read_gate_config_status(
     db_path: &Path,
     repo: &str,
@@ -232,9 +234,10 @@ pub fn read_gate_config_status(
     if status.is_some() {
         return Ok(status);
     }
-    // No config under this exact name. `gh` treats a different letter case or
-    // a host prefix as the same repository, so a config stored under one of
-    // those spellings means the repo IS onboarded, under another name.
+    // No config under this exact name. `gh` can read a different letter case,
+    // or a name with a host and one without, as the same repository, so a
+    // config stored under one of those spellings means the repo may already
+    // be onboarded under another name.
     let near: Vec<String> = stored_gate_config_repos_read_only(&db)
         .map_err(explain)?
         .into_iter()
@@ -248,29 +251,53 @@ pub fn read_gate_config_status(
         .map(|name| format!("'{name}'"))
         .collect::<Vec<_>>()
         .join(", ");
+    // Only one side naming a host is the one case that may be two
+    // repositories, so the error says what is true if it is.
+    let asked_names_host = names_a_host(repo);
+    let other_host = if near
+        .iter()
+        .any(|stored| names_a_host(stored) != asked_names_host)
+    {
+        format!(" (if '{repo}' is a different repository on another host, it is not onboarded)")
+    } else {
+        String::new()
+    };
     Err(MemoryError::Validation(format!(
         "'{repo}' has no gate config under that exact name, but one is stored for {names}, \
-         which differs only in letter case or host prefix — ask with the stored name"
+         which differs only in letter case or host prefix — ask with the stored name{other_host}"
     )))
 }
 
-/// The owner and name of `repo`: its last two `/`-separated segments, ASCII
-/// lowercased. A host prefix is dropped, so `github.com/Owner/Repo` and
-/// `owner/repo` have the same identity.
-fn repo_identity(repo: &str) -> Option<(String, String)> {
+/// The host (when the name has one), owner and name of `repo`: its last three
+/// `/`-separated segments, ASCII lowercased. `None` for a string with no `/`.
+fn repo_identity(repo: &str) -> Option<(Option<String>, String, String)> {
     let mut segments = repo.rsplit('/');
-    let name = segments.next()?;
-    let owner = segments.next()?;
-    Some((owner.to_ascii_lowercase(), name.to_ascii_lowercase()))
+    let name = segments.next()?.to_ascii_lowercase();
+    let owner = segments.next()?.to_ascii_lowercase();
+    let host = segments.next().map(str::to_ascii_lowercase);
+    Some((host, owner, name))
 }
 
-/// Whether two repo strings could name the same repository: same owner and
-/// name ignoring ASCII case and any host prefix.
+/// Whether `repo` is a `host/owner/name` rather than an `owner/name`.
+fn names_a_host(repo: &str) -> bool {
+    matches!(repo_identity(repo), Some((Some(_), _, _)))
+}
+
+/// Whether two repo strings could name the same repository: the same owner
+/// and name ignoring ASCII case, and not two different hosts. A name without
+/// a host matches any host, because `gh` reads it against its default host,
+/// which is not known here.
 fn same_repository(a: &str, b: &str) -> bool {
-    match (repo_identity(a), repo_identity(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => false,
-    }
+    let (Some((host_a, owner_a, name_a)), Some((host_b, owner_b, name_b))) =
+        (repo_identity(a), repo_identity(b))
+    else {
+        return false;
+    };
+    let hosts_may_match = match (host_a, host_b) {
+        (Some(host_a), Some(host_b)) => host_a == host_b,
+        _ => true,
+    };
+    owner_a == owner_b && name_a == name_b && hosts_may_match
 }
 
 /// An I/O failure naming `db_path`, with a hint only for the SQLite errors the
@@ -916,6 +943,81 @@ mod tests {
         assert_eq!(read_gate_config_status(&path, "xowner/repo").unwrap(), None);
         let (_dir, path) = db_with_configs(&["other/thing"]);
         assert_eq!(read_gate_config_status(&path, "owner/repo").unwrap(), None);
+    }
+
+    #[test]
+    fn two_names_with_different_hosts_are_different_repositories() {
+        let (_dir, path) = db_with_configs(&["ghe.example.com/owner/repo"]);
+        for asked in ["github.com/owner/repo", "github.com/Owner/Repo"] {
+            assert_eq!(
+                read_gate_config_status(&path, asked).unwrap(),
+                None,
+                "{asked}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_host_in_another_letter_case_is_a_near_miss() {
+        let message = near_miss_message(&["github.com/owner/repo"], "GitHub.com/Owner/repo");
+        assert!(message.contains("'github.com/owner/repo'"), "{message}");
+    }
+
+    #[test]
+    fn a_near_miss_that_could_be_another_host_says_so() {
+        // `gh` reads a name without a host against its default host, which
+        // `GH_HOST` changes, so only one side naming a host is ambiguous.
+        for (stored, asked) in [
+            ("ghe.example.com/owner/repo", "owner/repo"),
+            ("owner/repo", "ghe.example.com/owner/repo"),
+        ] {
+            let message = near_miss_message(&[stored], asked);
+            assert!(
+                message.contains(&format!(
+                    "if '{asked}' is a different repository on another host, it is not onboarded"
+                )),
+                "{message}"
+            );
+        }
+        // Letter case alone is never another host.
+        for (stored, asked) in [
+            ("owner/repo", "Owner/Repo"),
+            ("github.com/owner/repo", "github.com/Owner/Repo"),
+        ] {
+            let message = near_miss_message(&[stored], asked);
+            assert!(!message.contains("another host"), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_superseded_config_row_reads_the_same_by_name_and_as_a_near_miss() {
+        // Autopilot never supersedes a gate config, but `add_drawer`'s
+        // `supersedes` can mark any row. The read by name is a lookup by id
+        // that ignores the mark, so the listing must ignore it too, or the two
+        // would disagree about one row.
+        let (_dir, path) = db_with_configs(&["owner/repo"]);
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            let changed = conn
+                .execute(
+                    "UPDATE drawers SET superseded_by = 'some-successor' \
+                     WHERE wing = 'autopilot' AND room = 'backlog-lineage' \
+                     AND source_file LIKE 'logical:gate-config:%'",
+                    [],
+                )
+                .unwrap();
+            assert_eq!(changed, 1, "the UPDATE must hit the gate config row");
+        }
+
+        assert!(read_gate_config_status(&path, "owner/repo")
+            .unwrap()
+            .is_some());
+        match read_gate_config_status(&path, "Owner/Repo") {
+            Err(MemoryError::Validation(message)) => {
+                assert!(message.contains("'owner/repo'"), "{message}")
+            }
+            other => panic!("expected the near-miss error, got {other:?}"),
+        }
     }
 
     #[test]

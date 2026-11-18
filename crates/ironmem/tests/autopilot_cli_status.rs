@@ -760,3 +760,36 @@ fn a_git_suffix_exits_one() {
 
     assert_unreadable(&fixture, &output, &["drop the `.git` suffix"]);
 }
+
+#[test]
+fn a_host_with_a_port_and_a_full_url_exit_one() {
+    // Each ends in the onboarded `owner/repo`, so a status that stopped
+    // refusing the shape would answer with that repo's near-miss error
+    // instead; the message pins which rule refused it.
+    for name in [
+        "ghe.example.com:8443/owner/repo",
+        "https://github.com/owner/repo",
+        "git@github.com:owner/repo",
+    ] {
+        let fixture = Fixture::new();
+        fixture.propose(REPO, &["cargo test"]);
+
+        let output = fixture
+            .command(
+                name,
+                &fixture.db_path(),
+                fixture.root.path(),
+                &isolated_path(&fixture.stubs()),
+                ALL_LABELS,
+                None,
+            )
+            .output()
+            .unwrap();
+
+        assert_unreadable(
+            &fixture,
+            &output,
+            &[&format!("'{name}' is not a repo name")],
+        );
+    }
+}
