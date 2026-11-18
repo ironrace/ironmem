@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not "not onboarded". A
   `gh` failure is reported as a failed label read, not as missing
   labels. `/evaluate-issue` now reads the gate config from this command
-  instead of from Autopilot's drawer.
+  instead of from Autopilot's drawer, and when a phase-2 remainder is lost
+  to a missing prerequisite or a failed read, it says so under *Why*.
 
 ### Changed
 

@@ -99,9 +99,11 @@ Goal: a rough estimate of how much code the issue touches.
      A GOAL command's condition is built from those `gate_commands`.
      Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
      A `gate_config` of `null` is a repo not onboarded under that exact name
-     in the database the report names in `db`: a name spelled differently
-     (letter case included) or another database reads the same way. A `state`
-     of `"pending"` is a proposal nobody has approved.
+     in the database the report names in `db`; a repo onboarded in another
+     database reads the same way. A name that differs from an onboarded one
+     only in letter case, or in whether it names a host, does not read as
+     `null`: `status` exits 1 and names the stored name, which is a failed
+     read. A `state` of `"pending"` is a proposal nobody has approved.
      Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
      A non-zero exit, a run that could not be made, output that is not JSON, or a report that fits none of the three states above is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
      An `ironmem` missing from `PATH` or older than `status` fails this way; the fix is a current install.
@@ -304,7 +306,9 @@ verdict when **all** hold:
 - the remainder is a substantial share of the work — roughly half the effort
   or more — so pricing the whole issue at phase 1's cost would overspend
 
-Otherwise the verdict stays single. There are never more than two phases, and
+Otherwise the verdict stays single.
+When the remainder would meet rule 1 or rule 3 but for a prerequisite, a failed read included, keep the single verdict and add that rule's `Missing AUTOPILOT prerequisite:` or `Missing GOAL prerequisite:` line to *Why*.
+There are never more than two phases, and
 phase 2 is always GOAL or AUTOPILOT. A phase-2 AUTOPILOT runs on a remainder
 issue of its own, which the user opens after phase 1 merges so that it can
 cite phase 1's PR. At phase-1 time the router only drafts that issue (the

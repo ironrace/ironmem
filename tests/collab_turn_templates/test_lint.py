@@ -807,6 +807,9 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `\"approved\"`; keep that object's `gate_commands`.",
     "failed `status` read gets neither command: its fix line gives the command that was run, its exit status if it had one, and its error; for an `ironmem` that is missing or too old, it also says to install a current one.",
     "with the fix rule 1 gives for that state (not onboarded, pending, or a failed `status` read)",
+    # Rule 6 judges the remainder, not the issue, so without this a phase 2
+    # lost to a missing prerequisite or a failed read left no line in *Why*.
+    "When the remainder would meet rule 1 or rule 3 but for a prerequisite, a failed read included, keep the single verdict and add that rule's `Missing AUTOPILOT prerequisite:` or `Missing GOAL prerequisite:` line to *Why*.",
     "Never infer gate commands from the repo.",
     "For both `gh label list` reads, a non-zero exit, an auth error or a rate limit is a failed read: it counts as not meeting the requirement, and the router reports it as a failed read, naming the command and its error, never as a missing label and with no label-creation fix line.",
     "Labels that could not be read count as not meeting this requirement.",

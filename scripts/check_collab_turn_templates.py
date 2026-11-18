@@ -610,6 +610,10 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "current one.",
     "with the fix rule 1 gives for that state (not onboarded, pending, or a "
     "failed `status` read)",
+    "When the remainder would meet rule 1 or rule 3 but for a prerequisite, a "
+    "failed read included, keep the single verdict and add that rule's "
+    "`Missing AUTOPILOT prerequisite:` or `Missing GOAL prerequisite:` line "
+    "to *Why*.",
     "Never infer gate commands from the repo.",
     "For both `gh label list` reads, a non-zero exit, an auth error or a rate "
     "limit is a failed read: it counts as not meeting the requirement, and the "

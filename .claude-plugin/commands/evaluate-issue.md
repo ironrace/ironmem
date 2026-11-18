@@ -196,7 +196,9 @@ not justify COLLAB — it drives the review tier recommendation instead.
    `<COLLAB | IRON> → <GOAL | AUTOPILOT>` when **all** hold: phase 1 settles
    every decision the remainder depends on; the remainder, judged as if phase
    1 had merged, meets rule 1 or rule 3 on its own, prerequisites included;
-   the remainder is roughly half the effort or more. Never more than two
+   the remainder is roughly half the effort or more.
+   When the remainder would meet rule 1 or rule 3 but for a prerequisite, a failed read included, keep the single verdict and add that rule's `Missing AUTOPILOT prerequisite:` or `Missing GOAL prerequisite:` line to *Why*.
+   Never more than two
    phases; phase 2 is always GOAL or AUTOPILOT. A phase-2 AUTOPILOT runs on
    a remainder issue of its own, which the user opens after phase 1 merges so
    that it can cite phase 1's PR. At phase-1 time the router only drafts that
