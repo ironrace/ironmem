@@ -521,9 +521,12 @@ impl App {
     /// Insert a single embedding into the live HNSW index without a full rebuild.
     /// Falls back to a full rebuild from DB if the index is at capacity.
     ///
-    /// An embedding with no usable norm (all zeros, or a non-finite norm) is
-    /// not inserted, for the reason given on `Database::load_all_vectors`,
-    /// which leaves the same rows out of every rebuild.
+    /// An embedding with no usable norm is not inserted, for the reason given
+    /// on `Database::load_all_vectors`, which leaves the same rows out of
+    /// every rebuild and classifies them the same way
+    /// (`crate::db::drawers::embedding_norm`): an all-zero embedding is
+    /// skipped at `debug`, any other unusable one with a `warn` naming the
+    /// drawer.
     pub fn insert_into_index(&self, drawer_id: &str, embedding: &[f32]) -> Result<(), MemoryError> {
         let mut state = self
             .index_state
@@ -539,7 +542,22 @@ impl App {
             return Ok(());
         }
 
-        if crate::db::drawers::vector_norm(embedding).is_none() {
+        let usable = match crate::db::drawers::embedding_norm(embedding) {
+            crate::db::drawers::EmbeddingNorm::Usable(_) => true,
+            crate::db::drawers::EmbeddingNorm::Zero => {
+                tracing::debug!(drawer_id = %drawer_id, "all-zero embedding left out of the vector index");
+                false
+            }
+            crate::db::drawers::EmbeddingNorm::Unusable => {
+                tracing::warn!(
+                    drawer_id = %drawer_id,
+                    "drawer left out of the vector index: its embedding has no usable norm \
+                     (a non-finite value, or a norm that overflows or underflows)"
+                );
+                false
+            }
+        };
+        if !usable {
             drop(state);
             // The drawer is new to the wing/room graph even though it has no
             // place in the vector index.
@@ -1136,6 +1154,27 @@ mod tests {
         crate::search::pipeline::search(&app, "content", &filters).unwrap();
         assert!(!app.dirty.load(Ordering::Acquire));
         assert_eq!(indexed_ids(&app), ["n1", "n2"]);
+    }
+
+    /// A damaged embedding is a warning naming the drawer; a deliberate zero
+    /// vector is not. Neither is indexed.
+    #[test]
+    fn insert_into_index_warns_for_a_damaged_embedding_but_not_a_zero_one() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+
+        let app = App::open_for_test().unwrap();
+        store(&app, "z1", &zero_vector());
+        let ((), log) = with_captured_log(|| app.insert_into_index("z1", &zero_vector()).unwrap());
+        assert!(!log.contains("WARN"), "{log}");
+
+        let mut nan = unit_axis(4);
+        nan[0] = f32::NAN;
+        store(&app, "nan1", &nan);
+        let ((), log) = with_captured_log(|| app.insert_into_index("nan1", &nan).unwrap());
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("drawer_id=nan1"), "{log}");
+        assert!(indexed_ids(&app).is_empty());
     }
 
     #[test]

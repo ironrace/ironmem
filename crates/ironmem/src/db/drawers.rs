@@ -1487,6 +1487,36 @@ pub(crate) fn vector_norm(embedding: &[f32]) -> Option<f32> {
     (norm.is_finite() && norm > 0.0).then_some(norm)
 }
 
+/// What an embedding's norm makes of it, for the vector index and for exact
+/// cosine scoring. [`embedding_norm`] is the one place that decides it, so
+/// the index rebuild, the single-drawer index insert and the scoped search
+/// cannot disagree about which rows are damaged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum EmbeddingNorm {
+    /// A finite, non-zero norm: the vector has a direction to score.
+    Usable(f32),
+    /// Every component is zero (`0.0` or `-0.0`). Autopilot and collab rows,
+    /// and anything the noop embedder wrote, carry one on purpose: it means
+    /// "no vector", not damage, so skipping it is silent.
+    Zero,
+    /// No usable norm for any other reason: an empty vector, a NaN or
+    /// infinite component, or a sum of squares that overflows `f32` or
+    /// rounds to zero although some component is not zero. Damage, worth a
+    /// warning.
+    Unusable,
+}
+
+/// Classify `embedding` by its norm (see [`EmbeddingNorm`]).
+pub(crate) fn embedding_norm(embedding: &[f32]) -> EmbeddingNorm {
+    if let Some(norm) = vector_norm(embedding) {
+        EmbeddingNorm::Usable(norm)
+    } else if !embedding.is_empty() && embedding.iter().all(|value| *value == 0.0) {
+        EmbeddingNorm::Zero
+    } else {
+        EmbeddingNorm::Unusable
+    }
+}
+
 /// Cosine similarity of `a` and `b`, given their norms (from [`vector_norm`]),
 /// or `None` when the result is not finite. The caller must check that the
 /// lengths match: the dot product stops at the shorter of the two.
@@ -2449,6 +2479,70 @@ mod tests {
         assert_eq!(ids, ["real"]);
         // The rows themselves are untouched.
         assert!(db.get_drawer("zero").unwrap().is_some());
+    }
+
+    #[test]
+    fn embedding_norm_tells_a_deliberate_zero_vector_from_damage() {
+        let dim = ironrace_embed::embedder::EMBED_DIM;
+        let mut unit = vec![0.0; dim];
+        unit[3] = 1.0;
+        assert_eq!(embedding_norm(&unit), EmbeddingNorm::Usable(1.0));
+        assert_eq!(embedding_norm(&vec![0.0; dim]), EmbeddingNorm::Zero);
+        assert_eq!(embedding_norm(&vec![-0.0; dim]), EmbeddingNorm::Zero);
+
+        let mut nan = unit.clone();
+        nan[0] = f32::NAN;
+        let mut infinite = unit.clone();
+        infinite[0] = f32::INFINITY;
+        let mut nan_otherwise_zero = vec![0.0; dim];
+        nan_otherwise_zero[0] = f32::NAN;
+        for (what, embedding) in [
+            ("a NaN component", nan),
+            ("an infinite component", infinite),
+            ("a NaN among zeros", nan_otherwise_zero),
+            // Finite components whose sum of squares overflows `f32`.
+            ("an overflowing norm", vec![1e20; dim]),
+            // Non-zero components whose squares round to zero.
+            ("an underflowing norm", vec![1e-30; dim]),
+            ("an empty vector", Vec::new()),
+        ] {
+            assert_eq!(
+                embedding_norm(&embedding),
+                EmbeddingNorm::Unusable,
+                "{what}"
+            );
+        }
+    }
+
+    /// A damaged embedding is a warning naming the drawer; a deliberate zero
+    /// vector is not. Neither is indexed.
+    #[test]
+    fn load_all_vectors_warns_for_a_damaged_embedding_but_not_a_zero_one() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+
+        let db = Database::open_in_memory().unwrap();
+        let dim = ironrace_embed::embedder::EMBED_DIM;
+        let mut nan = dummy_embedding();
+        nan[5] = f32::NAN;
+        db.insert_drawer("real", "c", &dummy_embedding(), "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("zero-row", "c", &vec![0.0; dim], "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("nan-row", "c", &nan, "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("overflow-row", "c", &vec![1e20; dim], "w", "r", "", "mcp")
+            .unwrap();
+
+        let (vectors, log) = with_captured_log(|| db.load_all_vectors().unwrap());
+        let ids: Vec<&str> = vectors.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["real"]);
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 2, "{log}");
+        for id in ["nan-row", "overflow-row"] {
+            let named = format!("drawer_id={id}");
+            assert!(warnings.iter().any(|line| line.contains(&named)), "{log}");
+        }
+        assert!(!log.contains("zero-row"), "{log}");
     }
 
     #[test]

@@ -802,14 +802,18 @@ impl Database {
 
     /// Load the vectors the HNSW index is built from, as (id, embedding) pairs.
     ///
-    /// A drawer whose embedding has no usable norm (all zeros: Autopilot and
-    /// collab rows, or anything written by the noop embedder; also a
-    /// non-finite norm) is left out. The index's cosine distance is 0 against
-    /// a zero vector, so such a row would match every query perfectly. Those
-    /// drawers stay in the table and can still be read by id. Autopilot
-    /// backlog-lineage rows and collab plans and task lists are still found by
-    /// keyword search; collab messages never were, since `insert_drawer` keeps
-    /// them out of the keyword index.
+    /// A drawer whose embedding has no usable norm is left out
+    /// (`crate::db::drawers::embedding_norm` decides). The index's cosine
+    /// distance is 0 against a zero vector, so such a row would match every
+    /// query perfectly. An all-zero embedding (Autopilot and collab rows, or
+    /// anything written by the noop embedder) is deliberate and is only
+    /// counted at `debug`; any other unusable norm (a NaN or infinite
+    /// component, a norm that overflows or underflows) is damage, and each
+    /// such drawer gets a `warn` naming its id. Either way the drawers stay
+    /// in the table and can still be read by id. Autopilot backlog-lineage
+    /// rows and collab plans and task lists are still found by keyword
+    /// search; collab messages are not, since `insert_drawer` keeps them out
+    /// of the keyword index.
     pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
         let mut stmt = self.conn.prepare("SELECT id, embedding FROM drawers")?;
 
@@ -854,20 +858,23 @@ impl Database {
 
         let mut result = Vec::new();
         let mut skipped = 0usize;
-        let mut no_norm = 0usize;
+        let mut zero = 0usize;
         for row in rows {
             match row {
-                Ok((_, embedding)) if crate::db::drawers::vector_norm(&embedding).is_none() => {
-                    no_norm += 1;
-                }
-                Ok(item) => result.push(item),
+                Ok((id, embedding)) => match crate::db::drawers::embedding_norm(&embedding) {
+                    crate::db::drawers::EmbeddingNorm::Usable(_) => result.push((id, embedding)),
+                    crate::db::drawers::EmbeddingNorm::Zero => zero += 1,
+                    crate::db::drawers::EmbeddingNorm::Unusable => tracing::warn!(
+                        drawer_id = %id,
+                        "drawer left out of the index: its embedding has no usable norm \
+                         (a non-finite value, or a norm that overflows or underflows)"
+                    ),
+                },
                 Err(_) => skipped += 1,
             }
         }
-        if no_norm > 0 {
-            tracing::debug!(
-                "{no_norm} drawer(s) left out of the index: zero (or non-finite) embedding norm"
-            );
+        if zero > 0 {
+            tracing::debug!("{zero} drawer(s) left out of the index: all-zero embedding");
         }
         if skipped > 0 {
             tracing::warn!(
