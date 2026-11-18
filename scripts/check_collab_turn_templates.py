@@ -629,10 +629,12 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "which must still be on the issue when `advance` runs",
     "once that dispatch has succeeded and pushed its branch",
     "acts on every succeeded `agent:ready` issue in the repo, not only this one.",
-    "A name that differs from an onboarded one only in letter case, or in "
-    "whether it names a host, exits 1 naming the stored name; a stored config "
-    "that does not parse, under that name or another spelling of it, exits 1 "
-    "too: both are failed reads, not `null`.",
+    "When no config is stored under that exact name, a name that differs from "
+    "an onboarded one only in letter case, or in whether it names a host, "
+    "exits 1 naming the stored name, and a name that a stored config that "
+    "does not parse could be another spelling of exits 1 too; a config that "
+    "does not parse under the exact name exits 1 whatever else is stored: "
+    "each is a failed read, not `null`.",
     "`ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`",
     "`ironmem autopilot approve <owner>/<repo> --db '<db>'`",
     "`ironmem autopilot labels <owner>/<repo>`",

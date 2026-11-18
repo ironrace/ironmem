@@ -75,7 +75,7 @@ tracing.**
      the database the report names in `db` (a repo onboarded in another
      database reads the same way); a `state` of `"pending"` is a proposal
      nobody has approved.
-     A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name; a stored config that does not parse, under that name or another spelling of it, exits 1 too: both are failed reads, not `null`.
+     When no config is stored under that exact name, a name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name, and a name that a stored config that does not parse could be another spelling of exits 1 too; a config that does not parse under the exact name exits 1 whatever else is stored: each is a failed read, not `null`.
      Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
      A non-zero exit, a run that could not be made, output that is not JSON, or a report that is none of approved, pending or `null` is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
      An `ironmem` missing from `PATH` or too old to have the `status` subcommand fails this way; the fix is a current install.
