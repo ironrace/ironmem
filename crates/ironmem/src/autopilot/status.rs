@@ -949,7 +949,9 @@ impl LabelSet {
 
 impl LabelStatus {
     /// Read `repo`'s labels through `gh`. Never an `Err`: every failure is
-    /// [`LabelStatus::Failed`], worded without a [`MemoryError`] prefix.
+    /// [`LabelStatus::Failed`], worded without the `Not found:` or
+    /// `Validation error:` prefix its variant would add (see
+    /// [`bare_message`]).
     fn read(gh: &mut dyn GhRunner, repo: &RepoName) -> Self {
         match repo_labels(gh, repo.as_str()) {
             Ok(names) => Self::Ok(LabelSet::from_names(&names)),
@@ -988,10 +990,10 @@ fn bare_message(err: MemoryError) -> String {
 /// repo onboarded under another spelling is not reported as "not onboarded".
 /// A stored config that does not parse and could be this repo's is an error
 /// too, whether it is under this name's storage key or under another
-/// spelling. Two stored names with different hosts are different
-/// repositories and never match. A config that does not parse and holds no
-/// name is matched by the slug in its key instead, and that can match a name
-/// on another host.
+/// spelling. A stored name and an asked name with different hosts are
+/// different repositories and never match. A config that does not parse and
+/// holds no name is matched by the slug in its key instead, and that can
+/// match a name on another host.
 ///
 /// Under this name's own storage key, a config is this repo's only when the
 /// `repo` it holds says so, because every name that reduces to the same slug

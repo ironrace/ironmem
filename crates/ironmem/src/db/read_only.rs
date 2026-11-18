@@ -28,6 +28,24 @@ use crate::report::{run_report, Report, ReportOptions};
 ///
 /// Exposes only read/query methods. Write and migrate methods on [`Database`]
 /// are unreachable through this type, so misuse is caught at compile time.
+/// A read compiles:
+///
+/// ```
+/// # use ironmem::db::read_only::ReadOnlyDb;
+/// fn reads(ro: &ReadOnlyDb) {
+///     ro.schema_version().unwrap();
+/// }
+/// ```
+///
+/// The same function calling a write method does not. The two examples
+/// differ only in the method, so the method is why this one is refused:
+///
+/// ```compile_fail
+/// # use ironmem::db::read_only::ReadOnlyDb;
+/// fn writes(ro: &ReadOnlyDb) {
+///     ro.migrate().unwrap();
+/// }
+/// ```
 pub struct ReadOnlyDb {
     pub(super) inner: Database,
 }
@@ -157,21 +175,11 @@ mod tests {
         assert_eq!(found[0].content, "wanted");
     }
 
-    /// Documents that `ReadOnlyDb` exposes the read methods its callers (the
-    /// dashboard and `ironmem autopilot status`) need and that they return the
-    /// same data as the underlying `Database`.
-    ///
-    /// The compile-time guarantee is the real contract: a write method (e.g.
-    /// `ro.insert_drawer(..)` or `ro.migrate()`) does not exist on `ReadOnlyDb`,
-    /// so it cannot be called through one. The commented line below would
-    /// fail to compile if uncommented:
-    ///
-    /// ```compile_fail
-    /// # use ironmem::db::read_only::ReadOnlyDb;
-    /// fn writes(ro: &ReadOnlyDb) {
-    ///     ro.migrate().unwrap();
-    /// }
-    /// ```
+    /// `ReadOnlyDb` exposes the read methods its callers (the dashboard and
+    /// `ironmem autopilot status`) need, and they return the same data as the
+    /// underlying `Database`. That a write method cannot be called through
+    /// one is a compile-time property, checked by the `compile_fail` example
+    /// in the rustdoc of [`ReadOnlyDb`].
     #[test]
     fn read_only_db_exposes_reads_only() {
         // Build a populated DB, then re-open it read-only.

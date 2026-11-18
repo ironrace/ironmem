@@ -750,9 +750,10 @@ fn parse_label_list(stdout: &str) -> Result<Vec<String>, MemoryError> {
 /// Its own wording, not [`GhOutput::require_success`]'s: the exit code is
 /// printed as a number, a `gh` that a signal killed (no exit code) is called
 /// that, and a failure that printed nothing says so instead of ending in a
-/// bare colon. The `gh auth status` pointer goes on every exit, because an
-/// expired or missing token is the common cause and `gh`'s own message for
-/// it names an HTTP status, not the remedy.
+/// bare colon. The `gh auth status` pointer goes on every non-zero exit and
+/// not on a signal kill: an expired or missing token is a common cause of
+/// the first, and the pointer is worded as a condition ("if the cause is
+/// authentication") because the exit code does not say which cause it was.
 fn label_list_failure(repo: &str, out: &GhOutput) -> String {
     let said = out.stderr.trim();
     let what = format!("gh label list on {repo}");

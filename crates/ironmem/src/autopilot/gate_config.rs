@@ -273,7 +273,7 @@ impl BrokenGateConfig {
     }
 
     /// The row's own `repo`, when its content is a JSON object that holds one
-    /// as a string. `None` for content that is not JSON, or has no such field.
+    /// as a string. `None` otherwise.
     pub fn repo(&self) -> Option<&str> {
         self.repo.as_deref()
     }
