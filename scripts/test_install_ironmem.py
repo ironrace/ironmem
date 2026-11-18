@@ -1099,8 +1099,45 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             result = self.run_installer(home, home / ".claude.json", extra_env=env)
 
-            self.assertIn(f"WARN: could not finish writing {path}, so it may be incomplete;", result.stderr)
+            warning = f"WARN: the write to {path} did not finish, so it may be incomplete. Check it, then re-run this script."
+            self.assertIn(warning, result.stderr)
+            # Some bytes may have landed, so it must not claim nothing was wired.
+            line = next(line for line in result.stderr.splitlines() if "did not finish" in line)
+            self.assertNotIn("wired no Claude hooks", line)
+            self.assertNotIn("wired no Claude hooks", result.stderr)
             self.assertNotIn("Wired Claude hooks", result.stdout)
+            self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
+
+    def test_a_failed_dirname_creates_no_settings_and_says_so(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            # Fails only for the settings path. It still prints the real answer,
+            # so the dirname status check, not the mkdir after it, has to catch it.
+            real = shutil.which("dirname")
+            env = self.command_stub(home, "dirname", str(path), f'{real} "$@"; exit 1')
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertIn(f"WARN: cannot create {path}; wired no Claude hooks.", result.stderr)
+            self.assertFalse(path.exists())
+            self.assertNotIn("Wired Claude hooks", result.stdout)
+
+    def test_a_failed_temp_cleanup_warns_and_the_install_continues(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            # TMPDIR inside the temp home, so the directory rm leaves is cleaned up.
+            env = {
+                **self.command_stub(home, "rm", "ironmem-hooks", 'echo "stub rm failure" >&2; exit 1'),
+                "TMPDIR": str(home / "tmp"),
+            }
+            (home / "tmp").mkdir()
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertIn(f"WARN: could not remove the temp directory {home / 'tmp'}/ironmem-hooks.", result.stderr)
+            self.assertEqual(set(self.claude_settings(home)["hooks"]), set(self.plugin_hook_names()))
+            self.assertIn("Wired Claude hooks", result.stdout)
             self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
 
     def test_junk_entries_neither_abort_nor_multiply_hooks(self) -> None:

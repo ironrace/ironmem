@@ -702,9 +702,11 @@ register_json_mcpservers() {
 # install go on. The write is `cat >` rather than a move, so a settings.json
 # symlinked into a dotfiles repo stays a symlink; `cat >` truncates first, so if
 # that one write fails partway (a full disk) the file can be left incomplete,
-# and its WARN says so and names the file. Every outcome returns 0. The matcher expects the hook name directly after `hook`; a hand-wired command
-# in another shape (say `hook --harness claude-code stop`) gets a second copy
-# appended. Keep CLAUDE_HOOK_EVENTS in step with PLUGIN_HOOKS in
+# and its WARN says so and names the file. Every outcome returns 0.
+#
+# The matcher expects the hook name directly after `hook`; a hand-wired
+# command in another shape (say `hook --harness claude-code stop`) gets a
+# second copy appended. Keep CLAUDE_HOOK_EVENTS in step with PLUGIN_HOOKS in
 # crates/ironmem/src/doctor/hooks.rs; the unit test
 # plugin_hooks_table_matches_the_plugin_hooks_json pins that table to
 # hooks.json, and scripts/test_install_ironmem.py pins this one to it.
@@ -828,8 +830,9 @@ _wire_claude_hooks_into() {
     fi
     # In place, not mv: a settings.json symlinked into a dotfiles repo stays one.
     # `cat >` truncates before writing, so a failure here can cut the file short.
+    # Some bytes may have landed, so this WARN does not say "wired no Claude hooks".
     if ! cat "$work" > "$settings" 2>/dev/null; then
-      _wire_claude_hooks_warn "could not finish writing $settings, so it may be incomplete"
+      echo "    WARN: the write to $settings did not finish, so it may be incomplete. Check it, then re-run this script." >&2
       return 0
     fi
     echo "==> Wired Claude hooks in $settings: ${added% }"
