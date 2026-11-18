@@ -1,4 +1,4 @@
-//! Search pipeline: sanitize → embed → HNSW (multi-query) → BM25 → RRF → KG boost
+//! Search pipeline: sanitize → embed → vector search (multi-query) → BM25 → RRF → KG boost
 //!     → collapse synthetic preference siblings → shrinkage rerank → LLM rerank → rank.
 //!
 //! Hybrid retrieval strategy:
@@ -6,7 +6,7 @@
 //!   2. Run HNSW ANN search for each query variant (an exact scan of the
 //!      scope instead for a wing/room-scoped search), union the ranked lists
 //!   3. Run BM25 full-text search via SQLite FTS5 (porter-stemmed tokens)
-//!   4. Merge HNSW and BM25 via weighted RRF (BM25 down-weighted when sparse)
+//!   4. Merge vector and BM25 results via weighted RRF (BM25 down-weighted when sparse)
 //!   5. Apply KG-entity score boosts
 //!   6. Apply lexical shrinkage rerank (mempalace hybrid-v5 port)
 //!   7. Sort deterministically, truncate to requested limit
@@ -97,14 +97,14 @@ pub fn search(
     // overfetch at 5× limit, clamped to MAX_OVERFETCH.
     let overfetch = limit.saturating_mul(5).clamp(30, tunables::max_overfetch());
 
-    let hnsw_ids = hnsw_candidates(
+    let vector_ids = vector_candidates(
         app,
         &primary_vec,
         maybe_content_vec.as_deref(),
         overfetch,
         filters,
     )?;
-    let total_candidates = hnsw_ids.len();
+    let total_candidates = vector_ids.len();
 
     // Step 4: BM25 full-text search.
     let bm25_pairs = app.db.bm25_search_with_history(
@@ -118,21 +118,21 @@ pub fn search(
     let bm25_ids: Vec<String> = bm25_pairs.into_iter().map(|(id, _)| id).collect();
 
     // Step 5: Weighted RRF — down-weight BM25 when results are sparse to keep
-    // HNSW authoritative rather than letting a few noisy BM25 hits dominate.
+    // the vector leg authoritative rather than letting a few noisy BM25 hits dominate.
     let bm25_weight = sparse_bm25_weight(bm25_ids.len(), tunables::bm25_sparse_threshold());
 
     let rrf_k = tunables::rrf_k();
     let mut merged_ids = if bm25_weight == 0.0 {
-        hnsw_ids.clone()
+        vector_ids.clone()
     } else {
-        rrf_merge_weighted(&hnsw_ids, &bm25_ids, rrf_k, bm25_weight)
+        rrf_merge_weighted(&vector_ids, &bm25_ids, rrf_k, bm25_weight)
     };
 
     // Step 5b: Pseudo-relevance feedback (E3) — expand the query with discriminative
     // terms from the top-K initial candidates, then re-search and 4-way RRF merge.
     // Gated on IRONMEM_PRF_ENABLED (default off). prf_top_k defaults to 15 so that
     // preference-question gold sessions (E1: ranks 6-22) appear in the foreground.
-    let mut prf_expanded_hnsw_ids: Option<Vec<String>> = None;
+    let mut prf_expanded_vector_ids: Option<Vec<String>> = None;
     let mut prf_expanded_bm25_ids: Option<Vec<String>> = None;
     let mut prf_drawer_cache: HashMap<String, Drawer> = HashMap::new();
 
@@ -238,7 +238,7 @@ pub fn search(
                 emb.embed_one(&expanded_query).map_err(MemoryError::Embed)?
             };
 
-            let exp_hnsw_ids = hnsw_candidates(app, &expanded_vec, None, overfetch, filters)?;
+            let exp_vector_ids = vector_candidates(app, &expanded_vec, None, overfetch, filters)?;
 
             let exp_bm25_pairs = app.db.bm25_search_with_history(
                 &expanded_query,
@@ -250,10 +250,10 @@ pub fn search(
             let exp_bm25_ids: Vec<String> = exp_bm25_pairs.into_iter().map(|(id, _)| id).collect();
 
             // 4-way RRF: original lists weight 1.0, expanded lists weight 0.5.
-            let lists: [&Vec<String>; 4] = [&hnsw_ids, &bm25_ids, &exp_hnsw_ids, &exp_bm25_ids];
+            let lists: [&Vec<String>; 4] = [&vector_ids, &bm25_ids, &exp_vector_ids, &exp_bm25_ids];
             let weights: [f32; 4] = [1.0, bm25_weight, 0.5, 0.5 * bm25_weight];
             merged_ids = rrf_merge_nway(&lists, &weights, rrf_k);
-            prf_expanded_hnsw_ids = Some(exp_hnsw_ids);
+            prf_expanded_vector_ids = Some(exp_vector_ids);
             prf_expanded_bm25_ids = Some(exp_bm25_ids);
         }
     }
@@ -282,13 +282,13 @@ pub fn search(
     drawers.extend(fetched);
 
     // Compute RRF scores — 4-way if PRF fired, 2-way otherwise.
-    let rrf_scores = match (&prf_expanded_hnsw_ids, &prf_expanded_bm25_ids) {
-        (Some(exp_hnsw), Some(exp_bm25)) => {
-            let lists: [&Vec<String>; 4] = [&hnsw_ids, &bm25_ids, exp_hnsw, exp_bm25];
+    let rrf_scores = match (&prf_expanded_vector_ids, &prf_expanded_bm25_ids) {
+        (Some(exp_vector), Some(exp_bm25)) => {
+            let lists: [&Vec<String>; 4] = [&vector_ids, &bm25_ids, exp_vector, exp_bm25];
             let weights: [f32; 4] = [1.0, bm25_weight, 0.5, 0.5 * bm25_weight];
             rrf_scores_map_nway(&lists, &weights, rrf_k)
         }
-        _ => rrf_scores_map_weighted(&hnsw_ids, &bm25_ids, rrf_k, bm25_weight),
+        _ => rrf_scores_map_weighted(&vector_ids, &bm25_ids, rrf_k, bm25_weight),
     };
     let mut scored: Vec<ScoredDrawer> = merged_ids
         .iter()
@@ -403,7 +403,7 @@ fn is_scoped(filters: &SearchFilters) -> bool {
 /// index has no scope filter, and its global top-k could hold none of the
 /// scope's drawers, which left a scoped search empty although matching
 /// drawers existed.
-fn hnsw_candidates(
+fn vector_candidates(
     app: &App,
     primary: &[f32],
     content: Option<&[f32]>,
@@ -590,7 +590,8 @@ fn filter_superseded_candidate_ids(
         .collect())
 }
 
-/// Union two HNSW result lists by max score, deduplicating by index position.
+/// Union two vector result lists (HNSW, or the scoped exact scan) by max
+/// score, deduplicating by index position.
 /// Merged list is sorted by score desc, then index asc (deterministic), capped at `cap`.
 fn union_hnsw(
     primary: Vec<(usize, f32)>,
@@ -673,7 +674,7 @@ pub(crate) fn rrf_merge_weighted(
     ranked.into_iter().map(|(id, _)| id.to_string()).collect()
 }
 
-/// Compute weighted RRF scores. list_a (HNSW) always has weight 1.0;
+/// Compute weighted RRF scores. list_a (vector) always has weight 1.0;
 /// list_b (BM25) contribution is scaled by `bm25_weight`.
 fn rrf_scores_map_weighted<'a>(
     list_a: &'a [String],
@@ -696,7 +697,7 @@ fn rrf_scores_map_weighted<'a>(
 /// A synthetic drawer carries `source_file = "pref:<parent_drawer_id>"`. After
 /// scoring, we want the parent to absorb the synth's score (if higher) and the
 /// synth to disappear from the candidate list. If the parent is missing from
-/// `candidates` (because it didn't make HNSW top-N) but the synth did, fetch
+/// `candidates` (because it didn't make the vector top-N) but the synth did, fetch
 /// the parent by id and surface it with the synth's score; drop the synth.
 /// The fetch honors `include_superseded`, so a surviving synthetic sibling
 /// cannot restore an otherwise-hidden historical parent during normal search.
@@ -1207,7 +1208,7 @@ mod tests {
         let app = app_with_scope_outside_top_k();
         let q = query_vec();
 
-        let in_a = hnsw_candidates(&app, &q, None, 30, &scope(Some("a"), None)).unwrap();
+        let in_a = vector_candidates(&app, &q, None, 30, &scope(Some("a"), None)).unwrap();
         assert_eq!(in_a.len(), 30);
         assert!(in_a.iter().all(|id| id.starts_with('a')));
     }
@@ -1236,13 +1237,13 @@ mod tests {
             .count();
         assert!(nearer > 30, "only {nearer} wing-a drawers are nearer");
 
-        let by_wing = hnsw_candidates(&app, &q, None, 30, &scope(Some("b"), None)).unwrap();
+        let by_wing = vector_candidates(&app, &q, None, 30, &scope(Some("b"), None)).unwrap();
         assert_eq!(by_wing, ["b00"]);
-        let by_room = hnsw_candidates(&app, &q, None, 30, &scope(None, Some("rb"))).unwrap();
+        let by_room = vector_candidates(&app, &q, None, 30, &scope(None, Some("rb"))).unwrap();
         assert_eq!(by_room, ["b00"]);
         let cv = near_query(7, 0.3);
         let with_variant =
-            hnsw_candidates(&app, &q, Some(&cv), 30, &scope(Some("b"), None)).unwrap();
+            vector_candidates(&app, &q, Some(&cv), 30, &scope(Some("b"), None)).unwrap();
         assert_eq!(with_variant, ["b00"]);
     }
 
@@ -1296,24 +1297,24 @@ mod tests {
         add(&app, "o4", "o", "r", &at_similarity(0.7, 3.0));
         let wing_o = scope(Some("o"), None);
 
-        let all = hnsw_candidates(&app, &query_vec(), None, 30, &wing_o).unwrap();
+        let all = vector_candidates(&app, &query_vec(), None, 30, &wing_o).unwrap();
         assert_eq!(all, ["o3", "o4", "o1", "o2", "o0"]);
         // A query of another length gives the same order.
         let long_query: Vec<f32> = query_vec().iter().map(|x| x * 5.0).collect();
         assert_eq!(
-            hnsw_candidates(&app, &long_query, None, 30, &wing_o).unwrap(),
+            vector_candidates(&app, &long_query, None, 30, &wing_o).unwrap(),
             all
         );
         // The top `overfetch`, cut after the order is decided.
         assert_eq!(
-            hnsw_candidates(&app, &query_vec(), None, 3, &wing_o).unwrap(),
+            vector_candidates(&app, &query_vec(), None, 3, &wing_o).unwrap(),
             ["o3", "o4", "o1"]
         );
         // A zero query (the noop embedder's) scores every drawer 0, so the id
         // tie-break alone decides, and nothing divides by zero.
         let zero = vec![0.0; DIM];
         assert_eq!(
-            hnsw_candidates(&app, &zero, None, 3, &wing_o).unwrap(),
+            vector_candidates(&app, &zero, None, 3, &wing_o).unwrap(),
             ["o0", "o1", "o2"]
         );
     }
@@ -1332,12 +1333,12 @@ mod tests {
         let wing_t = scope(Some("t"), None);
         let q = query_vec();
         assert_eq!(
-            hnsw_candidates(&app, &q, None, 30, &wing_t).unwrap(),
+            vector_candidates(&app, &q, None, 30, &wing_t).unwrap(),
             ["t0", "t1", "t2", "t3", "t4"]
         );
         let cv = at_similarity(0.5, 1.0);
         assert_eq!(
-            hnsw_candidates(&app, &q, Some(&cv), 3, &wing_t).unwrap(),
+            vector_candidates(&app, &q, Some(&cv), 3, &wing_t).unwrap(),
             ["t0", "t1", "t2"]
         );
     }
@@ -1404,10 +1405,10 @@ mod tests {
         add(&app, "w2r1", "w2", "r1", &v);
         let q = query_vec();
 
-        let room_only = hnsw_candidates(&app, &q, None, 30, &scope(None, Some("r1"))).unwrap();
+        let room_only = vector_candidates(&app, &q, None, 30, &scope(None, Some("r1"))).unwrap();
         assert_eq!(room_only, ["w1r1", "w2r1"]);
         let wing_and_room =
-            hnsw_candidates(&app, &q, None, 30, &scope(Some("w1"), Some("r1"))).unwrap();
+            vector_candidates(&app, &q, None, 30, &scope(Some("w1"), Some("r1"))).unwrap();
         assert_eq!(wing_and_room, ["w1r1"]);
     }
 
@@ -1443,7 +1444,7 @@ mod tests {
                 .filter(|id| drawer_matches_filters(&drawers[*id], &filters))
                 .collect();
             expected.sort_unstable();
-            let got = hnsw_candidates(&app, &query_vec(), None, 30, &filters).unwrap();
+            let got = vector_candidates(&app, &query_vec(), None, 30, &filters).unwrap();
             assert_eq!(got, expected, "{filters:?}");
         }
         // Spot-check the rules themselves, not just the agreement.
@@ -1452,10 +1453,10 @@ mod tests {
             ..scope(Some("x"), None)
         };
         assert_eq!(
-            hnsw_candidates(&app, &query_vec(), None, 30, &with_history).unwrap(),
+            vector_candidates(&app, &query_vec(), None, 30, &with_history).unwrap(),
             ["x-current", "x-old"]
         );
-        let current = hnsw_candidates(&app, &query_vec(), None, 30, &scope(Some("x"), None));
+        let current = vector_candidates(&app, &query_vec(), None, 30, &scope(Some("x"), None));
         assert_eq!(current.unwrap(), ["x-current"]);
     }
 
@@ -1470,7 +1471,7 @@ mod tests {
             .exec_raw("UPDATE drawers SET embedding = x'0102' WHERE id = 'bad-blob'")
             .unwrap();
 
-        let ids = hnsw_candidates(&app, &query_vec(), None, 30, &scope(Some("s"), None)).unwrap();
+        let ids = vector_candidates(&app, &query_vec(), None, 30, &scope(Some("s"), None)).unwrap();
         assert_eq!(ids, ["good"]);
     }
 
@@ -1483,7 +1484,7 @@ mod tests {
         let selects = app.db.count_select_statements();
 
         let ids =
-            hnsw_candidates(&app, &query_vec(), None, 30, &scope(Some("none"), None)).unwrap();
+            vector_candidates(&app, &query_vec(), None, 30, &scope(Some("none"), None)).unwrap();
         assert!(ids.is_empty());
         assert_eq!(selects.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
@@ -1517,14 +1518,14 @@ mod tests {
         let app = app_with_scope_outside_top_k();
         let q = query_vec();
 
-        let unscoped = hnsw_candidates(&app, &q, None, 30, &scope(None, None)).unwrap();
+        let unscoped = vector_candidates(&app, &q, None, 30, &scope(None, None)).unwrap();
         assert_eq!(unscoped, old_unscoped_candidates(&app, &q, None, 30));
         assert_eq!(unscoped.len(), 30);
         assert!(!unscoped.contains(&"b00".to_string()));
 
         // Same with the content-word variant: one union capped at overfetch.
         let cv = near_query(7, 0.3);
-        let with_variant = hnsw_candidates(&app, &q, Some(&cv), 30, &scope(None, None)).unwrap();
+        let with_variant = vector_candidates(&app, &q, Some(&cv), 30, &scope(None, None)).unwrap();
         assert_eq!(
             with_variant,
             old_unscoped_candidates(&app, &q, Some(&cv), 30)
@@ -1549,7 +1550,7 @@ mod tests {
         app.mark_dirty();
         app.ensure_index_fresh().unwrap();
 
-        let ids = hnsw_candidates(&app, &query_vec(), None, 30, &scope(None, None)).unwrap();
+        let ids = vector_candidates(&app, &query_vec(), None, 30, &scope(None, None)).unwrap();
         assert!(!ids.is_empty());
         assert!(ids.iter().all(|id| id.starts_with('n')), "{ids:?}");
     }
