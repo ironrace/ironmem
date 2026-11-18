@@ -819,7 +819,7 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "acts on every succeeded `agent:ready` issue in the repo, not only this one.",
     # What `status` does with a name it will not answer for: exit 1, which
     # the router must read as a failed read and never as "not onboarded".
-    "A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name, and so does a stored config that does not parse, under that name or another spelling of it: a failed read, not `null`.",
+    "A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name; a stored config that does not parse, under that name or another spelling of it, exits 1 too: both are failed reads, not `null`.",
     # The fix-line commands. `--db '<db>'` is what makes `onboard` and
     # `approve` act on the database `status` read; a mirror that drops it
     # sends the user to approve in a different one.
@@ -837,6 +837,9 @@ EVALUATE_ISSUE_FORBIDDEN_DRAWER_READ_SNIPPETS = [
     "backlog-lineage",
     'logical_key="gate-config:',
     "gate-config:<slug>",
+    # The read's own name: a sentence that sends the reader to "the Step 2
+    # `get_drawer` read" names no wing, room or key for the three above.
+    "get_drawer",
 ]
 # Route pins whose wording differs per surface. The two-phase confirm rule is
 # a list item in the spec and inline prose in the mirrors; the bare

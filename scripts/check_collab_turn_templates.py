@@ -630,9 +630,9 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "once that dispatch has succeeded and pushed its branch",
     "acts on every succeeded `agent:ready` issue in the repo, not only this one.",
     "A name that differs from an onboarded one only in letter case, or in "
-    "whether it names a host, exits 1 naming the stored name, and so does a "
-    "stored config that does not parse, under that name or another spelling "
-    "of it: a failed read, not `null`.",
+    "whether it names a host, exits 1 naming the stored name; a stored config "
+    "that does not parse, under that name or another spelling of it, exits 1 "
+    "too: both are failed reads, not `null`.",
     "`ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`",
     "`ironmem autopilot approve <owner>/<repo> --db '<db>'`",
     "`ironmem autopilot labels <owner>/<repo>`",
@@ -642,17 +642,20 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "then that `approve` command",
     "`ironmem autopilot status <owner>/<repo> --db '<db>'`",
 ]
-# A read of the gate config straight from Autopilot's drawer, by wing, room
-# and logical key (#420). The router must not make one: it reads the gate
-# config with `ironmem autopilot status`. The pins above are presence checks,
-# so a surface that carries such a read beside the `status` command satisfies
-# all of them. These are matched on the raw text, comments included, like the
-# other FORBIDDEN lists: the router is a model reading the file, and rejecting
-# the read inside a comment is stricter, not weaker.
+# A read of the gate config straight from Autopilot's drawer (#420): its
+# room, its logical key in two spellings, and the name of the call that makes
+# it, which is all a sentence pointing back at "the Step 2 `get_drawer` read"
+# holds. The router must not make that read: it reads the gate config with
+# `ironmem autopilot status`. The pins above are presence checks, so a surface
+# that carries such a read beside the `status` command satisfies all of them.
+# These are matched on the raw text, comments included, like the other
+# FORBIDDEN lists: the router is a model reading the file, and rejecting the
+# read inside a comment is stricter, not weaker.
 FORBIDDEN_EVALUATE_ISSUE_DRAWER_READ_SNIPPETS = [
     "backlog-lineage",
     'logical_key="gate-config:',
     "gate-config:<slug>",
+    "get_drawer",
 ]
 # Route pins whose wording differs per surface. The two-phase confirm rule is
 # a list item in the spec and inline prose in the mirrors, and the shared

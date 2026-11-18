@@ -104,7 +104,7 @@ Goal: a rough estimate of how much code the issue touches.
      A `gate_config` of `null` is a repo not onboarded under that exact name
      in the database the report names in `db`; a repo onboarded in another
      database reads the same way.
-     A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name, and so does a stored config that does not parse, under that name or another spelling of it: a failed read, not `null`.
+     A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name; a stored config that does not parse, under that name or another spelling of it, exits 1 too: both are failed reads, not `null`.
      A `state` of `"pending"` is a proposal nobody has approved.
      Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
      A non-zero exit, a run that could not be made, output that is not JSON, or a report that is none of approved, pending or `null` is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
