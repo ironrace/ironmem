@@ -1208,6 +1208,22 @@ mod tests {
     }
 
     #[test]
+    fn the_label_lines_follow_the_map_and_never_invent_a_missing_entry() {
+        let status = RepoStatus::new(
+            "owner/repo",
+            Path::new("/tmp/mem.db"),
+            None,
+            LabelStatus::Ok {
+                agent: BTreeMap::from([("agent:ready", true)]),
+                risk: vec![],
+            },
+        );
+        let text = render_text(&status, false);
+        assert!(text.contains("  agent:ready — present"), "{text}");
+        assert!(!text.contains("agent:blocked"), "{text}");
+    }
+
+    #[test]
     fn shell_quote_quotes_only_what_needs_it() {
         assert_eq!(shell_quote("owner/repo"), "owner/repo");
         assert_eq!(shell_quote("a b"), "'a b'");
