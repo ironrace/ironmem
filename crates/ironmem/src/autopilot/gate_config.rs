@@ -228,8 +228,10 @@ pub(super) fn gate_config_key(repo: &str) -> String {
 /// One stored gate config, as [`stored_gate_configs_read_only`] lists it.
 #[derive(Debug)]
 pub(super) enum StoredGateConfig {
-    /// A row that parses, by its `repo`.
-    Parsed(String),
+    /// A row that parses: the `repo` it holds and the key it is stored
+    /// under. Every config `onboard` writes is under the key of its own
+    /// `repo`, and nothing checks a stored row for that.
+    Parsed { repo: String, storage_key: String },
     /// A row that does not parse.
     Broken(BrokenGateConfig),
 }
@@ -312,9 +314,9 @@ pub(super) enum StoredGateConfigsError {
 }
 
 /// Every stored gate config, read-only (#420): the `repo` of each row that
-/// parses, and for each row that does not, the key it is stored under, the
-/// parse error and the `repo` its content still holds. A row marked
-/// superseded is listed, because the read by name
+/// parses and the key it is stored under, and for each row that does not,
+/// that key, the parse error and the `repo` its content still holds. A row
+/// marked superseded is listed, because the read by name
 /// ([`get_gate_config_read_only`]) is a lookup by id that returns such a row
 /// too.
 ///
@@ -349,7 +351,10 @@ pub(super) fn stored_gate_configs_read_only(
         match Listed::of(drawer, &source_prefix) {
             Listed::GateConfig { slug } => {
                 stored.push(match parse_stored(slug, &drawer.content) {
-                    Ok(config) => StoredGateConfig::Parsed(config.repo),
+                    Ok(config) => StoredGateConfig::Parsed {
+                        repo: config.repo,
+                        storage_key: format!("{GATE_CONFIG_KEY_PREFIX}{slug}"),
+                    },
                     Err(broken) => StoredGateConfig::Broken(broken),
                 });
             }
@@ -1137,7 +1142,7 @@ mod tests {
         let mut broken = Vec::new();
         for row in listing {
             match row {
-                StoredGateConfig::Parsed(repo) => parsed.push(repo),
+                StoredGateConfig::Parsed { repo, .. } => parsed.push(repo),
                 StoredGateConfig::Broken(row) => broken.push(row),
             }
         }

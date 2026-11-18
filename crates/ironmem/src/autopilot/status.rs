@@ -249,6 +249,16 @@ impl fmt::Display for DbPath {
     }
 }
 
+/// A stored gate config that parses and is not under the key of the `repo`
+/// it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MisplacedConfig {
+    /// The `repo` the config holds.
+    pub repo: String,
+    /// The key the config is stored under.
+    pub storage_key: String,
+}
+
 /// Why `ironmem autopilot status` could not report. Every variant is exit 1
 /// with nothing on stdout.
 ///
@@ -363,12 +373,26 @@ pub enum StatusError {
     },
 
     /// No config is stored under the name asked about, but one is stored
-    /// under a spelling `gh` can read as the same repository.
+    /// under a spelling `gh` can read as the same repository, and under that
+    /// spelling's own key, so a read of that spelling finds it.
     #[error("{}", stored_under_another_name(.asked, .stored))]
     StoredUnderAnotherName {
         asked: RepoName,
         /// Every stored name that could be the repo asked about.
         stored: Vec<String>,
+    },
+
+    /// No config is stored under the name asked about, and a config that
+    /// parses holds a `repo` `gh` can read as the same repository, under a
+    /// key that is not that `repo`'s own. No `onboard` writes such a row,
+    /// and a read of the `repo` it holds looks under another key, so the
+    /// message does not say to ask with that name, and it gives no command.
+    #[error("{}", stored_under_another_names_key(.asked, .db, .rows))]
+    StoredUnderAnotherNamesKey {
+        asked: RepoName,
+        db: DbPath,
+        /// Every such config.
+        rows: Vec<MisplacedConfig>,
     },
 
     /// The config stored under the asked name's storage key parses, and the
@@ -447,14 +471,17 @@ pub enum StatusError {
     /// of the repo asked about under another spelling. Autopilot and
     /// `add_drawer` both make a row's id and its `source_file` from one key,
     /// so such a row was changed after it was written, or put there by
-    /// something else.
+    /// something else. The message gives no command, because no command is
+    /// known to repair a row whose reader cannot be told: it says where the
+    /// row is and that it is repaired or removed by hand.
     #[error(
         "'{asked}' has no gate config under that exact name, and {db} holds a gate config row \
          whose id is not the id of the key in its `source_file` (id {id:?}, `source_file` \
          {source_file:?}), so which repo name reads that row cannot be told, and it cannot be \
          ruled out as this repo's config under another spelling. Autopilot does not store a row \
-         that way: find out where it came from, and repair or remove it. A repo asked about by \
-         the exact name it was onboarded under is still answered"
+         that way, and `status` gives no command for one: find out where the row came from, then \
+         repair or remove it by hand (it is the row with that id in the `drawers` table). A repo \
+         asked about by the exact name it was onboarded under is still answered"
     )]
     MisfiledStoredConfig {
         asked: RepoName,
@@ -505,11 +532,12 @@ fn printable(given: &str) -> String {
 /// The message of [`StatusError::StoredUnderAnotherName`]. It ends with what
 /// is true if the asked name is another repository, when a stored name and
 /// the asked one differ in whether they name a host: the one case that may be
-/// two repositories.
+/// two repositories. A stored name is shown with its control characters
+/// escaped: it is not shape-checked.
 fn stored_under_another_name(asked: &RepoName, stored: &[String]) -> String {
     let names = stored
         .iter()
-        .map(|name| format!("'{name}'"))
+        .map(|name| format!("'{}'", printable(name)))
         .collect::<Vec<_>>()
         .join(", ");
     let asked_names_a_host = asked.identity().host.is_some();
@@ -528,9 +556,39 @@ fn stored_under_another_name(asked: &RepoName, stored: &[String]) -> String {
     )
 }
 
-/// The message of [`StatusError::KeyCollision`].
+/// The message of [`StatusError::StoredUnderAnotherNamesKey`].
+fn stored_under_another_names_key(
+    asked: &RepoName,
+    db: &DbPath,
+    rows: &[MisplacedConfig],
+) -> String {
+    let listed = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "one whose `repo`, {:?}, differs from it only in letter case or host prefix, \
+                 under the key '{}'",
+                row.repo,
+                printable(&row.storage_key)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" and ");
+    format!(
+        "'{asked}' has no gate config under that exact name, but {db} holds {listed} — `onboard` \
+         stores a config under the key of its own `repo`, so no `onboard` wrote a config that is \
+         under another key, and a read by the `repo` such a config holds looks under that \
+         `repo`'s own key and does not find it. Whether '{asked}' is onboarded cannot be reported \
+         while such a row is stored: find out where it came from, then repair or remove it by hand"
+    )
+}
+
+/// The message of [`StatusError::KeyCollision`]. The stored `repo` is shown
+/// with its control characters escaped: it is not shape-checked.
 fn key_collision(asked: &RepoName, stored: &str, storage_key: &str, db: &DbPath) -> String {
-    if gate_config_key(stored) != storage_key {
+    let under_this_key = gate_config_key(stored) == storage_key;
+    let stored = printable(stored);
+    if !under_this_key {
         return format!(
             "the gate config stored under the key '{storage_key}' in {db} names '{stored}' as its \
              `repo`, not '{asked}' — '{stored}' is not a name stored under this key, so `onboard` \
@@ -657,21 +715,33 @@ fn broken_under_another_name(asked: &RepoName, db: &DbPath, rows: &[BrokenGateCo
     let quoted_db = shell_quote(db.as_str());
     let mut remedies: Vec<String> = Vec::new();
     for row in rows {
-        // The command is given only for a name it would work for: one that
-        // is a repo name, and whose proposal is written over this row.
-        let held = row
-            .repo()
-            .and_then(|held| RepoName::parse(held).ok())
-            .filter(|held| row.is_stored_under_the_key_of(held.as_str()));
-        // Each remedy ends with the name to ask with afterwards: the config
-        // is then stored under that name, and the name first asked about is
-        // refused again as another spelling of it.
+        // A row is replaced by onboarding the name it holds only when a
+        // proposal for that name is written over this row, and `onboard`
+        // takes the name.
+        let held = row.repo().filter(|held| {
+            row.is_stored_under_the_key_of(held) && super::validate_repo(held).is_ok()
+        });
+        // Each remedy ends with the name to ask with afterwards.
         let remedy = match held {
-            Some(held) => format!(
-                "run `ironmem autopilot onboard {held} --path . --db {quoted_db}` from that \
-                 repo's checkout, then ask with `{held}`"
-            ),
-            // A key cannot be turned back into a name, so the reader is told
+            Some(held) => match RepoName::parse(held) {
+                // The config is then stored under that name, and the name
+                // first asked about is refused again as another spelling of
+                // it.
+                Ok(held) => format!(
+                    "run `ironmem autopilot onboard {held} --path . --db {quoted_db}` from that \
+                     repo's checkout, then ask with `{held}`"
+                ),
+                // `onboard` takes names `status` refuses (#422). No command
+                // is printed for one, and `status` cannot be asked about it,
+                // so the name to ask with is the one first asked about.
+                Err(_) => format!(
+                    "run `ironmem autopilot onboard` with the name that config holds, {held:?}, \
+                     and `--db {quoted_db}` from that repo's checkout, then ask with `{asked}` \
+                     again ({held:?} is not a name `status` accepts, #422)"
+                ),
+            },
+            // The row holds no name it could have been onboarded under, and
+            // a key cannot be turned back into a name, so the reader is told
             // how the two relate.
             None => format!(
                 "run `ironmem autopilot onboard` with the name it was onboarded under and `--db \
@@ -787,6 +857,7 @@ impl From<StatusError> for MemoryError {
             | StatusError::DbPathNotUtf8 { .. }
             | StatusError::DatabaseIsADirectory { .. }
             | StatusError::StoredUnderAnotherName { .. }
+            | StatusError::StoredUnderAnotherNamesKey { .. }
             | StatusError::KeyCollision { .. }
             | StatusError::TooManyStoredConfigs { .. }
             | StatusError::MisfiledStoredConfig { .. } => MemoryError::Validation(message),
@@ -1065,13 +1136,15 @@ fn bare_message(err: MemoryError) -> String {
 /// because the report could not name the file that answered.
 ///
 /// A read whose config is `None` means no gate config is stored under this
-/// name or under another spelling of it. When one is stored under a spelling
-/// `gh` can read as the same repository (a different letter case, or a host
-/// on one side only), this is an error naming the stored name instead, so a
-/// repo onboarded under another spelling is not reported as "not onboarded".
-/// A stored config that does not parse and could be this repo's is an error
-/// too, whether it is under this name's storage key or under another
-/// spelling. A stored name and an asked name with different hosts are
+/// name or under another spelling of it. When none is stored under this
+/// name and one is stored under a spelling `gh` can read as the same
+/// repository (a different letter case, or a host on one side only), this is
+/// an error instead, so a repo onboarded under another spelling is not
+/// reported as "not onboarded". The error names the stored name, unless the
+/// stored configs cannot all be listed, which is an error before any is
+/// compared. A stored config that does not parse and could be this repo's is
+/// an error too: under this name's storage key always, and under another
+/// spelling when none is stored under this name. A stored name and an asked name with different hosts are
 /// different repositories and never match. A config that does not parse and
 /// holds no name is matched by the slug in its key instead, and that can
 /// match a name on another host.
@@ -1161,7 +1234,12 @@ fn absolute_db_path(db: &Path) -> Result<DbPath, StatusError> {
 /// A stored row that does not parse is not passed over: one that could be
 /// `repo`'s ([`RepoName::may_be_stored_as`]) is an error too, since nothing
 /// else on this read would report it. A config that parses is named first,
-/// because asking with its name is then a read that succeeds.
+/// because asking with its name is then a read that succeeds. That holds for
+/// a config under the key of the `repo` it holds, which is every config
+/// `onboard` writes. One under another key is not found by a read of that
+/// `repo`, so it is its own error
+/// ([`StatusError::StoredUnderAnotherNamesKey`]), reported after the names
+/// that can be asked with and before a row that does not parse.
 ///
 /// A listing that cannot show every such config is an error before any row
 /// is compared: one cut off at the row limit, and one that holds a row whose
@@ -1188,14 +1266,28 @@ fn refuse_another_spelling(
     })?;
     let asked = repo.identity();
     let mut near: Vec<String> = Vec::new();
+    let mut misplaced: Vec<MisplacedConfig> = Vec::new();
     let mut broken: Vec<BrokenGateConfig> = Vec::new();
     for row in stored {
         match row {
-            StoredGateConfig::Parsed(name) => {
+            StoredGateConfig::Parsed {
+                repo: name,
+                storage_key,
+            } => {
                 let may_be_the_repo = name != repo.as_str()
                     && RepoIdentity::of_stored(&name).is_some_and(|stored| asked.may_be(&stored));
-                if may_be_the_repo {
+                if !may_be_the_repo {
+                    continue;
+                }
+                // Asking with a stored name reads the key of that name, so
+                // only a config under that key is a name to ask with.
+                if gate_config_key(&name) == storage_key {
                     near.push(name);
+                } else {
+                    misplaced.push(MisplacedConfig {
+                        repo: name,
+                        storage_key,
+                    });
                 }
             }
             StoredGateConfig::Broken(row) => {
@@ -1209,6 +1301,13 @@ fn refuse_another_spelling(
         return Err(StatusError::StoredUnderAnotherName {
             asked: repo.clone(),
             stored: near,
+        });
+    }
+    if !misplaced.is_empty() {
+        return Err(StatusError::StoredUnderAnotherNamesKey {
+            asked: repo.clone(),
+            db: db_path.clone(),
+            rows: misplaced,
         });
     }
     if !broken.is_empty() {
@@ -2787,6 +2886,205 @@ mod tests {
         .to_string()
     }
 
+    #[test]
+    fn a_config_filed_under_another_names_key_is_not_a_stored_name_to_ask_with() {
+        // The row parses and holds `someone/else`, under the key of
+        // `foo-bar/baz`: a hand edit. A read of `someone/else` looks under
+        // `gate-config:someone-else` and finds nothing, so telling the reader
+        // to ask with that name would send them to "not onboarded".
+        let (_dir, path) = db_with_raw_config("foo-bar/baz", &parsing("someone/else"));
+
+        let err = read_gate_config_status(&path, &repo("Someone/Else")).unwrap_err();
+
+        match &err {
+            StatusError::StoredUnderAnotherNamesKey { asked, db, rows } => {
+                assert_eq!(asked.as_str(), "Someone/Else");
+                assert_eq!(db.as_path(), path);
+                assert_eq!(
+                    rows,
+                    &[MisplacedConfig {
+                        repo: "someone/else".to_string(),
+                        storage_key: "gate-config:foo-bar-baz".to_string(),
+                    }]
+                );
+            }
+            other => panic!("expected the config under another name's key, got {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "'Someone/Else' has no gate config under that exact name, but {} holds one \
+                 whose `repo`, \"someone/else\", differs from it only in letter case or host \
+                 prefix, under the key 'gate-config:foo-bar-baz'",
+                path.display()
+            )),
+            "{message}"
+        );
+        assert!(!message.contains("ask with the stored name"), "{message}");
+        assert!(!message.contains("autopilot onboard"), "{message}");
+        assert!(
+            message.ends_with("then repair or remove it by hand"),
+            "{message}"
+        );
+        let shown = MemoryError::from(err);
+        assert!(matches!(shown, MemoryError::Validation(_)), "{shown:?}");
+        assert_eq!(shown.to_string(), format!("Validation error: {message}"));
+
+        // What the message says of that name is true: a read of it does not
+        // find the config.
+        assert_eq!(
+            read_gate_config_status(&path, &repo("someone/else"))
+                .unwrap()
+                .config,
+            None
+        );
+
+        // A config stored under its own name's key is the name to ask with,
+        // and it is named once: the row under the other key is not a second
+        // stored name.
+        {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(&db, "someone/else", vec!["cargo test".into()], vec![]).unwrap();
+        }
+        let near = near_miss_at(&path, "Someone/Else");
+        assert_eq!(near.stored, vec!["someone/else".to_string()]);
+    }
+
+    #[test]
+    fn a_stored_repo_is_shown_escaped_by_every_error_that_names_it() {
+        // A stored `repo` is not shape-checked, and a row edited by hand can
+        // hold a control character. An error that names it must not write
+        // that character to the terminal.
+        let escape = '\u{1b}';
+        let shown_escaped = "\\u{1b}";
+
+        // Stored under the asked name's key, as a name stored under that key
+        // and as one that is not.
+        for held in ["foo\u{1b}bar/baz", "some\u{1b}one/else"] {
+            let (_dir, path) = db_with_raw_config("foo-bar/baz", &parsing(held));
+            let err = read_gate_config_status(&path, &repo("foo/bar-baz")).unwrap_err();
+            assert!(
+                matches!(&err, StatusError::KeyCollision { stored, .. } if stored == held),
+                "{held:?}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(!message.contains(escape), "{held:?}: {message:?}");
+            assert!(message.contains(shown_escaped), "{held:?}: {message}");
+        }
+
+        // Stored under its own key, as another spelling of the asked name:
+        // only the last three `/` segments are compared, so what comes
+        // before them can hold anything.
+        let held = "\u{1b}[2J/github.com/owner/repo";
+        let (_dir, path) = db_with_raw_config(held, &parsing(held));
+        let near = near_miss_at(&path, "owner/repo");
+        assert_eq!(near.stored, vec![held.to_string()]);
+        assert!(!near.message.contains(escape), "{:?}", near.message);
+        assert!(
+            near.message.contains("'\\u{1b}[2J/github.com/owner/repo'"),
+            "{}",
+            near.message
+        );
+
+        // Stored under another name's key, as another spelling of the asked
+        // name.
+        let (_dir, path) = db_with_raw_config("foo-bar/baz", &parsing(held));
+        let message = read_gate_config_status(&path, &repo("owner/repo"))
+            .unwrap_err()
+            .to_string();
+        assert!(!message.contains(escape), "{message:?}");
+        assert!(message.contains(shown_escaped), "{message}");
+    }
+
+    #[test]
+    fn a_broken_row_holding_a_name_status_refuses_is_not_told_to_read_a_name_off_its_key() {
+        // `onboard` takes `Owner-Repo` (#422) and stores it under
+        // `gate-config:Owner-Repo`, which is also the key of `Owner/Repo`.
+        // The row holds its name, so the key need not be read back into one:
+        // read back, it gives `Owner/Repo`, and onboarding that name would
+        // replace the row of `Owner-Repo`.
+        let (_dir, path) = db_with_raw_config("Owner-Repo", &no_gate("Owner-Repo"));
+        validate_repo("Owner-Repo").unwrap();
+
+        // Asked by the name that shares the key, the row is another repo's.
+        let err = read_gate_config_status(&path, &repo("Owner/Repo")).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("Do not onboard 'Owner/Repo' into this database"),
+            "{err}"
+        );
+
+        // Asked by another spelling of that name, the advice must not
+        // contradict that.
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+        assert!(
+            matches!(&err, StatusError::BrokenUnderAnotherName { rows, .. }
+                if rows.len() == 1
+                    && rows[0].storage_key() == "gate-config:Owner-Repo"
+                    && rows[0].repo() == Some("Owner-Repo")),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.contains("`gate-config:` followed by"), "{message}");
+        assert!(!message.contains("ask with that name"), "{message}");
+        assert!(!message.contains("Owner/Repo"), "{message}");
+        let quoted = shell_quote(&path.display().to_string());
+        assert!(
+            message.ends_with(&format!(
+                "cannot be reported until that config is replaced: run `ironmem autopilot \
+                 onboard` with the name that config holds, \"Owner-Repo\", and `--db {quoted}` \
+                 from that repo's checkout, then ask with `owner/repo` again (\"Owner-Repo\" is \
+                 not a name `status` accepts, #422)"
+            )),
+            "{message}"
+        );
+
+        // What the message says to do, done: the row parses again under the
+        // name it holds, and the name first asked about is answered.
+        {
+            let db = Database::open(&path).unwrap();
+            propose_gate_config(&db, "Owner-Repo", vec!["cargo test".into()], vec![]).unwrap();
+        }
+        assert_eq!(
+            read_gate_config_status(&path, &repo("owner/repo"))
+                .unwrap()
+                .config,
+            None
+        );
+    }
+
+    #[test]
+    fn a_broken_row_holding_a_name_onboard_refuses_is_not_told_to_onboard_that_name() {
+        // Stored under the key of `Owner-Repo`, and holding a name `onboard`
+        // does not take: a control character, which only a hand edit leaves.
+        let held = "Owner\u{7}Repo";
+        assert!(validate_repo(held).is_err());
+        let (_dir, path) = db_with_raw_config("Owner-Repo", &no_gate(held));
+
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+
+        assert!(
+            matches!(&err, StatusError::BrokenUnderAnotherName { rows, .. }
+                if rows.len() == 1
+                    && rows[0].repo() == Some(held)
+                    && rows[0].is_stored_under_the_key_of(held)),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(!message.contains('\u{7}'), "{message:?}");
+        assert!(
+            !message.contains("with the name that config holds"),
+            "{message}"
+        );
+        assert!(
+            message.ends_with(
+                "(its key is `gate-config:` followed by that name with each `/` written as `-`), \
+                 then ask with that name"
+            ),
+            "{message}"
+        );
+    }
+
     /// Rewrite the one stored gate config row in place, as a hand edit or an
     /// import could leave it: under `source_file`, and under `id` when one is
     /// given.
@@ -2912,6 +3210,16 @@ mod tests {
             message.contains("`source_file` \"logical:gate-config:Other-Slug\""),
             "{message}"
         );
+        // The message gives no command for such a row: it says where the
+        // row is and that it is repaired or removed by hand.
+        assert!(
+            message.contains(
+                "find out where the row came from, then repair or remove it by hand (it is the \
+                 row with that id in the `drawers` table)"
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("ironmem autopilot"), "{message}");
         // What the message says can still be done, can.
         assert!(
             message.ends_with(

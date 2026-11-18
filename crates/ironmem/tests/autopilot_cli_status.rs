@@ -913,12 +913,159 @@ fn a_gate_config_row_filed_under_another_key_exits_one_for_another_spelling_of_i
             "Error: Validation error: 'Other/Thing' has no gate config under that exact name, and ",
             "holds a gate config row whose id is not the id of the key in its `source_file` (id \"",
             "`source_file` \"logical:gate-config:Other-Slug\")",
+            // No command repairs such a row, and the error gives none.
+            "then repair or remove it by hand (it is the row with that id in the `drawers` table)",
         ],
     );
 
     // The exact name is read by id and is still answered.
     let report = report(&ask("other/thing"));
     assert_eq!(report["gate_config"]["state"], json!("pending"));
+}
+
+/// A stored gate config that parses and names `repo`.
+fn pending(repo: &str) -> String {
+    json!({
+        "repo": repo,
+        "state": "pending",
+        "gate_commands": ["cargo test"],
+        "proposed_at": "2026-01-01T00:00:00+00:00",
+        "approved_at": null,
+    })
+    .to_string()
+}
+
+#[test]
+fn a_config_filed_under_another_names_key_exits_one_without_a_name_to_ask_with() {
+    let fixture = Fixture::new();
+    // Onboarded as `foo-bar/baz`; the row's `repo` is then edited to
+    // `someone/else`, a name stored under another key.
+    fixture.propose("foo-bar/baz", &["cargo test"]);
+    overwrite_the_gate_config(&fixture.db_path(), &pending("someone/else"));
+    let ask = |repo: &str| {
+        fixture
+            .command(
+                repo,
+                &fixture.db_path(),
+                fixture.root(),
+                &isolated_path(&fixture.stubs()),
+                ALL_LABELS,
+                None,
+            )
+            .output()
+            .unwrap()
+    };
+
+    let output = ask("Someone/Else");
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &[
+            "Error: Validation error: 'Someone/Else' has no gate config under that exact name, but ",
+            "holds one whose `repo`, \"someone/else\", differs from it only in letter case or host \
+             prefix, under the key 'gate-config:foo-bar-baz'",
+            "then repair or remove it by hand",
+        ],
+    );
+    // Asking with that name reads another key, as the next run shows, so
+    // the error must not send the reader there, or to a command.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("ask with the stored name"), "{stderr}");
+    assert!(!stderr.contains("ironmem autopilot"), "{stderr}");
+
+    let report = report(&ask("someone/else"));
+    assert_eq!(report["onboarded"], json!(false));
+    assert_eq!(report["gate_config"], Value::Null);
+}
+
+#[test]
+fn a_stored_repo_holding_an_escape_character_is_not_written_raw_to_stderr() {
+    let fixture = Fixture::new();
+    fixture.propose("foo-bar/baz", &["cargo test"]);
+    // Still a name stored under that key: the character is written as `-`.
+    overwrite_the_gate_config(&fixture.db_path(), &pending("foo\u{1b}bar/baz"));
+
+    let output = fixture
+        .command(
+            "foo/bar-baz",
+            &fixture.db_path(),
+            fixture.root(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &["belongs to 'foo\\u{1b}bar/baz', not 'foo/bar-baz'"],
+    );
+    assert!(
+        !output.stderr.contains(&0x1b),
+        "{:?}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn a_broken_config_holding_a_name_status_refuses_exits_one_and_its_remedy_works() {
+    let fixture = Fixture::new();
+    let checkout = checkout(&fixture);
+    // `onboard` takes `Owner-Repo` (#422) and stores it under
+    // `gate-config:Owner-Repo`, which is also the key of `Owner/Repo`.
+    let onboard = || {
+        let mut onboard = ironmem();
+        onboard
+            .args(["autopilot", "onboard", "Owner-Repo", "--path", ".", "--db"])
+            .arg(fixture.db_path())
+            .current_dir(&checkout);
+        fixture.env(
+            &mut onboard,
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        );
+        onboard.output().unwrap()
+    };
+    let onboarded = onboard();
+    assert!(onboarded.status.success(), "{onboarded:?}");
+    overwrite_the_gate_config_under(
+        &fixture.db_path(),
+        "logical:gate-config:Owner-Repo",
+        &no_gate("Owner-Repo"),
+    );
+
+    let output = fixture.status(ALL_LABELS, None);
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &[
+            "Error: JSON error: 'owner/repo' has no gate config under that exact name",
+            "the config stored under the key 'gate-config:Owner-Repo', whose `repo` is \
+             \"Owner-Repo\", does not parse: gate_commands must not be empty",
+            "run `ironmem autopilot onboard` with the name that config holds, \"Owner-Repo\", and \
+             `--db ",
+            "` from that repo's checkout, then ask with `owner/repo` again (\"Owner-Repo\" is not \
+             a name `status` accepts, #422)",
+        ],
+    );
+    // Read off the key, the name would be `Owner/Repo`, and onboarding that
+    // would replace the row of `Owner-Repo`.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("Owner/Repo"), "{stderr}");
+    assert!(!stderr.contains("`gate-config:` followed by"), "{stderr}");
+
+    // The remedy, followed: `onboard` with the name the config holds, then
+    // the name first asked about, which is answered.
+    let onboarded = onboard();
+    assert!(onboarded.status.success(), "{onboarded:?}");
+    let report = report(&fixture.status(ALL_LABELS, None));
+    assert_eq!(report["onboarded"], json!(false));
+    assert_eq!(report["gate_config"], Value::Null);
 }
 
 #[test]
