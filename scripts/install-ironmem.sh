@@ -740,21 +740,23 @@ _shell_word() {
 # $TARGET as the first word of a hook command.
 HOOK_PROGRAM="$(_shell_word "$TARGET")"
 
-# Prints $1 escaped for the inside of a JSON string: each \ then each " gets
-# a backslash. Loops for the same reason as _shell_word.
+# Prints $1 escaped for the inside of a JSON string: \ and " get a backslash,
+# and newline, carriage return and tab become \n, \r and \t. One pass over
+# the characters, so no escape is escaped again.
 _json_string_body() {
-  local rest="$1" escaped=""
-  while [[ "$rest" == *\\* ]]; do
-    escaped+="${rest%%\\*}\\\\"
-    rest="${rest#*\\}"
+  local rest="$1" out="" c i
+  for ((i = 0; i < ${#rest}; i++)); do
+    c="${rest:i:1}"
+    case "$c" in
+      \\) out+="\\\\" ;;
+      \") out+='\"' ;;
+      $'\n') out+='\n' ;;
+      $'\r') out+='\r' ;;
+      $'\t') out+='\t' ;;
+      *) out+="$c" ;;
+    esac
   done
-  rest="$escaped$rest"
-  escaped=""
-  while [[ "$rest" == *\"* ]]; do
-    escaped+="${rest%%\"*}\\\""
-    rest="${rest#*\"}"
-  done
-  printf '%s' "$escaped$rest"
+  printf '%s' "$out"
 }
 
 # Prints the WARN every failed wiring attempt ends with; $1 says what failed.

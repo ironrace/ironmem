@@ -905,8 +905,9 @@ class InstallIronmemSelfTest(unittest.TestCase):
         self.assert_hooks_run_from_an_unsafe_install_dir("it's here")
 
     def test_without_jq_the_printed_hook_command_is_quoted(self) -> None:
-        # A space needs shell quoting; a `"` or `\` also needs JSON escaping.
-        for dir_name in ("Jo Smith", 'Jo "JJ" \\ Smith'):
+        # A space needs shell quoting; a `"`, `\`, newline or tab also needs
+        # JSON escaping.
+        for dir_name in ("Jo Smith", 'Jo "JJ" \\ Smith', "Jo\nnew\tline"):
             with self.subTest(dir_name=dir_name), tempfile.TemporaryDirectory() as directory:
                 home = pathlib.Path(directory)
                 path = self.path_without_jq(home / "no-jq-bin")
