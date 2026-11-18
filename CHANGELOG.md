@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`ironmem autopilot status <owner/repo>` (#420).** A report of a repo's
-  gate config (state, gate commands, `proposed_at`, `approved_at`) and of
+  gate config (state, gate commands, `manifest_warnings`, `proposed_at`,
+  `approved_at`) and of
   which `agent:*` and `risk:*` labels it has, as text or `--json`, naming the
   database that answered. It never creates, migrates or writes the database
   file (SQLite may leave its `-wal`/`-shm` side files) and only asks `gh` to

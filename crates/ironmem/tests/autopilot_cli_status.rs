@@ -85,11 +85,12 @@ impl Fixture {
             .unwrap()
     }
 
-    /// `ironmem autopilot status <repo> --json --db <db> --path <path_arg>`
+    /// `ironmem autopilot status <repo> --db <db> --path <path_arg>` (the text
+    /// report)
     /// with the stub answering `labels`, or failing with `fail` on stderr.
     /// Ambient `IRONMEM_*` settings are removed so a developer's shell cannot
     /// change the result.
-    fn command(
+    fn plain(
         &self,
         repo: &str,
         db: &Path,
@@ -100,7 +101,8 @@ impl Fixture {
     ) -> Command {
         let mut command = ironmem();
         command
-            .args(["autopilot", "status", repo, "--json", "--db"])
+            .args(["autopilot", "status", repo])
+            .arg("--db")
             .arg(db)
             .arg("--path")
             .arg(path_arg)
@@ -115,6 +117,21 @@ impl Fixture {
         } else {
             command.env_remove("GH_FAIL");
         }
+        command
+    }
+
+    /// The `--json` form of [`Fixture::plain`].
+    fn command(
+        &self,
+        repo: &str,
+        db: &Path,
+        path_arg: &Path,
+        path_var: &Path,
+        labels: &str,
+        fail: Option<&str>,
+    ) -> Command {
+        let mut command = self.plain(repo, db, path_arg, path_var, labels, fail);
+        command.arg("--json");
         command
     }
 
@@ -365,18 +382,15 @@ fn the_text_report_is_the_default() {
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
 
-    let output = ironmem()
-        .args(["autopilot", "status", REPO, "--db"])
-        .arg(fixture.db_path())
-        .arg("--path")
-        .arg(fixture.root.path())
-        .env("PATH", isolated_path(&fixture.stubs()))
-        .env("GH_LOG", fixture.log_path())
-        .env("GH_LABELS", ALL_LABELS)
-        .env_remove("GH_FAIL")
-        .env_remove("IRONMEM_DB_PATH")
-        .env_remove("IRONMEM_MCP_MODE")
-        .env_remove("IRONMEM_EMBED_MODE")
+    let output = fixture
+        .plain(
+            REPO,
+            &fixture.db_path(),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
         .output()
         .unwrap();
 
@@ -606,4 +620,91 @@ fn a_wal_database_in_a_read_only_directory_exits_one_and_explains_the_side_files
         &output,
         &["could not read the database", "-wal/-shm"],
     );
+}
+
+#[test]
+fn hints_name_the_absolute_database_when_db_was_given_relative() {
+    let fixture = Fixture::new();
+    // Another repo's config, so the database exists and REPO is not onboarded.
+    fixture.propose("other/repo", &["cargo test"]);
+
+    let output = fixture
+        .plain(
+            REPO,
+            Path::new("memory.sqlite3"),
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .current_dir(fixture.root.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let hint = stdout
+        .lines()
+        .find(|line| line.contains("autopilot onboard"))
+        .unwrap_or_else(|| panic!("no onboard hint: {stdout}"));
+    let value = hint
+        .split("--db ")
+        .nth(1)
+        .and_then(|rest| rest.split('`').next())
+        .unwrap_or_else(|| panic!("no --db in the hint: {hint}"))
+        .trim_matches('\'');
+    assert!(
+        Path::new(value).is_absolute(),
+        "the hinted --db is not absolute: {hint}"
+    );
+    assert_eq!(
+        std::fs::canonicalize(value).unwrap(),
+        std::fs::canonicalize(fixture.db_path()).unwrap()
+    );
+}
+
+#[test]
+fn a_repo_name_gh_would_not_accept_exits_one() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+
+    // After `--`, so clap passes the dash-led name through as the repo.
+    let output = ironmem()
+        .args(["autopilot", "status", "--json", "--db"])
+        .arg(fixture.db_path())
+        .args(["--", "-R/x"])
+        .env("PATH", isolated_path(&fixture.stubs()))
+        .env("GH_LOG", fixture.log_path())
+        .env_remove("IRONMEM_DB_PATH")
+        .env_remove("IRONMEM_MCP_MODE")
+        .env_remove("IRONMEM_EMBED_MODE")
+        .output()
+        .unwrap();
+
+    assert_unreadable(&fixture, &output, &["is not a repo name"]);
+}
+
+#[test]
+fn a_stored_config_that_does_not_parse_exits_one() {
+    let fixture = Fixture::new();
+    fixture.propose(REPO, &["cargo test"]);
+    {
+        let conn = rusqlite::Connection::open(fixture.db_path()).unwrap();
+        let changed = conn
+            .execute(
+                "UPDATE drawers SET content = ?1 \
+                 WHERE wing = 'autopilot' AND room = 'backlog-lineage' \
+                 AND source_file LIKE '%gate-config:%'",
+                [r#"{"repo":"owner/repo","state":"approved","gate_commands":[],"proposed_at":"2026-01-01T00:00:00+00:00","approved_at":null}"#],
+            )
+            .unwrap();
+        assert_eq!(
+            changed, 1,
+            "the UPDATE must hit exactly the gate config row"
+        );
+    }
+
+    let output = fixture.status(ALL_LABELS, None);
+
+    assert_unreadable(&fixture, &output, &["gate_commands must not be empty"]);
 }

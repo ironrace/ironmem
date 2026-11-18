@@ -883,7 +883,7 @@ descriptions.
 | Exit status | Meaning |
 |---|---|
 | `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
-| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
+| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`) made of letters, digits, `.`, `_` and `-`, the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
 | `2` | A usage error. An `ironmem` too old to know `status` also exits 2. |
 
 `--json` prints this shape:
@@ -914,18 +914,21 @@ descriptions.
 - A repo name is matched as written: `github.com/owner/repo` and `owner/repo`
   are different names, and so are names that differ in letter case, so ask
   with the name the repo was onboarded under. A three-part name is read as
-  `host/owner/name`. A name that is not `owner/name` or `host/owner/name` exits 1.
+  `host/owner/name`. Each part may hold only letters, digits, `.`, `_` and
+  `-` and may not start with `-`; any other name exits 1.
 - A pending config has `"approved_at": null`.
 - `manifest_warnings` lists the problems recorded on the proposal; read them
   before running `approve`. It is empty when there are none.
 - When `gh` is missing, exits non-zero (authentication, a rate limit, an
-  unknown repo), prints something that is not the expected JSON, returns a
-  list long enough to have been cut off, or `--path` is not a directory,
+  unknown repo), prints something that is not the expected JSON, lists a
+  label with no name, returns a list long enough to have been cut off, or `--path` is not a directory,
   `labels` is `{"read": "failed", "error": "<what failed>"}` with no `agent`
   or `risk` key. A failed read says nothing about which labels exist.
 
-The text report ends its hints with the same `--db` it was run with, and its
-last line names the database.
+When `--db` is given, the text report's `onboard` and `approve` hints end with
+`--db` and the absolute path of the database that answered, so they act on that
+file from any directory (the `labels` hint takes no `--db`). The report's last
+line names the database.
 
 `/evaluate-issue` reads the gate config from this command
 (`docs/EVALUATE_ISSUE.md`, Step 2).

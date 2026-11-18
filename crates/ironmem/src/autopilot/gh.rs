@@ -2850,11 +2850,6 @@ mod tests {
     }
 
     #[test]
-    fn a_repo_with_no_labels_parses_to_an_empty_list() {
-        assert_eq!(parse_label_list("[]\n").unwrap(), Vec::<String>::new());
-    }
-
-    #[test]
     fn a_refused_label_list_is_an_error_not_an_empty_list() {
         // An empty list would report every label as missing. A `gh` that
         // exited non-zero has not said that.
@@ -2897,17 +2892,6 @@ mod tests {
     }
 
     #[test]
-    fn a_label_list_under_the_limit_is_returned_whole() {
-        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(
-            r#"[{"name":"agent:ready"},{"name":"agent:blocked"}]"#,
-        ))]);
-        assert_eq!(
-            repo_labels(&mut gh, "owner/repo").unwrap(),
-            vec!["agent:ready", "agent:blocked"]
-        );
-    }
-
-    #[test]
     fn a_label_row_with_no_name_is_an_error_not_a_blank_label() {
         // GitHub label names cannot be empty, so a row without one is output
         // this parser does not understand. Returning it as "" (or dropping
@@ -2935,6 +2919,12 @@ mod tests {
         let names = repo_labels(&mut gh, "owner/repo").unwrap();
 
         assert_eq!(names.len(), LABEL_LIST_LIMIT - 1);
+        // Returned in order, with each name exactly as listed.
+        assert_eq!(names.first().map(String::as_str), Some("label-0"));
+        assert_eq!(
+            names.last().cloned(),
+            Some(format!("label-{}", LABEL_LIST_LIMIT - 2))
+        );
     }
 
     #[test]

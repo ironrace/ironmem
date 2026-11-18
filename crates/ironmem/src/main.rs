@@ -990,9 +990,11 @@ enum AutopilotCmd {
     /// is not onboarded (`"onboarded": false`, `"gate_config": null`) and
     /// labels that could not be read (`"labels": {"read": "failed", ...}`).
     /// 1 when the gate config could not be read: the repo is not an
-    /// `owner/name`, the database is missing, not an ironmem database or not
-    /// readable, or the stored config does not parse or belongs to another
-    /// repo name. 2 for a usage error.
+    /// `owner/name` (or `host/owner/name`) made of letters, digits, `.`, `_`
+    /// and `-`, the database is missing, not an ironmem database or not
+    /// readable, the stored config does not parse or belongs to another repo
+    /// name, or an ironmem environment setting is invalid (for example
+    /// `IRONMEM_MCP_MODE`, as for every command). 2 for a usage error.
     Status {
         /// Path to the database
         #[arg(long)]
@@ -3600,9 +3602,9 @@ after {n} attempt(s)",
                 if json {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
-                    // The `--db` this ran with, so the hinted commands
-                    // act on the database that was read.
-                    print!("{}", render_text(&status, db.as_deref()));
+                    // Hint `--db` only when one was given; the hint carries the
+                    // report's absolute path, so it works from any directory.
+                    print!("{}", render_text(&status, db.is_some()));
                 }
                 Ok(())
             }
