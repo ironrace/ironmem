@@ -3583,26 +3583,20 @@ after {n} attempt(s)",
                 json,
             } => {
                 use ironmem::autopilot::status::{
-                    read_gate_config_status, render_text, LabelStatus, RepoStatus,
+                    read_gate_config_status, render_text, LabelStatus, RepoName, RepoStatus,
                 };
 
-                // `open_read_only`, never `open_migrated_db`: this command
-                // must not create a missing database or migrate an old one.
                 let cfg = config::Config::load(db.clone())?;
-                let gate_config = read_gate_config_status(&cfg.db_path, &repo)?;
-                // A `gh` that cannot be found is a failed label read, like
-                // one that exits non-zero: the gate config is still reported.
-                let labels = if !std::path::Path::new(&path).is_dir() {
-                    LabelStatus::failed(format!(
-                        "--path '{path}' is not a directory, so gh was not run"
-                    ))
-                } else {
-                    match ironmem::autopilot::gh::GhCli::resolve(&path) {
-                        Ok(mut gh) => LabelStatus::read(&mut gh, &repo),
-                        Err(err) => LabelStatus::failed(err.to_string()),
-                    }
-                };
-                let status = RepoStatus::new(&repo, &cfg.db_path, gate_config, labels);
+                // Parsed here and not by clap, whose own parse failure exits
+                // 2: a malformed repo name is exit 1.
+                let repo = RepoName::parse(&repo)?;
+                // A read-only open, never `open_migrated_db`: this command
+                // must not create a missing database or migrate an old one.
+                let read = read_gate_config_status(&cfg.db_path, &repo)?;
+                // Never an error: a label read that fails is part of the
+                // report, and the gate config is still reported.
+                let labels = LabelStatus::read_in(std::path::Path::new(&path), read.repo());
+                let status = RepoStatus::new(read, labels);
                 if json {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {

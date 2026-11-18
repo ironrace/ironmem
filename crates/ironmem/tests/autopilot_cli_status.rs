@@ -493,6 +493,29 @@ fn a_file_that_is_not_a_database_exits_one_and_names_the_path() {
 }
 
 #[test]
+fn a_malformed_repo_name_is_reported_before_a_missing_database() {
+    let fixture = Fixture::new();
+    let absent_db = fixture.root.path().join("absent.sqlite3");
+
+    let output = fixture
+        .command(
+            "not a repo",
+            &absent_db,
+            fixture.root.path(),
+            &isolated_path(&fixture.stubs()),
+            ALL_LABELS,
+            None,
+        )
+        .output()
+        .unwrap();
+
+    assert_unreadable(&fixture, &output, &["is not a repo name"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("db not found"), "{stderr}");
+    assert!(!absent_db.exists(), "status created the database file");
+}
+
+#[test]
 fn status_never_migrates_an_old_database() {
     let fixture = Fixture::new();
     let db = fixture.db_path();

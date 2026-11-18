@@ -24,6 +24,16 @@ pub enum GateConfigState {
     Approved,
 }
 
+impl GateConfigState {
+    /// The state's name, spelled as it is stored and serialized.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Approved => "approved",
+        }
+    }
+}
+
 /// Whether `gate_commands` is a real, satisfiable gate: non-empty, with no
 /// empty/whitespace-only entry. Shared by [`propose_gate_config`]'s explicit
 /// check (the only write path) and [`GateConfig`]'s deserialize guard (every
@@ -207,7 +217,7 @@ const GATE_CONFIG_KEY_PREFIX: &str = "gate-config:";
 /// list. A listing that fills it may be incomplete, so it is an error.
 const STORED_GATE_CONFIG_LIMIT: usize = 1000;
 
-pub(super) fn gate_config_key(repo: &str) -> String {
+fn gate_config_key(repo: &str) -> String {
     format!("{GATE_CONFIG_KEY_PREFIX}{}", repo_slug(repo))
 }
 
@@ -218,7 +228,9 @@ pub(super) fn gate_config_key(repo: &str) -> String {
 /// returns such a row too. An error when the listing reaches
 /// [`STORED_GATE_CONFIG_LIMIT`], since a possibly incomplete list cannot show
 /// that no near-match exists.
-pub fn stored_gate_config_repos_read_only(db: &ReadOnlyDb) -> Result<Vec<String>, MemoryError> {
+pub(super) fn stored_gate_config_repos_read_only(
+    db: &ReadOnlyDb,
+) -> Result<Vec<String>, MemoryError> {
     let prefix = format!(
         "{}{GATE_CONFIG_KEY_PREFIX}",
         crate::mcp::tools::LOGICAL_KEY_SOURCE_PREFIX
@@ -421,7 +433,7 @@ pub fn get_gate_config(db: &Database, repo: &str) -> Result<Option<GateConfig>, 
 ///
 /// Goes through the same `GateConfig` deserialize guard as every other read:
 /// a stored row with no real gate is an `Err`, never a config.
-pub fn get_gate_config_read_only(
+pub(super) fn get_gate_config_read_only(
     db: &ReadOnlyDb,
     repo: &str,
 ) -> Result<Option<GateConfig>, MemoryError> {
@@ -442,10 +454,33 @@ pub fn is_gate_config_approved(db: &Database, repo: &str) -> Result<bool, Memory
     ))
 }
 
+/// Fixtures for the unit tests of this module's siblings.
+#[cfg(test)]
+pub(super) mod testing {
+    use super::*;
+
+    /// Store `content` as `repo`'s gate config exactly as given, skipping
+    /// every check a proposal goes through, so a test can read back a row no
+    /// writer would produce.
+    pub(in crate::autopilot) fn store_raw_gate_config(db: &Database, repo: &str, content: &str) {
+        write_current(db, &gate_config_key(repo), content).unwrap();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::autopilot::testing::on_disk_db;
+
+    #[test]
+    fn a_state_is_named_as_it_is_serialized() {
+        for state in [GateConfigState::Pending, GateConfigState::Approved] {
+            assert_eq!(
+                serde_json::to_value(state).unwrap(),
+                serde_json::json!(state.as_str())
+            );
+        }
+    }
 
     // ── rung 7: the per-repo wall-clock bound ───────────────────────────
 

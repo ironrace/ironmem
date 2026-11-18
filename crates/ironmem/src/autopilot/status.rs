@@ -7,17 +7,31 @@
 //! reading Autopilot's drawer directly, which tied prose instructions to a
 //! storage layout.
 //!
-//! # Read-only by construction
+//! # Read-only by how the database is opened
 //!
-//! The gate config is read by [`read_gate_config_status`] through
-//! [`ReadOnlyDb`], a type with no write or migrate method, over a connection
-//! opened `SQLITE_OPEN_READ_ONLY`. The labels are read with one
-//! `gh label list`. Nothing here writes the database file or creates a drawer
-//! or a label, though a read-only connection to a WAL-mode database may create
-//! the `-wal`/`-shm` side files.
+//! The gate config is read by [`read_gate_config_status`] over a connection
+//! opened `SQLITE_OPEN_READ_ONLY`, which is what refuses a write. The handle
+//! it reads through, [`ReadOnlyDb`], offers only read methods, but it also
+//! lends its raw connection, so the open flag is the guarantee and the type
+//! is not. The labels are read with one `gh label list`. Nothing here writes
+//! the database file or creates a drawer or a label, though a read-only
+//! connection to a WAL-mode database may create the `-wal`/`-shm` side files.
 //!
 //! The label half is read-only because this module only ever builds a
 //! `label list` argv, not because a type forbids more.
+//!
+//! # What the types hold
+//!
+//! - [`RepoName`] is the only repo argument the reads and the report take,
+//!   and only [`RepoName::parse`] builds one, so no unchecked string reaches
+//!   the database lookup or a `gh` argv.
+//! - [`GateConfigRead`] is built only by [`read_gate_config_status`] and
+//!   carries the repo asked about, the database that answered and what it
+//!   held; [`RepoStatus::new`] takes it whole, so a report cannot name a
+//!   database or a repo other than the ones that were read.
+//! - [`GateConfigStatus`] is built only from a stored
+//!   [`GateConfig`](super::gate_config::GateConfig), and a [`LabelSet`] only
+//!   from a label list that was read in full.
 //!
 //! # A failed read is never a missing label
 //!
@@ -31,27 +45,323 @@
 //! missing key read as false) can still be fooled, which is why `read` exists.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use crate::db::read_only::ReadOnlyDb;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 
 use super::gate_config::{
-    get_gate_config_read_only, stored_gate_config_repos_read_only, GateConfigState,
+    get_gate_config_read_only, stored_gate_config_repos_read_only, GateConfig, GateConfigState,
 };
-use super::gh::{repo_labels, GhRunner};
+use super::gh::{repo_labels, GhCli, GhRunner};
 use super::labels::AgentLabel;
 use super::validate_repo;
+
+/// A repo name that passed the shape check: `owner/name` or `host/owner/name`,
+/// each part non-empty, made only of ASCII letters, digits, `.`, `_` and `-`,
+/// not starting with `-`, and with a name that does not end in `.git`. The
+/// check does not know every name `gh` refuses.
+///
+/// Measured against `gh` 2.96.0 for `gh label list --repo`: a different
+/// letter case and a `github.com/` prefix both resolve to the same repository
+/// (which is why [`read_gate_config_status`] refuses them as near-misses of a
+/// stored name); a name without a host is read against `GH_HOST` when that is
+/// set; a `.git` suffix and `host:port` do not resolve; and a dash-led value
+/// is read as a repo name, not as a flag.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoName {
+    /// The name exactly as it was given.
+    raw: String,
+    identity: RepoIdentity,
+}
+
+impl RepoName {
+    /// Check `given`'s shape. The only way to build a [`RepoName`].
+    pub fn parse(given: &str) -> Result<Self, StatusError> {
+        validate_repo(given).map_err(StatusError::Other)?;
+        let not_a_repo_name = || StatusError::NotARepoName {
+            given: given.to_string(),
+        };
+        let parts: Vec<&str> = given.split('/').collect();
+        let part_ok = |part: &&str| {
+            !part.is_empty()
+                && !part.starts_with('-')
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+        };
+        if !parts.iter().all(part_ok) {
+            return Err(not_a_repo_name());
+        }
+        let (host, owner, name) = match parts.as_slice() {
+            [owner, name] => (None, owner, name),
+            [host, owner, name] => (Some(host), owner, name),
+            _ => return Err(not_a_repo_name()),
+        };
+        let identity = RepoIdentity {
+            host: host.map(|host| host.to_ascii_lowercase()),
+            owner: owner.to_ascii_lowercase(),
+            name: name.to_ascii_lowercase(),
+        };
+        if identity.name.ends_with(".git") {
+            return Err(StatusError::GitSuffix {
+                given: given.to_string(),
+            });
+        }
+        Ok(Self {
+            raw: given.to_string(),
+            identity,
+        })
+    }
+
+    /// The name exactly as it was given.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+}
+
+impl fmt::Display for RepoName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+/// Serialized as the bare name, a JSON string.
+impl Serialize for RepoName {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.raw)
+    }
+}
+
+/// The parts of a repo name that decide which repository it is, ASCII
+/// lowercased.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepoIdentity {
+    /// `None` for an `owner/name`.
+    host: Option<String>,
+    owner: String,
+    name: String,
+}
+
+impl RepoIdentity {
+    /// The identity of a stored repo name. Stored names are not shape-checked,
+    /// so this reads leniently: the last three `/`-separated segments, and
+    /// `None` for a string with no `/`.
+    fn of_stored(repo: &str) -> Option<Self> {
+        let mut segments = repo.rsplit('/');
+        let name = segments.next()?.to_ascii_lowercase();
+        let owner = segments.next()?.to_ascii_lowercase();
+        let host = segments.next().map(str::to_ascii_lowercase);
+        Some(Self { host, owner, name })
+    }
+
+    /// Whether two names could name the same repository: the same owner and
+    /// name, and not two different hosts. A name without a host matches any
+    /// host, because `gh` reads it against its default host, which is not
+    /// known here.
+    fn may_be(&self, other: &Self) -> bool {
+        let hosts_may_match = match (&self.host, &other.host) {
+            (Some(host), Some(other_host)) => host == other_host,
+            _ => true,
+        };
+        self.owner == other.owner && self.name == other.name && hosts_may_match
+    }
+}
+
+/// Why `ironmem autopilot status` could not report. Every variant is exit 1
+/// with nothing on stdout.
+#[derive(Debug, thiserror::Error)]
+pub enum StatusError {
+    /// The string is not shaped like a repo name.
+    #[error(
+        "'{given}' is not a repo name — expected `owner/name` (or `host/owner/name`), each part \
+         made of letters, digits, `.`, `_` and `-`, and not starting with `-`"
+    )]
+    NotARepoName { given: String },
+
+    /// The string is shaped like a repo name but ends in `.git`.
+    #[error("'{given}' ends in `.git`, which `gh` does not resolve — drop the `.git` suffix")]
+    GitSuffix { given: String },
+
+    /// The database path could not be made absolute, so the report could not
+    /// say which file answered.
+    #[error("could not make the database path '{}' absolute: {source}", .path.display())]
+    DbPathNotAbsolute {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The absolute database path is not UTF-8, so neither the JSON report
+    /// nor a `--db` hint could name the file exactly.
+    #[error(
+        "the database path '{}' is not valid UTF-8, so the report could not name it exactly — \
+         use a database whose full path is UTF-8",
+        .path.display()
+    )]
+    DbPathNotUtf8 { path: PathBuf },
+
+    /// The database file is there, and SQLite could not open it.
+    #[error(
+        "could not open the database at {}: the file exists but could not be opened — check its \
+         permissions and that it is a file",
+        .path.display()
+    )]
+    CannotOpen { path: PathBuf },
+
+    /// SQLite failed while the database was being opened or read.
+    #[error(
+        "could not read the database at {}: {source}. `status` opens it read-only and never \
+         writes it.{}",
+        .path.display(),
+        .hint.map_or("", DbHint::sentence)
+    )]
+    Database {
+        path: PathBuf,
+        hint: Option<DbHint>,
+        #[source]
+        source: rusqlite::Error,
+    },
+
+    /// No config is stored under the name asked about, but one is stored
+    /// under a spelling `gh` can read as the same repository.
+    #[error("{}", stored_under_another_name(.asked, .stored, *.host_ambiguous))]
+    StoredUnderAnotherName {
+        asked: RepoName,
+        /// Every stored name that could be the repo asked about.
+        stored: Vec<String>,
+        /// True when a stored name and the asked one differ in whether they
+        /// name a host, the one case that may be two repositories.
+        host_ambiguous: bool,
+    },
+
+    /// The config stored under the asked name's storage key is another
+    /// repo's.
+    #[error(
+        "the gate config stored under this key belongs to '{stored}', not '{asked}' — two repo \
+         names that reduce to the same storage key share one config, so this status cannot be \
+         reported"
+    )]
+    KeyCollision { asked: RepoName, stored: String },
+
+    /// Any other failure, reported as the error it already is: a string that
+    /// fails the crate-wide repo check, a missing database, a stored config
+    /// that does not parse, more stored configs than can be compared.
+    #[error(transparent)]
+    Other(MemoryError),
+}
+
+impl StatusError {
+    /// Classify a failure of the open or of a read: a SQLite error names
+    /// `db_path` and carries the hint that is true of it, anything else
+    /// passes through.
+    fn from_read(db_path: &Path, err: MemoryError) -> Self {
+        match err {
+            MemoryError::Db(source) => Self::Database {
+                path: db_path.to_path_buf(),
+                hint: DbHint::for_error(&source),
+                source,
+            },
+            other => Self::Other(other),
+        }
+    }
+}
+
+/// The message of [`StatusError::StoredUnderAnotherName`].
+fn stored_under_another_name(asked: &RepoName, stored: &[String], host_ambiguous: bool) -> String {
+    let names = stored
+        .iter()
+        .map(|name| format!("'{name}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let other_host = if host_ambiguous {
+        format!(" (if '{asked}' is a different repository on another host, it is not onboarded)")
+    } else {
+        String::new()
+    };
+    format!(
+        "'{asked}' has no gate config under that exact name, but one is stored for {names}, \
+         which differs only in letter case or host prefix — ask with the stored name{other_host}"
+    )
+}
+
+/// The extra sentence a [`StatusError::Database`] carries, for the SQLite
+/// errors it is true of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbHint {
+    /// SQLite refused the read as read-only.
+    WalSideFiles,
+    /// The file is not a database, or is one without ironmem's tables.
+    NotAnIronmemDatabase,
+}
+
+impl DbHint {
+    /// The hint that is true of `e`. A busy or locked database gets none.
+    fn for_error(e: &rusqlite::Error) -> Option<Self> {
+        let rusqlite::Error::SqliteFailure(failure, detail) = e else {
+            return None;
+        };
+        // A foreign or empty SQLite file arrives as a generic `SQLITE_ERROR`
+        // (code `Unknown`) whose message is "no such table: drawers".
+        let no_such_table = detail
+            .as_deref()
+            .is_some_and(|text| text.starts_with("no such table"));
+        match failure.code {
+            rusqlite::ErrorCode::ReadOnly => Some(Self::WalSideFiles),
+            code if code == rusqlite::ErrorCode::NotADatabase || no_such_table => {
+                Some(Self::NotAnIronmemDatabase)
+            }
+            _ => None,
+        }
+    }
+
+    fn sentence(self) -> &'static str {
+        match self {
+            Self::WalSideFiles => {
+                " A WAL-mode database whose -wal/-shm side files are missing can only be read \
+                 from a directory SQLite can create them in."
+            }
+            Self::NotAnIronmemDatabase => {
+                " If this is not an ironmem database, pass the right one with --db."
+            }
+        }
+    }
+}
+
+/// How a [`StatusError`] reaches the command line, where `main` prints
+/// `Error: {MemoryError}` and every `MemoryError` variant adds its own prefix.
+/// The variant is chosen for the prefix that is true of the failure; the
+/// typed data stays on the [`StatusError`].
+impl From<StatusError> for MemoryError {
+    fn from(err: StatusError) -> Self {
+        let message = err.to_string();
+        match err {
+            StatusError::Other(inner) => inner,
+            StatusError::NotARepoName { .. }
+            | StatusError::GitSuffix { .. }
+            | StatusError::DbPathNotUtf8 { .. }
+            | StatusError::StoredUnderAnotherName { .. }
+            | StatusError::KeyCollision { .. } => MemoryError::Validation(message),
+            StatusError::DbPathNotAbsolute { source, .. } => {
+                MemoryError::Io(std::io::Error::new(source.kind(), message))
+            }
+            StatusError::CannotOpen { .. } | StatusError::Database { .. } => {
+                MemoryError::Io(std::io::Error::other(message))
+            }
+        }
+    }
+}
 
 /// Everything `ironmem autopilot status` reports for one repo. Its
 /// serialized form is the command's `--json` output, a contract the
 /// `/evaluate-issue` router reads.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RepoStatus {
-    repo: String,
+    repo: RepoName,
     /// The absolute path of the database file the gate config was read from.
     db: String,
     /// Whether a gate config exists at all, in any state. Always equal to
@@ -63,77 +373,98 @@ pub struct RepoStatus {
 }
 
 impl RepoStatus {
-    /// The one place `onboarded` is derived, so it cannot disagree with
-    /// `gate_config`.
-    pub fn new(
-        repo: &str,
-        db: &Path,
-        gate_config: Option<GateConfigStatus>,
-        labels: LabelStatus,
-    ) -> Self {
+    /// The report for one gate-config read and the labels read for the repo
+    /// it names ([`GateConfigRead::repo`]). The repo, the database and the
+    /// gate config all come from `read`, so they describe one read, and
+    /// `onboarded` is derived here, so it cannot disagree with `gate_config`.
+    pub fn new(read: GateConfigRead, labels: LabelStatus) -> Self {
+        let GateConfigRead { repo, db, config } = read;
         Self {
-            repo: repo.to_string(),
-            // Absolute, so the report names one file whatever the cwd.
-            db: std::path::absolute(db)
-                .unwrap_or_else(|_| db.to_path_buf())
-                .display()
-                .to_string(),
-            onboarded: gate_config.is_some(),
-            gate_config,
+            repo,
+            db,
+            onboarded: config.is_some(),
+            gate_config: config,
             labels,
         }
     }
 }
 
-/// The reported part of a stored gate config.
+/// One read of a repo's gate config: the repo asked about, the database that
+/// answered and what it held. Built only by [`read_gate_config_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateConfigRead {
+    repo: RepoName,
+    /// The absolute path of the database file that was read.
+    db: String,
+    /// `None` for a repo that was never onboarded.
+    config: Option<GateConfigStatus>,
+}
+
+impl GateConfigRead {
+    /// The repo this read was made for, so the labels can be read for the
+    /// same one.
+    pub fn repo(&self) -> &RepoName {
+        &self.repo
+    }
+}
+
+/// The reported part of a stored gate config. Built only from a
+/// [`GateConfig`], which cannot exist without passing its own guard.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GateConfigStatus {
-    pub state: GateConfigState,
+    state: GateConfigState,
     /// Never empty and never holding a blank entry: a stored config that
     /// breaks that rule fails to read instead of being reported.
-    pub gate_commands: Vec<String>,
+    gate_commands: Vec<String>,
     /// Problems a human must read before approving; empty when there are none.
-    pub manifest_warnings: Vec<String>,
-    pub proposed_at: String,
-    /// `None` (JSON `null`) while the config is still pending.
-    pub approved_at: Option<String>,
+    manifest_warnings: Vec<String>,
+    proposed_at: String,
+    /// As stored. The writers set it exactly when they approve a config, but
+    /// nothing checks a stored row for that, so it can disagree with `state`.
+    /// The Lead dispatches on `state` alone, and so does the text report.
+    approved_at: Option<String>,
+}
+
+impl From<GateConfig> for GateConfigStatus {
+    fn from(config: GateConfig) -> Self {
+        Self {
+            state: config.state,
+            gate_commands: config.gate_commands().to_vec(),
+            manifest_warnings: config.manifest_warnings,
+            proposed_at: config.proposed_at,
+            approved_at: config.approved_at,
+        }
+    }
 }
 
 /// What the repo's labels are, or that they could not be read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "read", rename_all = "snake_case")]
+#[serde(tag = "read")]
 pub enum LabelStatus {
     /// The label list was read in full.
-    Ok {
-        /// One entry per [`AgentLabel::ALL`] label, keyed by its GitHub name,
-        /// `true` when the repo has it.
-        agent: BTreeMap<&'static str, bool>,
-        /// The repo's `risk:<class>` labels as spelled on GitHub, sorted.
-        risk: Vec<String>,
-    },
+    #[serde(rename = "ok")]
+    Ok(LabelSet),
     /// The label list could not be read. Says nothing about any label.
+    #[serde(rename = "failed")]
     Failed { error: String },
 }
 
-impl LabelStatus {
-    /// Read `repo`'s labels. Never an `Err`: every failure is
-    /// [`LabelStatus::Failed`], so one unreadable half of the report does
-    /// not hide the other.
-    pub fn read(gh: &mut dyn GhRunner, repo: &str) -> Self {
-        match repo_labels(gh, repo) {
-            Ok(names) => Self::from_names(&names),
-            Err(err) => Self::failed(err.to_string()),
-        }
-    }
+/// The labels of a repo whose label list was read in full. Built only by
+/// matching that list's names, so `agent` always has every
+/// [`AgentLabel::ALL`] entry and `risk` only `risk:<class>` names.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LabelSet {
+    /// One entry per [`AgentLabel::ALL`] label, keyed by its canonical
+    /// lowercase GitHub name, `true` when the repo has it.
+    agent: BTreeMap<&'static str, bool>,
+    /// The repo's `risk:<class>` labels, sorted case-insensitively. Each is
+    /// spelled as it is on GitHub, not lowercased: a repo's `Risk:Logic` is
+    /// listed as `Risk:Logic`. GitHub label names are case-insensitive and
+    /// the Lead reads them that way, so compare an entry case-insensitively.
+    risk: Vec<String>,
+}
 
-    /// A read that failed before `gh` could be asked — for instance when no
-    /// `gh` binary is on `PATH`.
-    pub fn failed(error: impl Into<String>) -> Self {
-        Self::Failed {
-            error: error.into(),
-        }
-    }
-
+impl LabelSet {
     /// Match the repo's label names by name — trimmed and case-insensitive — never by search.
     fn from_names(names: &[String]) -> Self {
         // Driven by `AgentLabel::ALL`, so a new variant cannot be left out
@@ -153,207 +484,145 @@ impl LabelStatus {
             .cloned()
             .collect();
         risk.sort_by_cached_key(|name| (name.to_ascii_lowercase(), name.clone()));
-        Self::Ok { agent, risk }
+        Self { agent, risk }
     }
 }
 
-/// Refuse a string that is not shaped like a repo name. The shape is
-/// `owner/name` or `host/owner/name`, each part non-empty, made only of ASCII
-/// letters, digits, `.`, `_` and `-`, not starting with `-`, and with a name
-/// that does not end in `.git`. This does not know every name `gh` refuses.
-///
-/// Measured against `gh` 2.96.0 for `gh label list --repo`: a different
-/// letter case and a `github.com/` prefix both resolve to the same repository
-/// (which is why [`read_gate_config_status`] refuses them as near-misses of a
-/// stored name); a name without a host is read against `GH_HOST` when that is
-/// set; a `.git` suffix and `host:port` do not resolve; and a dash-led value
-/// is read as a repo name, not as a flag.
-fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
-    validate_repo(repo)?;
-    let segments: Vec<&str> = repo.split('/').collect();
-    let segment_ok = |segment: &&str| {
-        !segment.is_empty()
-            && !segment.starts_with('-')
-            && segment
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-    };
-    let shaped = (2..=3).contains(&segments.len()) && segments.iter().all(segment_ok);
-    if shaped
-        && segments[segments.len() - 1]
-            .to_ascii_lowercase()
-            .ends_with(".git")
-    {
-        return Err(MemoryError::Validation(format!(
-            "'{repo}' ends in `.git`, which `gh` does not resolve — drop the `.git` suffix"
-        )));
+impl LabelStatus {
+    /// Read `repo`'s labels with the `gh` on `PATH`, run in `path`. Never an
+    /// `Err`: a `path` that is not a directory, a `gh` that cannot be found
+    /// and every failure of the read itself are [`LabelStatus::Failed`], so
+    /// one unreadable half of the report does not hide the other.
+    pub fn read_in(path: &Path, repo: &RepoName) -> Self {
+        if !path.is_dir() {
+            return Self::failed(format!(
+                "--path '{}' is not a directory, so gh was not run",
+                path.display()
+            ));
+        }
+        match GhCli::resolve(path) {
+            Ok(mut gh) => Self::read(&mut gh, repo),
+            Err(err) => Self::failed(err.to_string()),
+        }
     }
-    if shaped {
-        Ok(())
-    } else {
-        Err(MemoryError::Validation(format!(
-            "'{repo}' is not a repo name — expected `owner/name` (or `host/owner/name`), each \
-             part made of letters, digits, `.`, `_` and `-`, and not starting with `-`"
-        )))
+
+    /// Read `repo`'s labels through `gh`. Never an `Err`: every failure is
+    /// [`LabelStatus::Failed`].
+    pub fn read(gh: &mut dyn GhRunner, repo: &RepoName) -> Self {
+        match repo_labels(gh, repo.as_str()) {
+            Ok(names) => Self::Ok(LabelSet::from_names(&names)),
+            Err(err) => Self::failed(err.to_string()),
+        }
+    }
+
+    fn failed(error: impl Into<String>) -> Self {
+        Self::Failed {
+            error: error.into(),
+        }
     }
 }
 
 /// Read `repo`'s gate config from the database at `db_path`, opening it
-/// read-only. The repo is checked before the database is touched, so a bad
-/// repo is reported even when the database is missing, and a SQLite failure
-/// is explained rather than passed through bare.
+/// read-only. A SQLite failure is explained rather than passed through bare.
 ///
-/// `Ok(None)` means no gate config is stored under this name, and none that
-/// parses under another spelling of it. When one is stored under a spelling
-/// `gh` can read as the same repository (a different letter case, or a host
-/// on one side only), this is an error naming the stored name instead, so a
-/// repo onboarded under another spelling is not reported as "not onboarded".
-/// Two names with different hosts are different repositories and never match.
+/// A read whose config is `None` means no gate config is stored under this
+/// name, and none that parses under another spelling of it. When one is
+/// stored under a spelling `gh` can read as the same repository (a different
+/// letter case, or a host on one side only), this is an error naming the
+/// stored name instead, so a repo onboarded under another spelling is not
+/// reported as "not onboarded". Two names with different hosts are different
+/// repositories and never match.
 pub fn read_gate_config_status(
     db_path: &Path,
-    repo: &str,
-) -> Result<Option<GateConfigStatus>, MemoryError> {
-    check_repo_shape(repo)?;
-    let explain = |err: MemoryError| match err {
-        MemoryError::Db(e) => explain_db_error(db_path, &e),
-        other => other,
-    };
+    repo: &RepoName,
+) -> Result<GateConfigRead, StatusError> {
+    let reported_db = absolute_db_path(db_path);
     let db = match Database::open_read_only(db_path) {
         // `open_read_only` calls every `CannotOpen` "not found"; a file that
         // is there but cannot be opened is a different problem.
         Err(MemoryError::NotFound(_)) if db_path.exists() => {
-            return Err(MemoryError::Io(std::io::Error::other(format!(
-                "could not open the database at {}: the file exists but could not be opened — \
-                 check its permissions and that it is a file",
-                db_path.display()
-            ))));
+            return Err(StatusError::CannotOpen {
+                path: db_path.to_path_buf(),
+            });
         }
-        other => other.map_err(explain)?,
+        other => other.map_err(|err| StatusError::from_read(db_path, err))?,
     };
-    let status = gate_config_status(&db, repo).map_err(explain)?;
-    if status.is_some() {
-        return Ok(status);
+    let config = gate_config_status(&db, db_path, repo)?;
+    if config.is_none() {
+        refuse_another_spelling(&db, db_path, repo)?;
     }
-    // No config under this exact name. `gh` can read a different letter case,
-    // or a name with a host and one without, as the same repository, so a
-    // config stored under one of those spellings means the repo may already
-    // be onboarded under another name.
-    let near: Vec<String> = stored_gate_config_repos_read_only(&db)
-        .map_err(explain)?
+    Ok(GateConfigRead {
+        repo: repo.clone(),
+        db: reported_db,
+        config,
+    })
+}
+
+/// `db` as the report names it: absolute, so the report names one file
+/// whatever the cwd.
+fn absolute_db_path(db: &Path) -> String {
+    std::path::absolute(db)
+        .unwrap_or_else(|_| db.to_path_buf())
+        .display()
+        .to_string()
+}
+
+/// An error when a gate config is stored under another spelling of `repo`.
+/// Called when none is stored under the exact name: `gh` can read a different
+/// letter case, or a name with a host and one without, as the same
+/// repository, so such a config means the repo may already be onboarded under
+/// another name.
+fn refuse_another_spelling(
+    db: &ReadOnlyDb,
+    db_path: &Path,
+    repo: &RepoName,
+) -> Result<(), StatusError> {
+    let near: Vec<(String, RepoIdentity)> = stored_gate_config_repos_read_only(db)
+        .map_err(|err| StatusError::from_read(db_path, err))?
         .into_iter()
-        .filter(|stored| stored != repo && same_repository(stored, repo))
+        .filter(|stored| stored != repo.as_str())
+        .filter_map(|stored| {
+            let identity = RepoIdentity::of_stored(&stored)?;
+            repo.identity
+                .may_be(&identity)
+                .then_some((stored, identity))
+        })
         .collect();
     if near.is_empty() {
-        return Ok(None);
+        return Ok(());
     }
-    let names = near
-        .iter()
-        .map(|name| format!("'{name}'"))
-        .collect::<Vec<_>>()
-        .join(", ");
     // Only one side naming a host is the one case that may be two
     // repositories, so the error says what is true if it is.
-    let asked_names_host = names_a_host(repo);
-    let other_host = if near
+    let host_ambiguous = near
         .iter()
-        .any(|stored| names_a_host(stored) != asked_names_host)
-    {
-        format!(" (if '{repo}' is a different repository on another host, it is not onboarded)")
-    } else {
-        String::new()
-    };
-    Err(MemoryError::Validation(format!(
-        "'{repo}' has no gate config under that exact name, but one is stored for {names}, \
-         which differs only in letter case or host prefix — ask with the stored name{other_host}"
-    )))
-}
-
-/// The host (when the name has one), owner and name of `repo`: its last three
-/// `/`-separated segments, ASCII lowercased. `None` for a string with no `/`.
-fn repo_identity(repo: &str) -> Option<(Option<String>, String, String)> {
-    let mut segments = repo.rsplit('/');
-    let name = segments.next()?.to_ascii_lowercase();
-    let owner = segments.next()?.to_ascii_lowercase();
-    let host = segments.next().map(str::to_ascii_lowercase);
-    Some((host, owner, name))
-}
-
-/// Whether `repo` is a `host/owner/name` rather than an `owner/name`.
-fn names_a_host(repo: &str) -> bool {
-    matches!(repo_identity(repo), Some((Some(_), _, _)))
-}
-
-/// Whether two repo strings could name the same repository: the same owner
-/// and name ignoring ASCII case, and not two different hosts. A name without
-/// a host matches any host, because `gh` reads it against its default host,
-/// which is not known here.
-fn same_repository(a: &str, b: &str) -> bool {
-    let (Some((host_a, owner_a, name_a)), Some((host_b, owner_b, name_b))) =
-        (repo_identity(a), repo_identity(b))
-    else {
-        return false;
-    };
-    let hosts_may_match = match (host_a, host_b) {
-        (Some(host_a), Some(host_b)) => host_a == host_b,
-        _ => true,
-    };
-    owner_a == owner_b && name_a == name_b && hosts_may_match
-}
-
-/// An I/O failure naming `db_path`, with a hint only for the SQLite errors the
-/// hint is true of. A busy or locked database gets neither hint.
-fn explain_db_error(db_path: &Path, e: &rusqlite::Error) -> MemoryError {
-    let mut message = format!(
-        "could not read the database at {}: {e}. `status` opens it read-only and never \
-         writes it.",
-        db_path.display()
-    );
-    if let rusqlite::Error::SqliteFailure(failure, detail) = e {
-        // A foreign or empty SQLite file arrives as a generic `SQLITE_ERROR`
-        // (code `Unknown`) whose message is "no such table: drawers".
-        let no_such_table = detail
-            .as_deref()
-            .is_some_and(|text| text.starts_with("no such table"));
-        match failure.code {
-            rusqlite::ErrorCode::ReadOnly => message.push_str(
-                " A WAL-mode database whose -wal/-shm side files are missing can only be read \
-                 from a directory SQLite can create them in.",
-            ),
-            code if code == rusqlite::ErrorCode::NotADatabase || no_such_table => message
-                .push_str(" If this is not an ironmem database, pass the right one with --db."),
-            _ => {}
-        }
-    }
-    MemoryError::Io(std::io::Error::other(message))
+        .any(|(_, identity)| identity.host.is_some() != repo.identity.host.is_some());
+    Err(StatusError::StoredUnderAnotherName {
+        asked: repo.clone(),
+        stored: near.into_iter().map(|(stored, _)| stored).collect(),
+        host_ambiguous,
+    })
 }
 
 /// Read `repo`'s gate config, whatever state it is in. `Ok(None)` is a repo
-/// that was never onboarded; an `Err` is a stored config that does not parse
-/// or that belongs to another repo name. The caller has already checked the
-/// repo's shape ([`read_gate_config_status`]).
+/// that was never onboarded; an `Err` is a read that failed, a stored config
+/// that does not parse, or one that belongs to another repo name.
 fn gate_config_status(
     db: &ReadOnlyDb,
-    repo: &str,
-) -> Result<Option<GateConfigStatus>, MemoryError> {
-    let Some(config) = get_gate_config_read_only(db, repo)? else {
+    db_path: &Path,
+    repo: &RepoName,
+) -> Result<Option<GateConfigStatus>, StatusError> {
+    let Some(config) = get_gate_config_read_only(db, repo.as_str())
+        .map_err(|err| StatusError::from_read(db_path, err))?
+    else {
         return Ok(None);
     };
-    if config.repo != repo {
-        return Err(MemoryError::Validation(format!(
-            "the gate config stored under this key belongs to '{}', not '{repo}' — two repo \
-             names that reduce to the same storage key share one config, so this status cannot \
-             be reported",
-            config.repo
-        )));
+    if config.repo != repo.as_str() {
+        return Err(StatusError::KeyCollision {
+            asked: repo.clone(),
+            stored: config.repo,
+        });
     }
-    let gate_commands = config.gate_commands().to_vec();
-    Ok(Some(GateConfigStatus {
-        state: config.state,
-        gate_commands,
-        manifest_warnings: config.manifest_warnings,
-        proposed_at: config.proposed_at,
-        approved_at: config.approved_at,
-    }))
+    Ok(Some(GateConfigStatus::from(config)))
 }
 
 /// `arg` quoted for a POSIX shell: unchanged when it is non-empty and made only
@@ -377,7 +646,7 @@ fn shell_quote(arg: &str) -> String {
 /// read wherever they are run from. The `labels` hint takes no `--db`.
 pub fn render_text(status: &RepoStatus, hint_db: bool) -> String {
     let repo = &status.repo;
-    let quoted_repo = shell_quote(repo);
+    let quoted_repo = shell_quote(repo.as_str());
     let db_flag = if hint_db {
         format!(" --db {}", shell_quote(&status.db))
     } else {
@@ -390,10 +659,7 @@ pub fn render_text(status: &RepoStatus, hint_db: bool) -> String {
              {quoted_repo} --path .{db_flag}` from the repo's checkout first.\n"
         )),
         Some(config) => {
-            let state = match config.state {
-                GateConfigState::Pending => "pending",
-                GateConfigState::Approved => "approved",
-            };
+            let state = config.state.as_str();
             out.push_str(&format!("{repo}: gate config {state}\n"));
             for command in &config.gate_commands {
                 out.push_str(&format!("  - {command}\n"));
@@ -420,7 +686,7 @@ pub fn render_text(status: &RepoStatus, hint_db: bool) -> String {
         LabelStatus::Failed { error } => {
             out.push_str(&format!("Labels: could not be read — {error}\n"));
         }
-        LabelStatus::Ok { agent, risk } => {
+        LabelStatus::Ok(LabelSet { agent, risk }) => {
             out.push_str("Labels:\n");
             for (label, present) in agent {
                 let word = if *present { "present" } else { "MISSING" };
@@ -446,10 +712,27 @@ pub fn render_text(status: &RepoStatus, hint_db: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::autopilot::gate_config::testing::store_raw_gate_config;
     use crate::autopilot::gate_config::{approve_gate_config, propose_gate_config};
     use crate::autopilot::gh::testing::ScriptedGh;
     use crate::autopilot::gh::{label_list_argv, GhOutput};
     use crate::autopilot::testing::on_disk_db;
+
+    fn repo(name: &str) -> RepoName {
+        RepoName::parse(name).unwrap()
+    }
+
+    /// The report for `owner/repo` read from `db`, without a database.
+    fn status_of(db: &str, config: Option<GateConfigStatus>, labels: LabelStatus) -> RepoStatus {
+        RepoStatus::new(
+            GateConfigRead {
+                repo: repo("owner/repo"),
+                db: db.to_string(),
+                config,
+            },
+            labels,
+        )
+    }
 
     fn label_json(names: &[&str]) -> String {
         let rows: Vec<serde_json::Value> = names
@@ -461,7 +744,7 @@ mod tests {
 
     fn read_labels(names: &[&str]) -> LabelStatus {
         let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(&label_json(names)))]);
-        let status = LabelStatus::read(&mut gh, "owner/repo");
+        let status = LabelStatus::read(&mut gh, &repo("owner/repo"));
         assert_eq!(gh.seen, vec![label_list_argv("owner/repo")]);
         status
     }
@@ -488,10 +771,10 @@ mod tests {
         ]);
         assert_eq!(
             status,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: agent_map(true, true, true),
                 risk: vec!["risk:documentation".into(), "risk:logic".into()],
-            }
+            })
         );
     }
 
@@ -500,10 +783,10 @@ mod tests {
         let status = read_labels(&["agent:ready", "agent:blocked"]);
         assert_eq!(
             status,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: agent_map(true, true, false),
                 risk: vec![],
-            }
+            })
         );
     }
 
@@ -522,10 +805,10 @@ mod tests {
         ]);
         assert_eq!(
             status,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: agent_map(false, false, false),
                 risk: vec![],
-            }
+            })
         );
     }
 
@@ -536,10 +819,10 @@ mod tests {
         let status = read_labels(&["Agent:Ready", "Risk:Logic"]);
         assert_eq!(
             status,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: agent_map(true, false, false),
                 risk: vec!["Risk:Logic".into()],
-            }
+            })
         );
     }
 
@@ -550,7 +833,7 @@ mod tests {
             "HTTP 401: Bad credentials (https://api.github.com/graphql)",
         ))]);
 
-        let status = LabelStatus::read(&mut gh, "owner/repo");
+        let status = LabelStatus::read(&mut gh, &repo("owner/repo"));
 
         match status {
             LabelStatus::Failed { error } => {
@@ -566,11 +849,28 @@ mod tests {
         let mut gh = ScriptedGh::new(vec![Err(MemoryError::NotFound(
             "failed to start gh label list".into(),
         ))]);
-        let status = LabelStatus::read(&mut gh, "owner/repo");
+        let status = LabelStatus::read(&mut gh, &repo("owner/repo"));
         assert_eq!(
             status,
             LabelStatus::failed("Not found: failed to start gh label list")
         );
+    }
+
+    #[test]
+    fn a_path_that_is_not_a_directory_is_a_failed_read_without_asking_gh() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-dir");
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "x").unwrap();
+        for path in [missing, file] {
+            assert_eq!(
+                LabelStatus::read_in(&path, &repo("owner/repo")),
+                LabelStatus::failed(format!(
+                    "--path '{}' is not a directory, so gh was not run",
+                    path.display()
+                ))
+            );
+        }
     }
 
     #[test]
@@ -601,18 +901,21 @@ mod tests {
         };
 
         let ro = Database::open_read_only(&path).unwrap();
-        let status = gate_config_status(&ro, "owner/repo").unwrap().unwrap();
+        let status = gate_config_status(&ro, &path, &repo("owner/repo"))
+            .unwrap()
+            .unwrap();
 
+        assert_eq!(status.state, GateConfigState::Approved);
         assert_eq!(
-            status,
-            GateConfigStatus {
-                state: GateConfigState::Approved,
-                gate_commands: vec!["cargo fmt --all -- --check".into(), "cargo test".into()],
-                manifest_warnings: vec![],
-                proposed_at: stored.proposed_at.clone(),
-                approved_at: stored.approved_at.clone(),
-            }
+            status.gate_commands,
+            vec![
+                "cargo fmt --all -- --check".to_string(),
+                "cargo test".to_string()
+            ]
         );
+        assert_eq!(status.manifest_warnings, Vec::<String>::new());
+        assert_eq!(status.proposed_at, stored.proposed_at);
+        assert_eq!(status.approved_at, stored.approved_at);
         assert!(status.approved_at.is_some());
     }
 
@@ -625,7 +928,9 @@ mod tests {
         }
 
         let ro = Database::open_read_only(&path).unwrap();
-        let status = gate_config_status(&ro, "owner/repo").unwrap().unwrap();
+        let status = gate_config_status(&ro, &path, &repo("owner/repo"))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(status.state, GateConfigState::Pending);
         assert_eq!(status.approved_at, None);
@@ -635,14 +940,30 @@ mod tests {
     fn a_repo_never_onboarded_has_no_gate_config_status() {
         let (_dir, path) = on_disk_db();
         let ro = Database::open_read_only(&path).unwrap();
-        assert_eq!(gate_config_status(&ro, "owner/repo").unwrap(), None);
+        assert_eq!(
+            gate_config_status(&ro, &path, &repo("owner/repo")).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_parsed_repo_name_keeps_the_spelling_it_was_given() {
+        let name = repo("GitHub.com/Owner/My.Repo_2");
+        assert_eq!(name.as_str(), "GitHub.com/Owner/My.Repo_2");
+        assert_eq!(name.to_string(), "GitHub.com/Owner/My.Repo_2");
+        assert_eq!(
+            serde_json::to_value(&name).unwrap(),
+            serde_json::json!("GitHub.com/Owner/My.Repo_2")
+        );
     }
 
     #[test]
     fn an_empty_repo_string_is_refused() {
-        let (_dir, path) = on_disk_db();
-        let err = read_gate_config_status(&path, "  ").unwrap_err();
-        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+        let err = RepoName::parse("  ").unwrap_err();
+        assert!(
+            matches!(err, StatusError::Other(MemoryError::Validation(_))),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -661,17 +982,21 @@ mod tests {
             "owner/it's",
             "owner/repo\\n",
         ] {
-            let err = read_gate_config_status(&path, bad).unwrap_err();
-            match err {
-                MemoryError::Validation(message) => {
-                    assert!(message.contains("is not a repo name"), "{bad}: {message}");
-                    assert!(
-                        message.contains("not starting with `-`"),
-                        "{bad}: {message}"
-                    );
-                }
-                other => panic!("{bad}: expected Validation, got {other:?}"),
-            }
+            let err = RepoName::parse(bad).unwrap_err();
+            assert!(
+                matches!(&err, StatusError::NotARepoName { given } if given == bad),
+                "{bad}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(message.contains("is not a repo name"), "{bad}: {message}");
+            assert!(
+                message.contains("not starting with `-`"),
+                "{bad}: {message}"
+            );
+            assert!(
+                matches!(MemoryError::from(err), MemoryError::Validation(_)),
+                "{bad}"
+            );
         }
         for good in [
             "owner/repo",
@@ -679,7 +1004,7 @@ mod tests {
             "ghe.example.com/owner/repo",
         ] {
             assert_eq!(
-                read_gate_config_status(&path, good).unwrap(),
+                read_gate_config_status(&path, &repo(good)).unwrap().config,
                 None,
                 "{good}"
             );
@@ -695,24 +1020,30 @@ mod tests {
             "this is not sqlite, it is a text file of some length\n".repeat(50),
         )
         .unwrap();
-        let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
-        match err {
-            MemoryError::Io(io) => {
-                let message = io.to_string();
-                assert!(
-                    message.contains("could not read the database at"),
-                    "{message}"
-                );
-                assert!(message.contains(&path.display().to_string()), "{message}");
-                assert!(message.contains("never writes it"), "{message}");
-                assert!(
-                    message.contains("pass the right one with --db"),
-                    "{message}"
-                );
-                assert!(!message.contains("-wal/-shm"), "{message}");
-            }
-            other => panic!("expected the mapped Io error, got {other:?}"),
-        }
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StatusError::Database {
+                    path: named,
+                    hint: Some(DbHint::NotAnIronmemDatabase),
+                    ..
+                } if named == &path
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("could not read the database at"),
+            "{message}"
+        );
+        assert!(message.contains(&path.display().to_string()), "{message}");
+        assert!(message.contains("never writes it"), "{message}");
+        assert!(
+            message.contains("pass the right one with --db"),
+            "{message}"
+        );
+        assert!(!message.contains("-wal/-shm"), "{message}");
     }
 
     #[test]
@@ -720,19 +1051,25 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("empty.sqlite3");
         rusqlite::Connection::open(&path).unwrap();
-        let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
-        match err {
-            MemoryError::Io(io) => {
-                let message = io.to_string();
-                assert!(message.contains("no such table"), "{message}");
-                assert!(
-                    message.contains("pass the right one with --db"),
-                    "{message}"
-                );
-                assert!(!message.contains("-wal/-shm"), "{message}");
-            }
-            other => panic!("expected the mapped Io error, got {other:?}"),
-        }
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                StatusError::Database {
+                    hint: Some(DbHint::NotAnIronmemDatabase),
+                    source: rusqlite::Error::SqliteFailure(_, Some(detail)),
+                    ..
+                } if detail.starts_with("no such table")
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(message.contains("no such table"), "{message}");
+        assert!(
+            message.contains("pass the right one with --db"),
+            "{message}"
+        );
+        assert!(!message.contains("-wal/-shm"), "{message}");
     }
 
     #[test]
@@ -746,23 +1083,23 @@ mod tests {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
             return;
         }
-        let result = read_gate_config_status(&path, "owner/repo");
+        let result = read_gate_config_status(&path, &repo("owner/repo"));
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        match result.unwrap_err() {
-            MemoryError::Io(io) => {
-                let message = io.to_string();
-                assert!(
-                    message.contains("could not open the database at"),
-                    "{message}"
-                );
-                assert!(
-                    message.contains("the file exists but could not be opened"),
-                    "{message}"
-                );
-                assert!(!message.contains("db not found"), "{message}");
-            }
-            other => panic!("expected the Io error, got {other:?}"),
-        }
+        let err = result.unwrap_err();
+        assert!(
+            matches!(&err, StatusError::CannotOpen { path: named } if named == &path),
+            "{err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.contains("could not open the database at"),
+            "{message}"
+        );
+        assert!(
+            message.contains("the file exists but could not be opened"),
+            "{message}"
+        );
+        assert!(!message.contains("db not found"), "{message}");
     }
 
     #[test]
@@ -771,7 +1108,18 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_READONLY),
             Some("attempt to write a readonly database".into()),
         );
-        let message = explain_db_error(Path::new("/x/m.db"), &readonly).to_string();
+        let err = StatusError::from_read(Path::new("/x/m.db"), MemoryError::Db(readonly));
+        assert!(
+            matches!(
+                err,
+                StatusError::Database {
+                    hint: Some(DbHint::WalSideFiles),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let message = err.to_string();
         assert!(message.contains("-wal/-shm"), "{message}");
         assert!(!message.contains("pass the right one"), "{message}");
 
@@ -779,7 +1127,12 @@ mod tests {
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             Some("database is locked".into()),
         );
-        let message = explain_db_error(Path::new("/x/m.db"), &busy).to_string();
+        let err = StatusError::from_read(Path::new("/x/m.db"), MemoryError::Db(busy));
+        assert!(
+            matches!(err, StatusError::Database { hint: None, .. }),
+            "{err:?}"
+        );
+        let message = err.to_string();
         assert!(message.contains("database is locked"), "{message}");
         assert!(!message.contains("-wal/-shm"), "{message}");
         assert!(!message.contains("pass the right one"), "{message}");
@@ -787,25 +1140,16 @@ mod tests {
 
     #[test]
     fn a_relative_database_path_is_reported_as_an_absolute_one() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("m.db"),
-            None,
-            LabelStatus::failed("x"),
-        );
-        assert!(Path::new(&status.db).is_absolute(), "{}", status.db);
-        assert!(status.db.ends_with("m.db"), "{}", status.db);
+        let db = absolute_db_path(Path::new("m.db"));
+        assert!(Path::new(&db).is_absolute(), "{db}");
+        assert!(db.ends_with("m.db"), "{db}");
     }
 
     #[test]
     fn a_repo_padded_with_whitespace_is_refused() {
-        let (_dir, path) = on_disk_db();
         for bad in [" owner/repo", "owner/repo "] {
             assert!(
-                matches!(
-                    read_gate_config_status(&path, bad),
-                    Err(MemoryError::Validation(_))
-                ),
+                matches!(RepoName::parse(bad), Err(StatusError::NotARepoName { .. })),
                 "{bad:?}"
             );
         }
@@ -815,27 +1159,14 @@ mod tests {
     fn reading_by_path_keeps_not_found_for_a_missing_database() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("absent.sqlite3");
-        let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
         match err {
-            MemoryError::NotFound(message) => {
+            StatusError::Other(MemoryError::NotFound(message)) => {
                 assert!(message.contains("db not found at"), "{message}")
             }
             other => panic!("expected NotFound, got {other:?}"),
         }
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn reading_by_path_checks_the_repo_before_the_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("absent.sqlite3");
-        let err = read_gate_config_status(&path, "not a repo").unwrap_err();
-        match err {
-            MemoryError::Validation(message) => {
-                assert!(message.contains("is not a repo name"), "{message}")
-            }
-            other => panic!("expected the repo error, got {other:?}"),
-        }
     }
 
     #[test]
@@ -845,20 +1176,18 @@ mod tests {
             let db = Database::open(&path).unwrap();
             propose_gate_config(&db, "owner/repo", vec!["cargo test".into()], vec![]).unwrap();
         }
-        let status = read_gate_config_status(&path, "owner/repo")
-            .unwrap()
-            .unwrap();
-        assert_eq!(status.gate_commands, vec!["cargo test".to_string()]);
+        let read = read_gate_config_status(&path, &repo("owner/repo")).unwrap();
+        assert_eq!(read.repo().as_str(), "owner/repo");
+        assert_eq!(read.db, path.display().to_string());
+        assert_eq!(
+            read.config.unwrap().gate_commands,
+            vec!["cargo test".to_string()]
+        );
     }
 
     #[test]
     fn the_text_report_ends_with_the_database_that_answered() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
-            None,
-            read_labels(&[]),
-        );
+        let status = status_of("/tmp/mem.db", None, read_labels(&[]));
         let text = render_text(&status, false);
         assert!(text.ends_with("Database: /tmp/mem.db\n"), "{text}");
     }
@@ -868,17 +1197,19 @@ mod tests {
         let (_dir, path) = on_disk_db();
         {
             let db = Database::open(&path).unwrap();
-            crate::autopilot::write_current(
+            store_raw_gate_config(
                 &db,
-                &crate::autopilot::gate_config::gate_config_key("owner/repo"),
+                "owner/repo",
                 r#"{"repo":"owner/repo","state":"approved","gate_commands":[],"proposed_at":"2026-01-01T00:00:00+00:00","approved_at":null}"#,
-            )
-            .unwrap();
+            );
         }
 
-        let err = read_gate_config_status(&path, "owner/repo").unwrap_err();
+        let err = read_gate_config_status(&path, &repo("owner/repo")).unwrap_err();
 
-        assert!(matches!(err, MemoryError::Json(_)), "{err:?}");
+        assert!(
+            matches!(err, StatusError::Other(MemoryError::Json(_))),
+            "{err:?}"
+        );
         assert!(
             err.to_string()
                 .contains(crate::autopilot::EMPTY_GATE_COMMANDS_MSG),
@@ -898,14 +1229,41 @@ mod tests {
         (dir, path)
     }
 
-    fn near_miss_message(stored: &[&str], asked: &str) -> String {
-        let (_dir, path) = db_with_configs(stored);
-        match read_gate_config_status(&path, asked) {
-            Err(MemoryError::Validation(message)) => message,
-            other => {
-                panic!("{asked} against {stored:?}: expected the near-miss error, got {other:?}")
+    /// What a near-miss error carries, and what it says.
+    struct NearMiss {
+        stored: Vec<String>,
+        host_ambiguous: bool,
+        message: String,
+    }
+
+    /// The near-miss a read of `asked` gets from the database at `path`.
+    fn near_miss_at(path: &Path, asked: &str) -> NearMiss {
+        let err = match read_gate_config_status(path, &repo(asked)) {
+            Err(err) => err,
+            Ok(read) => panic!("{asked}: expected the near-miss error, got {read:?}"),
+        };
+        let message = err.to_string();
+        match err {
+            StatusError::StoredUnderAnotherName {
+                asked: named,
+                stored,
+                host_ambiguous,
+            } => {
+                assert_eq!(named.as_str(), asked);
+                NearMiss {
+                    stored,
+                    host_ambiguous,
+                    message,
+                }
             }
+            other => panic!("{asked}: expected the near-miss error, got {other:?}"),
         }
+    }
+
+    /// The near-miss a read of `asked` gets against a database holding `stored`.
+    fn near_miss(stored: &[&str], asked: &str) -> NearMiss {
+        let (_dir, path) = db_with_configs(stored);
+        near_miss_at(&path, asked)
     }
 
     #[test]
@@ -915,7 +1273,12 @@ mod tests {
             ("ironrace/ironmem", "github.com/ironrace/ironmem"),
             ("ghe.example.com/ironrace/ironmem", "ironrace/ironmem"),
         ] {
-            let message = near_miss_message(&[stored], asked);
+            let NearMiss {
+                stored: named,
+                message,
+                ..
+            } = near_miss(&[stored], asked);
+            assert_eq!(named, vec![stored.to_string()]);
             assert!(message.contains(&format!("'{asked}'")), "{message}");
             assert!(message.contains(&format!("'{stored}'")), "{message}");
             assert!(message.contains("ask with the stored name"), "{message}");
@@ -924,7 +1287,19 @@ mod tests {
 
     #[test]
     fn every_matching_stored_name_is_listed() {
-        let message = near_miss_message(&["owner/repo", "github.com/owner/repo"], "OWNER/REPO");
+        let NearMiss {
+            mut stored,
+            message,
+            ..
+        } = near_miss(&["owner/repo", "github.com/owner/repo"], "OWNER/REPO");
+        stored.sort();
+        assert_eq!(
+            stored,
+            vec![
+                "github.com/owner/repo".to_string(),
+                "owner/repo".to_string()
+            ]
+        );
         assert!(message.contains("'owner/repo'"), "{message}");
         assert!(message.contains("'github.com/owner/repo'"), "{message}");
     }
@@ -932,17 +1307,32 @@ mod tests {
     #[test]
     fn the_exact_name_wins_over_a_differently_cased_one() {
         let (_dir, path) = db_with_configs(&["owner/repo", "Owner/Repo"]);
-        let status = read_gate_config_status(&path, "owner/repo").unwrap();
-        assert!(status.is_some());
+        let read = read_gate_config_status(&path, &repo("owner/repo")).unwrap();
+        assert!(read.config.is_some());
     }
 
     #[test]
     fn an_unrelated_or_longer_named_repo_is_not_a_near_miss() {
         let (_dir, path) = db_with_configs(&["other/thing", "owner/repo"]);
-        assert_eq!(read_gate_config_status(&path, "owner/repo2").unwrap(), None);
-        assert_eq!(read_gate_config_status(&path, "xowner/repo").unwrap(), None);
+        assert_eq!(
+            read_gate_config_status(&path, &repo("owner/repo2"))
+                .unwrap()
+                .config,
+            None
+        );
+        assert_eq!(
+            read_gate_config_status(&path, &repo("xowner/repo"))
+                .unwrap()
+                .config,
+            None
+        );
         let (_dir, path) = db_with_configs(&["other/thing"]);
-        assert_eq!(read_gate_config_status(&path, "owner/repo").unwrap(), None);
+        assert_eq!(
+            read_gate_config_status(&path, &repo("owner/repo"))
+                .unwrap()
+                .config,
+            None
+        );
     }
 
     #[test]
@@ -950,7 +1340,7 @@ mod tests {
         let (_dir, path) = db_with_configs(&["ghe.example.com/owner/repo"]);
         for asked in ["github.com/owner/repo", "github.com/Owner/Repo"] {
             assert_eq!(
-                read_gate_config_status(&path, asked).unwrap(),
+                read_gate_config_status(&path, &repo(asked)).unwrap().config,
                 None,
                 "{asked}"
             );
@@ -959,8 +1349,14 @@ mod tests {
 
     #[test]
     fn the_same_host_in_another_letter_case_is_a_near_miss() {
-        let message = near_miss_message(&["github.com/owner/repo"], "GitHub.com/Owner/repo");
-        assert!(message.contains("'github.com/owner/repo'"), "{message}");
+        let near = near_miss(&["github.com/owner/repo"], "GitHub.com/Owner/repo");
+        assert_eq!(near.stored, vec!["github.com/owner/repo".to_string()]);
+        assert!(!near.host_ambiguous);
+        assert!(
+            near.message.contains("'github.com/owner/repo'"),
+            "{}",
+            near.message
+        );
     }
 
     #[test]
@@ -971,7 +1367,12 @@ mod tests {
             ("ghe.example.com/owner/repo", "owner/repo"),
             ("owner/repo", "ghe.example.com/owner/repo"),
         ] {
-            let message = near_miss_message(&[stored], asked);
+            let NearMiss {
+                host_ambiguous,
+                message,
+                ..
+            } = near_miss(&[stored], asked);
+            assert!(host_ambiguous, "{stored} / {asked}");
             assert!(
                 message.contains(&format!(
                     "if '{asked}' is a different repository on another host, it is not onboarded"
@@ -984,7 +1385,12 @@ mod tests {
             ("owner/repo", "Owner/Repo"),
             ("github.com/owner/repo", "github.com/Owner/Repo"),
         ] {
-            let message = near_miss_message(&[stored], asked);
+            let NearMiss {
+                host_ambiguous,
+                message,
+                ..
+            } = near_miss(&[stored], asked);
+            assert!(!host_ambiguous, "{stored} / {asked}");
             assert!(!message.contains("another host"), "{message}");
         }
     }
@@ -1009,38 +1415,43 @@ mod tests {
             assert_eq!(changed, 1, "the UPDATE must hit the gate config row");
         }
 
-        assert!(read_gate_config_status(&path, "owner/repo")
+        assert!(read_gate_config_status(&path, &repo("owner/repo"))
             .unwrap()
+            .config
             .is_some());
-        match read_gate_config_status(&path, "Owner/Repo") {
-            Err(MemoryError::Validation(message)) => {
-                assert!(message.contains("'owner/repo'"), "{message}")
-            }
-            other => panic!("expected the near-miss error, got {other:?}"),
-        }
+        let near = near_miss_at(&path, "Owner/Repo");
+        assert_eq!(near.stored, vec!["owner/repo".to_string()]);
+        assert!(near.message.contains("'owner/repo'"), "{}", near.message);
     }
 
     #[test]
     fn a_git_suffix_is_refused_with_a_message_to_drop_it() {
-        let (_dir, path) = on_disk_db();
         for bad in [
             "owner/repo.git",
             "owner/repo.GIT",
             "github.com/owner/repo.git",
         ] {
-            match read_gate_config_status(&path, bad) {
-                Err(MemoryError::Validation(message)) => {
-                    assert!(
-                        message.contains("drop the `.git` suffix"),
-                        "{bad}: {message}"
-                    )
-                }
-                other => panic!("{bad}: expected Validation, got {other:?}"),
-            }
+            let err = RepoName::parse(bad).unwrap_err();
+            assert!(
+                matches!(&err, StatusError::GitSuffix { given } if given == bad),
+                "{bad}: {err:?}"
+            );
+            let message = err.to_string();
+            assert!(
+                message.contains("drop the `.git` suffix"),
+                "{bad}: {message}"
+            );
+            assert!(
+                matches!(MemoryError::from(err), MemoryError::Validation(_)),
+                "{bad}"
+            );
         }
         // A name that merely contains `.git` is fine.
+        let (_dir, path) = on_disk_db();
         assert_eq!(
-            read_gate_config_status(&path, "owner/my.github").unwrap(),
+            read_gate_config_status(&path, &repo("owner/my.github"))
+                .unwrap()
+                .config,
             None
         );
     }
@@ -1054,14 +1465,17 @@ mod tests {
         }
 
         let ro = Database::open_read_only(&path).unwrap();
-        let err = gate_config_status(&ro, "foo/bar-baz").unwrap_err();
+        let err = gate_config_status(&ro, &path, &repo("foo/bar-baz")).unwrap_err();
 
+        let message = err.to_string();
+        assert!(message.contains("'foo-bar/baz'"), "{message}");
+        assert!(message.contains("'foo/bar-baz'"), "{message}");
         match err {
-            MemoryError::Validation(message) => {
-                assert!(message.contains("'foo-bar/baz'"), "{message}");
-                assert!(message.contains("'foo/bar-baz'"), "{message}");
+            StatusError::KeyCollision { asked, stored } => {
+                assert_eq!(asked.as_str(), "foo/bar-baz");
+                assert_eq!(stored, "foo-bar/baz");
             }
-            other => panic!("expected a Validation error, got {other:?}"),
+            other => panic!("expected the key collision, got {other:?}"),
         }
     }
 
@@ -1071,10 +1485,10 @@ mod tests {
         let status = read_labels(&["Risk:Zeta", "risk:alpha"]);
         assert_eq!(
             status,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: agent_map(false, false, false),
                 risk: vec!["risk:alpha".into(), "Risk:Zeta".into()],
-            }
+            })
         );
     }
 
@@ -1082,12 +1496,7 @@ mod tests {
 
     #[test]
     fn a_repo_that_is_not_onboarded_serializes_a_null_gate_config() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
-            None,
-            LabelStatus::failed("boom"),
-        );
+        let status = status_of("/tmp/mem.db", None, LabelStatus::failed("boom"));
         assert_eq!(
             serde_json::to_value(&status).unwrap(),
             serde_json::json!({
@@ -1103,9 +1512,8 @@ mod tests {
     #[test]
     fn the_text_report_says_not_onboarded_and_that_labels_were_not_read() {
         let text = render_text(
-            &RepoStatus::new(
-                "owner/repo",
-                Path::new("/tmp/mem.db"),
+            &status_of(
+                "/tmp/mem.db",
                 None,
                 LabelStatus::failed("gh label list on owner/repo failed (exit Some(1)): HTTP 401"),
             ),
@@ -1131,9 +1539,8 @@ mod tests {
     #[test]
     fn the_text_report_lists_the_gate_and_marks_a_missing_label() {
         let text = render_text(
-            &RepoStatus::new(
-                "owner/repo",
-                Path::new("/tmp/mem.db"),
+            &status_of(
+                "/tmp/mem.db",
                 Some(config_status(GateConfigState::Pending, vec![], None)),
                 read_labels(&["agent:ready", "agent:blocked", "risk:logic"]),
             ),
@@ -1150,18 +1557,23 @@ mod tests {
         assert!(text.contains("  risk:* — risk:logic"), "{text}");
     }
 
+    /// The status of a stored row with these fields, read through
+    /// `GateConfig`'s own guard as a stored row is.
     fn config_status(
         state: GateConfigState,
         warnings: Vec<String>,
         approved_at: Option<&str>,
     ) -> GateConfigStatus {
-        GateConfigStatus {
-            state,
-            gate_commands: vec!["cargo test".into()],
-            manifest_warnings: warnings,
-            proposed_at: "2026-01-01T00:00:00+00:00".into(),
-            approved_at: approved_at.map(str::to_string),
-        }
+        let stored: GateConfig = serde_json::from_value(serde_json::json!({
+            "repo": "owner/repo",
+            "state": state,
+            "gate_commands": ["cargo test"],
+            "manifest_warnings": warnings,
+            "proposed_at": "2026-01-01T00:00:00+00:00",
+            "approved_at": approved_at,
+        }))
+        .unwrap();
+        GateConfigStatus::from(stored)
     }
 
     #[test]
@@ -1179,7 +1591,9 @@ mod tests {
         }
 
         let ro = Database::open_read_only(&path).unwrap();
-        let status = gate_config_status(&ro, "owner/repo").unwrap().unwrap();
+        let status = gate_config_status(&ro, &path, &repo("owner/repo"))
+            .unwrap()
+            .unwrap();
 
         assert_eq!(
             status.manifest_warnings,
@@ -1190,9 +1604,8 @@ mod tests {
     #[test]
     fn the_text_report_prints_manifest_warnings_after_the_commands() {
         let text = render_text(
-            &RepoStatus::new(
-                "owner/repo",
-                Path::new("/tmp/mem.db"),
+            &status_of(
+                "/tmp/mem.db",
                 Some(config_status(
                     GateConfigState::Pending,
                     vec!["manifest X could not be read".into()],
@@ -1213,9 +1626,8 @@ mod tests {
     #[test]
     fn an_approved_config_labels_its_warnings_as_recorded_not_as_pre_approval() {
         let text = render_text(
-            &RepoStatus::new(
-                "owner/repo",
-                Path::new("/tmp/mem.db"),
+            &status_of(
+                "/tmp/mem.db",
                 Some(config_status(
                     GateConfigState::Approved,
                     vec!["manifest X could not be read".into()],
@@ -1237,9 +1649,8 @@ mod tests {
     #[test]
     fn the_text_report_has_no_warnings_block_when_there_are_none() {
         let text = render_text(
-            &RepoStatus::new(
-                "owner/repo",
-                Path::new("/tmp/mem.db"),
+            &status_of(
+                "/tmp/mem.db",
                 Some(config_status(GateConfigState::Pending, vec![], None)),
                 read_labels(&[]),
             ),
@@ -1269,9 +1680,8 @@ mod tests {
 
     #[test]
     fn a_full_repo_status_serializes_the_pinned_shape() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
+        let status = status_of(
+            "/tmp/mem.db",
             Some(config_status(GateConfigState::Pending, vec![], None)),
             read_labels(&["agent:ready", "risk:logic"]),
         );
@@ -1302,11 +1712,45 @@ mod tests {
     }
 
     #[test]
+    fn the_json_report_is_pinned_byte_for_byte() {
+        // `serde_json::Value` equality ignores key order, and the report is
+        // read as printed text, so the bytes are pinned too.
+        let reported = status_of(
+            "/tmp/mem.db",
+            Some(config_status(
+                GateConfigState::Approved,
+                vec!["w".into()],
+                Some("2026-02-02T00:00:00+00:00"),
+            )),
+            read_labels(&["agent:ready", "Risk:Logic", "risk:documentation"]),
+        );
+        assert_eq!(
+            serde_json::to_string(&reported).unwrap(),
+            concat!(
+                r#"{"repo":"owner/repo","db":"/tmp/mem.db","onboarded":true,"#,
+                r#""gate_config":{"state":"approved","gate_commands":["cargo test"],"#,
+                r#""manifest_warnings":["w"],"proposed_at":"2026-01-01T00:00:00+00:00","#,
+                r#""approved_at":"2026-02-02T00:00:00+00:00"},"#,
+                r#""labels":{"read":"ok","agent":{"agent:blocked":false,"#,
+                r#""agent:exhausted":false,"agent:ready":true},"#,
+                r#""risk":["risk:documentation","Risk:Logic"]}}"#,
+            )
+        );
+        let unread = status_of("/tmp/mem.db", None, LabelStatus::failed("boom"));
+        assert_eq!(
+            serde_json::to_string(&unread).unwrap(),
+            concat!(
+                r#"{"repo":"owner/repo","db":"/tmp/mem.db","onboarded":false,"#,
+                r#""gate_config":null,"labels":{"read":"failed","error":"boom"}}"#,
+            )
+        );
+    }
+
+    #[test]
     fn the_text_report_for_an_approved_config_shows_the_approval_time() {
         let text = render_text(
-            &RepoStatus::new(
-                "owner/repo",
-                Path::new("/tmp/mem.db"),
+            &status_of(
+                "/tmp/mem.db",
                 Some(config_status(
                     GateConfigState::Approved,
                     vec![],
@@ -1329,15 +1773,12 @@ mod tests {
         let status = read_labels(&[]);
         assert_eq!(
             status,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: agent_map(false, false, false),
                 risk: vec![],
-            }
+            })
         );
-        let text = render_text(
-            &RepoStatus::new("owner/repo", Path::new("/tmp/mem.db"), None, status),
-            false,
-        );
+        let text = render_text(&status_of("/tmp/mem.db", None, status), false);
         assert!(text.contains("  risk:* — none"), "{text}");
         assert!(text.contains("  agent:ready — MISSING"), "{text}");
     }
@@ -1345,7 +1786,7 @@ mod tests {
     #[test]
     fn gh_output_that_is_not_json_is_a_failed_read() {
         let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("this is not json"))]);
-        let status = LabelStatus::read(&mut gh, "owner/repo");
+        let status = LabelStatus::read(&mut gh, &repo("owner/repo"));
         assert!(matches!(status, LabelStatus::Failed { .. }), "{status:?}");
     }
 
@@ -1354,18 +1795,17 @@ mod tests {
         let status = read_labels(&["risk:banana"]);
         assert_eq!(
             status,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: agent_map(false, false, false),
                 risk: vec!["risk:banana".into()],
-            }
+            })
         );
     }
 
     #[test]
     fn hints_carry_the_db_the_command_was_run_with_quoted() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/x y.sqlite3"),
+        let status = status_of(
+            "/tmp/x y.sqlite3",
             Some(config_status(GateConfigState::Pending, vec![], None)),
             read_labels(&[]),
         );
@@ -1375,12 +1815,7 @@ mod tests {
             "{text}"
         );
 
-        let not_onboarded = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/x y.sqlite3"),
-            None,
-            read_labels(&[]),
-        );
+        let not_onboarded = status_of("/tmp/x y.sqlite3", None, read_labels(&[]));
         let text = render_text(&not_onboarded, true);
         assert!(
             text.contains(
@@ -1393,9 +1828,8 @@ mod tests {
 
     #[test]
     fn a_relative_database_is_hinted_by_its_absolute_path() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("rel.sqlite3"),
+        let status = status_of(
+            &absolute_db_path(Path::new("rel.sqlite3")),
             None,
             read_labels(&[]),
         );
@@ -1413,12 +1847,7 @@ mod tests {
 
     #[test]
     fn no_db_is_hinted_when_none_was_given() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
-            None,
-            read_labels(&[]),
-        );
+        let status = status_of("/tmp/mem.db", None, read_labels(&[]));
         let text = render_text(&status, false);
         assert!(!text.contains("--db"), "{text}");
         assert!(
@@ -1431,12 +1860,7 @@ mod tests {
 
     #[test]
     fn a_missing_agent_label_gets_a_create_hint_without_a_db() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
-            None,
-            read_labels(&["agent:ready"]),
-        );
+        let status = status_of("/tmp/mem.db", None, read_labels(&["agent:ready"]));
         let text = render_text(&status, true);
         assert!(
             text.contains(
@@ -1448,32 +1872,27 @@ mod tests {
 
     #[test]
     fn no_create_hint_when_no_label_is_missing_or_the_read_failed() {
-        let all = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
+        let all = status_of(
+            "/tmp/mem.db",
             None,
             read_labels(&["agent:ready", "agent:blocked", "agent:exhausted"]),
         );
         assert!(!render_text(&all, false).contains("create the missing"));
-        let failed = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
-            None,
-            LabelStatus::failed("boom"),
-        );
+        let failed = status_of("/tmp/mem.db", None, LabelStatus::failed("boom"));
         assert!(!render_text(&failed, false).contains("create the missing"));
     }
 
     #[test]
     fn the_label_lines_follow_the_map_and_never_invent_a_missing_entry() {
-        let status = RepoStatus::new(
-            "owner/repo",
-            Path::new("/tmp/mem.db"),
+        // A one-entry map is one no read can produce, built here by literal
+        // to show the renderer prints the map and adds nothing to it.
+        let status = status_of(
+            "/tmp/mem.db",
             None,
-            LabelStatus::Ok {
+            LabelStatus::Ok(LabelSet {
                 agent: BTreeMap::from([("agent:ready", true)]),
                 risk: vec![],
-            },
+            }),
         );
         let text = render_text(&status, false);
         assert!(text.contains("  agent:ready — present"), "{text}");

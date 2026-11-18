@@ -4,9 +4,14 @@
 //! accidentally calls a write path only fails at runtime (the underlying SQLite
 //! connection is `SQLITE_OPEN_READ_ONLY`, so the write would error — but only
 //! once a request hit it). [`ReadOnlyDb`] is a thin newtype that wraps a
-//! read-only [`Database`] and re-exposes ONLY the read/query methods the
-//! dashboard data layer needs. Because the inner [`Database`] is private, a
-//! write call from dashboard code is a *compile* error, not a runtime one.
+//! read-only [`Database`] and re-exposes only read/query methods, for the
+//! dashboard data layer and for `ironmem autopilot status`. Because the inner
+//! [`Database`] is private, a call to one of its write methods from either is
+//! a *compile* error, not a runtime one.
+//!
+//! [`ReadOnlyDb::with_connection`] lends the raw connection, which the type
+//! cannot keep from running a write statement. There the
+//! `SQLITE_OPEN_READ_ONLY` open is what refuses the write.
 //!
 //! This wrapper holds no logic of its own: every method delegates verbatim to
 //! the corresponding [`Database`] read method.
@@ -152,12 +157,13 @@ mod tests {
         assert_eq!(found[0].content, "wanted");
     }
 
-    /// Documents that `ReadOnlyDb` exposes the read methods the dashboard needs
-    /// and that they return the same data as the underlying `Database`.
+    /// Documents that `ReadOnlyDb` exposes the read methods its callers (the
+    /// dashboard and `ironmem autopilot status`) need and that they return the
+    /// same data as the underlying `Database`.
     ///
     /// The compile-time guarantee is the real contract: a write method (e.g.
     /// `ro.insert_drawer(..)` or `ro.migrate()`) does not exist on `ReadOnlyDb`,
-    /// so it cannot be called from dashboard code. The commented line below would
+    /// so it cannot be called through one. The commented line below would
     /// fail to compile if uncommented:
     ///
     /// ```compile_fail

@@ -932,6 +932,11 @@ descriptions.
   label with no name, returns a list long enough to have been cut off, or `--path` is not a directory,
   `labels` is `{"read": "failed", "error": "<what failed>"}` with no `agent`
   or `risk` key. A failed read says nothing about which labels exist.
+- `labels.agent` keys are always the three lowercase names. `labels.risk`
+  entries are spelled as they are on GitHub, not lowercased: a repo's
+  `Risk:Logic` label is listed as `Risk:Logic`. GitHub label names are
+  case-insensitive and the Lead reads them that way, so compare a `risk`
+  entry case-insensitively.
 
 When `--db` is given, the text report's `onboard` and `approve` hints end with
 `--db` and the absolute path of the database that answered, so they act on that
