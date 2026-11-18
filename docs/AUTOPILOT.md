@@ -883,7 +883,7 @@ descriptions.
 | Exit status | Meaning |
 |---|---|
 | `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
-| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), each part made of letters, digits, `.`, `_` and `-` and not starting with `-`, the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or a config is stored under a name that differs only in letter case or in whether it names a host (the error names it), or the name ends in `.git`, or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
+| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), each part made of letters, digits, `.`, `_` and `-` and not starting with `-`, the database is missing, is not an ironmem database or is not readable, or its path cannot be made absolute (an empty `--db`) or is not UTF-8, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or a config is stored under a name that differs only in letter case or in whether it names a host (the error names it), or the name ends in `.git`, or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
 | `2` | A usage error. An `ironmem` too old to know `status` also exits 2. |
 
 `--json` prints this shape:
@@ -908,7 +908,9 @@ descriptions.
 }
 ```
 
-- `db` is the absolute path of the database that answered.
+- `db` is the absolute path of the database that answered. A path that
+  cannot be made absolute, or that is not UTF-8, exits 1 instead of being
+  reported inexactly.
 - A repo that was never onboarded has `"onboarded": false` and
   `"gate_config": null`.
 - The name must be the one the repo was onboarded under. A name that differs
@@ -924,7 +926,11 @@ descriptions.
   Each part may hold only letters, digits, `.`, `_` and `-` and may not start
   with `-`. A `.git` suffix and a host with a port are refused (`gh` does not
   resolve them), and so is a full URL.
-- A pending config has `"approved_at": null`.
+- A pending config has `"approved_at": null`. Both fields are reported as
+  stored, and only a row edited by hand can have them disagree. Go by `state`
+  then, as the Lead does: the text report prints `approved: time not recorded`
+  for an approved config with no time, and a note under a pending config that
+  carries one.
 - `manifest_warnings` lists the problems recorded on the proposal; read them
   before running `approve`. It is empty when there are none.
 - When `gh` is missing, exits non-zero (authentication, a rate limit, an

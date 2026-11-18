@@ -993,7 +993,8 @@ enum AutopilotCmd {
     /// `owner/name` (or `host/owner/name`), each part made of letters, digits,
     /// `.`, `_` and `-` and not starting with `-` (a `.git` suffix is
     /// refused too), the database is missing, not an ironmem database or not
-    /// readable, the stored config does not parse or belongs to another repo
+    /// readable, its path cannot be made absolute (an empty `--db`) or is not
+    /// UTF-8, the stored config does not parse or belongs to another repo
     /// name, a config is stored under a name that differs only in letter case
     /// or in whether it names a host (the error names it; two names with
     /// different hosts never match), or an ironmem environment setting

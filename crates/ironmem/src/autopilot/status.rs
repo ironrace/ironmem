@@ -336,9 +336,21 @@ impl DbHint {
 /// `Error: {MemoryError}` and every `MemoryError` variant adds its own prefix.
 /// The variant is chosen for the prefix that is true of the failure; the
 /// typed data stays on the [`StatusError`].
+///
+/// A SQLite failure becomes [`MemoryError::Db`], whose prefix is
+/// "Database error:". That variant holds a `rusqlite::Error`, and the one
+/// `rusqlite::Error` that displays a message of the caller's choosing is
+/// `SqliteFailure` with a detail string, so the explained message travels
+/// there, beside the failure's own result code. A `rusqlite` error that has
+/// no result code is given SQLite's generic one, and a file that could not be
+/// opened gets `SQLITE_CANTOPEN`, the only code `open_read_only` reports as
+/// "not found".
 impl From<StatusError> for MemoryError {
     fn from(err: StatusError) -> Self {
         let message = err.to_string();
+        let database = |failure: rusqlite::ffi::Error, message: String| {
+            MemoryError::Db(rusqlite::Error::SqliteFailure(failure, Some(message)))
+        };
         match err {
             StatusError::Other(inner) => inner,
             StatusError::NotARepoName { .. }
@@ -349,9 +361,18 @@ impl From<StatusError> for MemoryError {
             StatusError::DbPathNotAbsolute { source, .. } => {
                 MemoryError::Io(std::io::Error::new(source.kind(), message))
             }
-            StatusError::CannotOpen { .. } | StatusError::Database { .. } => {
-                MemoryError::Io(std::io::Error::other(message))
-            }
+            StatusError::CannotOpen { .. } => database(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CANTOPEN),
+                message,
+            ),
+            StatusError::Database {
+                source: rusqlite::Error::SqliteFailure(failure, _),
+                ..
+            } => database(failure, message),
+            StatusError::Database { .. } => database(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_ERROR),
+                message,
+            ),
         }
     }
 }
@@ -523,7 +544,9 @@ impl LabelStatus {
 }
 
 /// Read `repo`'s gate config from the database at `db_path`, opening it
-/// read-only. A SQLite failure is explained rather than passed through bare.
+/// read-only. A SQLite failure is explained rather than passed through bare,
+/// and a `db_path` that cannot be made absolute or is not UTF-8 is an error,
+/// because the report could not name the file that answered.
 ///
 /// A read whose config is `None` means no gate config is stored under this
 /// name, and none that parses under another spelling of it. When one is
@@ -536,7 +559,9 @@ pub fn read_gate_config_status(
     db_path: &Path,
     repo: &RepoName,
 ) -> Result<GateConfigRead, StatusError> {
-    let reported_db = absolute_db_path(db_path);
+    // Before the open, so a path the report could not name is refused
+    // whether or not a database is there.
+    let reported_db = absolute_db_path(db_path)?;
     let db = match Database::open_read_only(db_path) {
         // `open_read_only` calls every `CannotOpen` "not found"; a file that
         // is there but cannot be opened is a different problem.
@@ -559,12 +584,18 @@ pub fn read_gate_config_status(
 }
 
 /// `db` as the report names it: absolute, so the report names one file
-/// whatever the cwd.
-fn absolute_db_path(db: &Path) -> String {
-    std::path::absolute(db)
-        .unwrap_or_else(|_| db.to_path_buf())
-        .display()
-        .to_string()
+/// whatever the cwd, and UTF-8, so the JSON string and a `--db` hint name
+/// that file exactly. A path that cannot be both is an error: a relative or
+/// lossily converted path would name a file that may not exist.
+fn absolute_db_path(db: &Path) -> Result<String, StatusError> {
+    let absolute = std::path::absolute(db).map_err(|source| StatusError::DbPathNotAbsolute {
+        path: db.to_path_buf(),
+        source,
+    })?;
+    match absolute.to_str() {
+        Some(utf8) => Ok(utf8.to_string()),
+        None => Err(StatusError::DbPathNotUtf8 { path: absolute }),
+    }
 }
 
 /// An error when a gate config is stored under another spelling of `repo`.
@@ -659,27 +690,45 @@ pub fn render_text(status: &RepoStatus, hint_db: bool) -> String {
              {quoted_repo} --path .{db_flag}` from the repo's checkout first.\n"
         )),
         Some(config) => {
+            // Everything that depends on whether the config is approved is
+            // decided by this one match on `state`, as the Lead decides it,
+            // so a row whose `approved_at` disagrees with its `state` cannot
+            // print a headline and an approval line that contradict.
+            let (warnings_heading, approval) = match config.state {
+                GateConfigState::Pending => {
+                    let mut lines = format!(
+                        "  approved: not yet — run `ironmem autopilot approve \
+                         {quoted_repo}{db_flag}`\n"
+                    );
+                    if let Some(at) = &config.approved_at {
+                        lines.push_str(&format!(
+                            "  note: the stored config is pending but carries an approval time \
+                             ({at}), which a pending config should not have\n"
+                        ));
+                    }
+                    ("  warnings (read these before approving):\n", lines)
+                }
+                GateConfigState::Approved => (
+                    "  warnings recorded on the proposal:\n",
+                    match &config.approved_at {
+                        Some(at) => format!("  approved: {at}\n"),
+                        None => "  approved: time not recorded\n".to_string(),
+                    },
+                ),
+            };
             let state = config.state.as_str();
             out.push_str(&format!("{repo}: gate config {state}\n"));
             for command in &config.gate_commands {
                 out.push_str(&format!("  - {command}\n"));
             }
             if !config.manifest_warnings.is_empty() {
-                out.push_str(match config.state {
-                    GateConfigState::Pending => "  warnings (read these before approving):\n",
-                    GateConfigState::Approved => "  warnings recorded on the proposal:\n",
-                });
+                out.push_str(warnings_heading);
                 for warning in &config.manifest_warnings {
                     out.push_str(&format!("    - {warning}\n"));
                 }
             }
             out.push_str(&format!("  proposed: {}\n", config.proposed_at));
-            match &config.approved_at {
-                Some(at) => out.push_str(&format!("  approved: {at}\n")),
-                None => out.push_str(&format!(
-                    "  approved: not yet — run `ironmem autopilot approve {quoted_repo}{db_flag}`\n"
-                )),
-            }
+            out.push_str(&approval);
         }
     }
     match &status.labels {
@@ -1140,7 +1189,7 @@ mod tests {
 
     #[test]
     fn a_relative_database_path_is_reported_as_an_absolute_one() {
-        let db = absolute_db_path(Path::new("m.db"));
+        let db = absolute_db_path(Path::new("m.db")).unwrap();
         assert!(Path::new(&db).is_absolute(), "{db}");
         assert!(db.ends_with("m.db"), "{db}");
     }
@@ -1829,7 +1878,7 @@ mod tests {
     #[test]
     fn a_relative_database_is_hinted_by_its_absolute_path() {
         let status = status_of(
-            &absolute_db_path(Path::new("rel.sqlite3")),
+            &absolute_db_path(Path::new("rel.sqlite3")).unwrap(),
             None,
             read_labels(&[]),
         );
@@ -1897,6 +1946,185 @@ mod tests {
         let text = render_text(&status, false);
         assert!(text.contains("  agent:ready — present"), "{text}");
         assert!(!text.contains("agent:blocked"), "{text}");
+    }
+
+    // ── a row whose state and approval time disagree ────────────────────
+
+    #[test]
+    fn an_approved_config_with_no_approval_time_says_the_time_is_not_recorded() {
+        let config = config_status(GateConfigState::Approved, vec![], None);
+        // The JSON reports the row as stored; the Lead dispatches on `state`.
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["state"], serde_json::json!("approved"));
+        assert_eq!(json["approved_at"], serde_json::Value::Null);
+
+        let text = render_text(
+            &status_of("/tmp/mem.db", Some(config), read_labels(&[])),
+            true,
+        );
+
+        assert!(
+            text.contains("owner/repo: gate config approved\n"),
+            "{text}"
+        );
+        assert!(text.contains("  approved: time not recorded\n"), "{text}");
+        assert!(!text.contains("not yet"), "{text}");
+        assert!(!text.contains("autopilot approve"), "{text}");
+    }
+
+    #[test]
+    fn a_pending_config_that_carries_an_approval_time_is_reported_pending_with_a_note() {
+        let config = config_status(
+            GateConfigState::Pending,
+            vec![],
+            Some("2026-02-02T00:00:00+00:00"),
+        );
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["state"], serde_json::json!("pending"));
+        assert_eq!(
+            json["approved_at"],
+            serde_json::json!("2026-02-02T00:00:00+00:00")
+        );
+
+        let text = render_text(
+            &status_of("/tmp/mem.db", Some(config), read_labels(&[])),
+            false,
+        );
+
+        assert!(text.contains("owner/repo: gate config pending\n"), "{text}");
+        assert!(
+            text.contains(
+                "  approved: not yet — run `ironmem autopilot approve owner/repo`\n  note: the \
+                 stored config is pending but carries an approval time \
+                 (2026-02-02T00:00:00+00:00), which a pending config should not have\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("  approved: 2026-02-02"), "{text}");
+    }
+
+    // ── a database path the report could not name ───────────────────────
+
+    #[test]
+    fn a_database_path_that_cannot_be_made_absolute_is_an_error_not_a_relative_path() {
+        // An empty path is the one input `std::path::absolute` refuses
+        // whatever the working directory is.
+        let err = read_gate_config_status(Path::new(""), &repo("owner/repo")).unwrap_err();
+        assert!(
+            matches!(&err, StatusError::DbPathNotAbsolute { path, .. } if path == Path::new("")),
+            "{err:?}"
+        );
+        let shown = MemoryError::from(err);
+        assert!(matches!(shown, MemoryError::Io(_)), "{shown:?}");
+        assert!(
+            shown
+                .to_string()
+                .contains("could not make the database path '' absolute"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn a_database_path_that_is_not_utf8_is_refused_before_it_is_opened() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(std::ffi::OsStr::from_bytes(
+            b"/no-such-dir-\xff/memory.sqlite3",
+        ));
+        let err = read_gate_config_status(path, &repo("owner/repo")).unwrap_err();
+        assert!(
+            matches!(&err, StatusError::DbPathNotUtf8 { path: named } if named == path),
+            "{err:?}"
+        );
+        let shown = MemoryError::from(err);
+        assert!(matches!(shown, MemoryError::Validation(_)), "{shown:?}");
+        assert!(shown.to_string().contains("is not valid UTF-8"), "{shown}");
+    }
+
+    // ── how a SQLite failure reaches the command line ───────────────────
+
+    #[test]
+    fn a_sqlite_failure_is_shown_as_a_database_error_and_keeps_its_result_code() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some("database is locked".into()),
+        );
+        let err = StatusError::from_read(Path::new("/x/m.db"), MemoryError::Db(busy));
+        let explained = err.to_string();
+
+        let shown = MemoryError::from(err);
+
+        assert_eq!(shown.to_string(), format!("Database error: {explained}"));
+        assert!(explained.starts_with("could not read the database at /x/m.db: "));
+        match shown {
+            MemoryError::Db(rusqlite::Error::SqliteFailure(failure, _)) => {
+                assert_eq!(failure.code, rusqlite::ErrorCode::DatabaseBusy)
+            }
+            other => panic!("expected a SQLite failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_database_file_that_cannot_be_opened_is_shown_as_a_database_error() {
+        let err = StatusError::CannotOpen {
+            path: PathBuf::from("/x/m.db"),
+        };
+        let explained = err.to_string();
+
+        let shown = MemoryError::from(err);
+
+        assert_eq!(shown.to_string(), format!("Database error: {explained}"));
+        match shown {
+            MemoryError::Db(rusqlite::Error::SqliteFailure(failure, _)) => {
+                assert_eq!(failure.code, rusqlite::ErrorCode::CannotOpen)
+            }
+            other => panic!("expected a SQLite failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_rusqlite_failure_with_no_result_code_is_still_shown_as_a_database_error() {
+        let no_code =
+            rusqlite::Error::InvalidColumnType(2, "content".into(), rusqlite::types::Type::Null);
+        let err = StatusError::from_read(Path::new("/x/m.db"), MemoryError::Db(no_code));
+        assert!(
+            matches!(
+                &err,
+                StatusError::Database {
+                    hint: None,
+                    source: rusqlite::Error::InvalidColumnType(..),
+                    ..
+                }
+            ),
+            "{err:?}"
+        );
+        let explained = err.to_string();
+
+        let shown = MemoryError::from(err);
+
+        assert_eq!(shown.to_string(), format!("Database error: {explained}"));
+    }
+
+    #[test]
+    fn a_name_refused_for_what_is_stored_is_shown_as_a_validation_error() {
+        for err in [
+            StatusError::StoredUnderAnotherName {
+                asked: repo("Owner/Repo"),
+                stored: vec!["owner/repo".into()],
+                host_ambiguous: false,
+            },
+            StatusError::KeyCollision {
+                asked: repo("foo/bar-baz"),
+                stored: "foo-bar/baz".into(),
+            },
+        ] {
+            let explained = err.to_string();
+
+            let shown = MemoryError::from(err);
+
+            assert!(matches!(shown, MemoryError::Validation(_)), "{shown:?}");
+            assert_eq!(shown.to_string(), format!("Validation error: {explained}"));
+        }
     }
 
     #[test]

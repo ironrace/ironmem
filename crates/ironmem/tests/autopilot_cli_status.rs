@@ -489,7 +489,34 @@ fn a_file_that_is_not_a_database_exits_one_and_names_the_path() {
     let output = fixture.status_at(&not_db, &isolated_path(&fixture.stubs()), ALL_LABELS, None);
 
     let shown = not_db.display().to_string();
-    assert_unreadable(&fixture, &output, &["could not read the database", &shown]);
+    assert_unreadable(
+        &fixture,
+        &output,
+        &[
+            "Error: Database error: could not read the database at",
+            &shown,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("IO error"), "{stderr}");
+}
+
+#[test]
+fn an_empty_db_path_exits_one_instead_of_reporting_a_relative_path() {
+    let fixture = Fixture::new();
+
+    let output = fixture.status_at(
+        Path::new(""),
+        &isolated_path(&fixture.stubs()),
+        ALL_LABELS,
+        None,
+    );
+
+    assert_unreadable(
+        &fixture,
+        &output,
+        &["could not make the database path '' absolute"],
+    );
 }
 
 #[test]
