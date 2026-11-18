@@ -1044,12 +1044,9 @@ impl Database {
             ),
             Bm25Rows::PromptRecall(None) => (prompt_recall_eligible_sql(), None, true),
         };
-        if query.trim().is_empty() {
-            return Ok(vec![]);
-        }
         let fts_query = fts5_sanitize(query);
-        // Nothing left to match (a query of only punctuation): `MATCH ''` is a
-        // syntax error, not an empty result.
+        // Nothing left to match (a query of only whitespace, punctuation or
+        // operator words): `MATCH ''` is a syntax error, not an empty result.
         if fts_query.is_empty() {
             return Ok(vec![]);
         }
@@ -2806,14 +2803,79 @@ mod tests {
     }
 
     #[test]
-    fn bm25_punctuation_only_query_is_accepted_and_matches_nothing() {
+    fn bm25_punctuation_or_operator_only_query_matches_nothing() {
         let db = Database::open_in_memory().unwrap();
         let emb = dummy_embedding();
         db.insert_drawer("e", "the hooks are wired", &emb, "w", "r", "", "test")
             .unwrap();
         for query in ["-", "^", "- ^", "!!! ???", "***", "AND", "NOT NEAR"] {
+            // Nothing survives sanitizing, so FTS5 is never asked.
+            assert!(fts5_sanitize(query).is_empty(), "{query:?}");
             assert!(bm25_ids(&db, query, None).is_empty(), "{query:?}");
         }
+    }
+
+    /// `bm25_search` reads an FTS5 rejection as no hits, so it would hide a sanitizer
+    /// bug. This runs the sanitized text through `MATCH` directly instead.
+    #[test]
+    fn fts5_sanitize_output_is_always_a_valid_match_expression() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer("k", "the hooks are wired", &emb, "w", "r", "", "test")
+            .unwrap();
+        let empty = [
+            "",
+            "   ",
+            "\t\n",
+            "-",
+            "--",
+            "'",
+            "''",
+            "'-'",
+            "\0",
+            "\u{7}",
+            "\"",
+            "\"\"\"\"",
+            "NEAR(",
+            "\u{1F389}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+        ];
+        for query in empty {
+            assert_eq!(fts5_sanitize(query), "", "{query:?}");
+        }
+        let reaches_fts5 = [
+            "a-",
+            "-a-",
+            "a--b",
+            "don't",
+            "café",
+            "日本語",
+            "\u{FF21}\u{FF2E}\u{FF24}",
+            "e\u{301}",
+            "²",
+            "drawer_id:a",
+            "{content}:",
+            "handoff-issue-377",
+            "-hooks",
+            "^hooks",
+            "hooks AND",
+        ];
+        let mut stmt = db
+            .conn
+            .prepare("SELECT drawer_id FROM drawers_fts WHERE drawers_fts MATCH ?1")
+            .unwrap();
+        let mut rejected = Vec::new();
+        for query in reaches_fts5 {
+            let sanitized = fts5_sanitize(query);
+            assert!(!sanitized.is_empty(), "{query:?}");
+            let run = stmt
+                .query_map([&sanitized], |row| row.get::<_, String>(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>());
+            if let Err(e) = run {
+                rejected.push(format!("{query:?} -> {sanitized:?}: {e}"));
+            }
+        }
+        assert!(rejected.is_empty(), "FTS5 rejected: {rejected:#?}");
     }
 
     #[test]

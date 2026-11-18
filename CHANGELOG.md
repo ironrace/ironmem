@@ -134,6 +134,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its source and excerpt, so one imported row can't flood the prompt.
   On a fixed five-prompt fixture, one of whose ids is a 209-byte import, the
   injected text grew from 1,700 to 2,398 bytes.
+- **Search's keyword leg ignores upper-case `AND`, `OR`, `NOT` and `NEAR`.**
+  Unless quoted on their own (`"NOT"`), they are dropped from the query, so
+  `a OR b` requires both words and `a NOT b` no longer excludes `b`; lower-case
+  forms stay ordinary words.
 
 ### Fixed
 
@@ -183,12 +187,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rejected by FTS5, which read the `-` as a column filter, and the rejection was
   silently scored as zero keyword hits. Each token is now quoted, so a hyphenated
   word matches as a phrase (`non` then `plugin`, adjacent). A token with no
-  letter or digit is dropped. Upper-case `AND`, `OR`, `NOT` and `NEAR` in a query
-  are now ignored, so `a OR b` requires both words and `a NOT b` no longer
-  excludes `b`. Lower-case `and`, `or`, `not` and `near` stay ordinary words,
-  and so does a single word in its own double quotes (`"NOT"`). Only a whole
-  space-separated token counts as quoted, so the word is still ignored inside a
-  quoted phrase (`"NOT here"`) or with punctuation outside the quotes (`"NOT",`).
+  letter or digit is dropped.
 
 ## [0.7.0] - 2026-11-09
 
