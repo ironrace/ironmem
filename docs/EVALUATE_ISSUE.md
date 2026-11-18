@@ -104,7 +104,7 @@ Goal: a rough estimate of how much code the issue touches.
      database reads the same way. A `state` of `"pending"` is a proposal
      nobody has approved.
      Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
-     A non-zero exit, a run that could not be made, or output that is not JSON is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
+     A non-zero exit, a run that could not be made, output that is not JSON, or a report that fits none of the three states above is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
      An `ironmem` missing from `PATH` or older than `status` fails this way; the fix is a current install.
    - **Agent labels.** Run
      `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`.
@@ -200,8 +200,11 @@ the command that supplies it, then continue down the table:
 - repo not onboarded (`gate_config` `null`) → `ironmem autopilot onboard <owner>/<repo> --path '<checkout>'`, then `ironmem autopilot approve <owner>/<repo>`
   (`<checkout>` is single-quoted: write any `'` in it as `'\''`); name the
   database the report gave in `db`
-- gate config `"pending"` → read its `manifest_warnings`, then `ironmem autopilot approve <owner>/<repo>`
-- A failed `status` read gets neither command: its fix line gives the command that was run, its exit status and its error.
+- gate config `"pending"` → review its `gate_commands` and `manifest_warnings`
+  (re-run the `onboard` command above first if `proposed_at` is old or the
+  checkout's build setup has changed since), then `ironmem autopilot approve <owner>/<repo>`,
+  again naming that database
+- a failed `status` read gets neither command: its fix line gives the command that was run, its exit status if it had one, and its error; for an `ironmem` that is missing or too old, it also says to install a current one.
 - agent labels missing → `ironmem autopilot labels <owner>/<repo>`
 - `risk:<expected class>` label missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`
 - issue carries `risk:<other>` → name it; removing it is a human's risk call,
@@ -248,14 +251,9 @@ labels, or wherever rule 1 (AUTOPILOT) does not hold: the loop runs alone, and
 a human reviews and merges its PR.
 
 When the issue otherwise fits GOAL but the repo has no approved gate config,
-add a `Missing GOAL prerequisite:` line to *Why* with the fix rule 1 gives for
-that state, and continue down the table (usually to IRON). For a repo that is
-not onboarded that is
-`ironmem autopilot onboard <owner>/<repo> --path '<checkout>'` (write any
-`'` in `<checkout>` as `'\''`) then `ironmem autopilot approve <owner>/<repo>`;
-for a pending config, `ironmem autopilot approve <owner>/<repo>` after reading
-its `manifest_warnings`; for a failed `status` read, neither command, only the
-command that was run, its exit status and its error.
+add a `Missing GOAL prerequisite:` line to *Why*
+with the fix rule 1 gives for that state (not onboarded, pending, or a failed `status` read)
+and continue down the table (usually to IRON).
 
 Typical issues: applying a decided pattern across many files, authoring a
 large table of config or terminology, bulk fixture regeneration.
