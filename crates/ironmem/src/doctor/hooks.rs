@@ -114,6 +114,10 @@ restricted) in the hook command so doctor can check it";
 const DUPLICATE_HINT: &str = "remove the hand-wired ironmem entries from settings.json; \
 the enabled plugin already supplies these hooks";
 
+const MIS_SHAPED_HINT: &str = "fix hooks in settings.json by hand (it must be an object, and \
+each hooks.<event> an array of hook groups), then re-run scripts/install-ironmem.sh, which \
+refuses the file until then";
+
 const HOME_UNKNOWN: &str = "hook mining: skipped (home directory unknown)";
 
 /// The command shape of a plugin hook, used to work out the mode it runs in.
@@ -131,6 +135,10 @@ enum HookWiring {
     NoSettings,
     /// The file exists but cannot be read as a JSON object.
     Unreadable(String),
+    /// The file is a JSON object, but its `hooks` is not absent, null, or an
+    /// object whose values are all arrays (the shape the installer accepts),
+    /// for this reason.
+    MisShaped(String),
     /// The ironmem plugin is enabled; its hooks.json supplies the hooks.
     Plugin {
         /// Plugin hooks that settings.json also wires by hand (they run
@@ -199,6 +207,22 @@ pub(super) fn claude_hook_checks(
                 HOOK_MINING_KEY,
                 CheckStatus::Info,
                 "hook mining: skipped (settings.json unreadable)",
+            ),
+        ],
+        HookWiring::MisShaped(reason) => [
+            Check::new(
+                HOOKS_KEY,
+                CheckStatus::Warn,
+                format!(
+                    "Claude Code hooks: cannot read the hooks in {}: {reason}",
+                    path.display()
+                ),
+            )
+            .with_hint(MIS_SHAPED_HINT),
+            Check::new(
+                HOOK_MINING_KEY,
+                CheckStatus::Info,
+                "hook mining: skipped (the hooks in settings.json cannot be read)",
             ),
         ],
         HookWiring::Plugin {
@@ -305,6 +329,9 @@ fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
     if !doc.is_object() {
         return HookWiring::Unreadable("not a JSON object".to_string());
     }
+    if let Some(reason) = hooks_shape_problem(&doc) {
+        return HookWiring::MisShaped(reason);
+    }
     let mut wired = Vec::new();
     let mut missing = Vec::new();
     for hook in &PLUGIN_HOOKS {
@@ -332,6 +359,29 @@ fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
         wired,
         missing,
         settings_env_mode,
+    }
+}
+
+/// Why `doc.hooks` is not a shape doctor and the installer read, if it is
+/// not: readable is absent, null, or an object whose values are all arrays
+/// (scripts/install-ironmem.sh's rule). Junk inside an event's array is not
+/// a shape problem; [`commands_for`] skips it, as the installer does.
+fn hooks_shape_problem(doc: &Value) -> Option<String> {
+    let hooks = match doc.get("hooks") {
+        None | Some(Value::Null) => return None,
+        Some(Value::Object(hooks)) => hooks,
+        Some(_) => return Some("hooks is not an object".to_owned()),
+    };
+    let mut bad: Vec<String> = hooks
+        .iter()
+        .filter(|(_, v)| !v.is_array())
+        .map(|(event, _)| format!("hooks.{event}"))
+        .collect();
+    bad.sort();
+    match bad.len() {
+        0 => None,
+        1 => Some(format!("{} is not an array", bad[0])),
+        _ => Some(format!("{} are not arrays", bad.join(" and "))),
     }
 }
 
@@ -1203,16 +1253,78 @@ mod tests {
 
     #[test]
     fn hooks_with_odd_shapes_do_not_panic() {
+        // An event value that is not an array: the installer refuses the
+        // file, so doctor says it cannot read the hooks, not that they are
+        // missing (whose hint, re-run the installer, could not fix it).
         let home = home_with_settings(
             r#"{"hooks": {"Stop": {"not": "an array"}, "PreCompact": [{"hooks": "x"}, 3]}}"#,
         );
         let checks = claude_hook_checks(Some(home.path()), None);
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert_eq!(checks[1].status, CheckStatus::Info, "{}", checks[1].summary);
+        assert_eq!(
+            checks[1].summary,
+            "hook mining: skipped (the hooks in settings.json cannot be read)"
+        );
+        // Junk nested inside an event's array is skipped silently, as the
+        // installer does: the hooks read as missing.
+        let home = home_with_settings(
+            r#"{"hooks": {"PreCompact": [{"hooks": "x"}, 3, {"hooks": [{"command": 5}, "s"]}]}}"#,
+        );
+        let checks = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(checks[0].status, CheckStatus::Warn);
+        assert!(
+            checks[0]
+                .summary
+                .contains("missing SessionStart, UserPromptSubmit, Stop, PreCompact"),
+            "{}",
+            checks[0].summary
+        );
         assert_eq!(checks[1].status, CheckStatus::Warn, "{}", checks[1].summary);
         assert!(checks[1]
             .summary
             .contains("no Stop or PreCompact hook is wired"));
+    }
+
+    #[test]
+    fn a_mis_shaped_hooks_block_names_the_offending_key() {
+        for (settings, reason) in [
+            (r#"{"hooks": {"Stop": {}}}"#, "hooks.Stop is not an array"),
+            (r#"{"hooks": {"Stop": null}}"#, "hooks.Stop is not an array"),
+            (
+                r#"{"hooks": {"Stop": {}, "PreCompact": 3, "SessionStart": []}}"#,
+                "hooks.PreCompact and hooks.Stop are not arrays",
+            ),
+            (r#"{"hooks": []}"#, "hooks is not an object"),
+            (r#"{"hooks": "x"}"#, "hooks is not an object"),
+        ] {
+            let home = home_with_settings(settings);
+            let c = claude_hook_checks(Some(home.path()), None);
+            let path = home.path().join(".claude").join("settings.json");
+            assert_eq!(c[0].status, CheckStatus::Warn, "{settings}");
+            assert_eq!(
+                c[0].summary,
+                format!(
+                    "Claude Code hooks: cannot read the hooks in {}: {reason}",
+                    path.display()
+                ),
+                "{settings}"
+            );
+            assert_eq!(c[0].hint.as_deref(), Some(MIS_SHAPED_HINT), "{settings}");
+            assert_eq!(c[1].status, CheckStatus::Info, "{settings}");
+            assert!(c[1].summary.contains("skipped"), "{settings}");
+        }
+        // Absent or null hooks are readable: nothing is wired.
+        for settings in ["{}", r#"{"hooks": null}"#] {
+            let home = home_with_settings(settings);
+            let c = claude_hook_checks(Some(home.path()), None);
+            assert!(
+                c[0].summary.contains("missing SessionStart"),
+                "{settings}: {}",
+                c[0].summary
+            );
+        }
     }
 
     const PLUGIN_ON: &str = r#"{"enabledPlugins": {"ironmem@ironrace": true}"#;
