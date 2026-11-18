@@ -31,6 +31,10 @@ pub enum McpAccessMode {
 }
 
 impl McpAccessMode {
+    /// The mode when `IRONMEM_MCP_MODE` is unset. `ironmem doctor` reads it
+    /// too, to say which mode a hook command that sets nothing runs in.
+    pub(crate) const UNSET_DEFAULT: Self = Self::ReadOnly;
+
     pub(crate) fn parse(raw: &str) -> Result<Self, MemoryError> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "trusted" => Ok(Self::Trusted),
@@ -126,7 +130,7 @@ impl Config {
         let state_dir = base_dir.join("hook_state");
         let mcp_access_mode = match std::env::var("IRONMEM_MCP_MODE") {
             Ok(mode) => McpAccessMode::parse(&mode)?,
-            Err(_) => McpAccessMode::ReadOnly,
+            Err(_) => McpAccessMode::UNSET_DEFAULT,
         };
         let embed_mode = match std::env::var("IRONMEM_EMBED_MODE") {
             Ok(mode) => EmbedMode::parse(&mode)?,

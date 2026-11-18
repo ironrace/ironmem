@@ -11,27 +11,74 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::hook_command::{
-    best_result, hook_mode_with_raw, hook_modes_with_raw, runs_hook, source_label, ModeError,
-    ModeSource, RawModeResult,
+    best_result, hook_modes, runs_hook, source_label, ModeEnv, ModeError, ModeSource, RunMode,
 };
 use super::{Check, CheckStatus};
-use crate::config::McpAccessMode;
 
-/// The Claude Code event and `ironmem hook` name of each plugin hook. A unit
-/// test pins its events and each one's command to
+/// The key of the check on whether the hooks are wired and start.
+pub(super) const HOOKS_KEY: &str = "hooks";
+/// The key of the check on whether the wired miners mine.
+pub(super) const HOOK_MINING_KEY: &str = "hook_mining";
+
+/// One hook the ironmem plugin wires.
+#[derive(Debug)]
+pub(super) struct PluginHook {
+    /// The Claude Code event that runs it.
+    pub(super) event: &'static str,
+    /// Its `ironmem hook <name>`.
+    pub(super) name: &'static str,
+    /// A run with write access mines the workspace's changed files. A unit
+    /// test pins this to the hook's own rule, `crate::hook::hook_mines_workspace`.
+    pub(super) mines: bool,
+    /// What is lost when it does not run (it is missing or exits at startup),
+    /// as a full clause. It follows "so" or "and if it does," in the startup
+    /// entries (`startup_failure`, `possible_startup_failure`) and "and if it
+    /// fails too," in `split_hand_wired`'s hand-wired entries, and is listed
+    /// in parentheses, joined by "; ", for missing hooks.
+    pub(super) lost: &'static str,
+}
+
+/// The plugin hooks. A unit test pins their events and each one's command to
 /// `.claude-plugin/hooks/hooks.json`, but not their order; the order here is
 /// the one doctor reports them in.
 /// scripts/install-ironmem.sh's `CLAUDE_HOOK_EVENTS` mirrors it.
-const PLUGIN_HOOKS: [(&str, &str); 4] = [
-    ("SessionStart", "session-start"),
-    ("UserPromptSubmit", "user-prompt-submit"),
-    ("Stop", "stop"),
-    ("PreCompact", "precompact"),
+pub(super) static PLUGIN_HOOKS: [PluginHook; 4] = [
+    PluginHook {
+        event: "SessionStart",
+        name: "session-start",
+        mines: false,
+        lost: "no memory context is loaded at session start",
+    },
+    PluginHook {
+        event: "UserPromptSubmit",
+        name: "user-prompt-submit",
+        mines: false,
+        lost: "prompt recall is off",
+    },
+    PluginHook {
+        event: "Stop",
+        name: "stop",
+        mines: true,
+        lost: "workspace files are not mined when a session stops",
+    },
+    PluginHook {
+        event: "PreCompact",
+        name: "precompact",
+        mines: true,
+        lost: "workspace files are not mined before compaction",
+    },
 ];
 
-/// The hooks whose run mines the workspace's changed files (and is skipped
-/// without write access).
-const MINING_EVENTS: [&str; 2] = ["Stop", "PreCompact"];
+/// The events of the plugin hooks that mine, joined with `joiner`, e.g.
+/// "Stop and PreCompact".
+pub(super) fn miner_events(joiner: &str) -> String {
+    PLUGIN_HOOKS
+        .iter()
+        .filter(|h| h.mines)
+        .map(|h| h.event)
+        .collect::<Vec<_>>()
+        .join(joiner)
+}
 
 const INSTALL_HINT: &str = "re-run scripts/install-ironmem.sh to wire the missing hooks, \
 or install the ironmem Claude Code plugin";
@@ -72,8 +119,8 @@ const HOME_UNKNOWN: &str = "hook mining: skipped (home directory unknown)";
 /// The command shape of a plugin hook, used to work out the mode it runs in.
 const PLUGIN_HOOK_COMMAND: &str = "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh";
 
-/// Plugin hook events that settings.json wires, with every command matching each.
-type WiredHooks = Vec<(&'static str, Vec<String>)>;
+/// Plugin hooks that settings.json wires, with every command matching each.
+type WiredHooks = Vec<(&'static PluginHook, Vec<String>)>;
 
 /// What `~/.claude/settings.json` says about the ironmem hooks.
 #[derive(Debug)]
@@ -97,21 +144,21 @@ enum HookWiring {
     Manual {
         /// The plugin hooks found, in PLUGIN_HOOKS order.
         wired: WiredHooks,
-        /// Plugin hook events with no matching command.
-        missing: Vec<&'static str>,
+        /// Plugin hooks with no matching command.
+        missing: Vec<&'static PluginHook>,
         /// `env.IRONMEM_MCP_MODE` from settings.json, if set.
         settings_env_mode: Option<String>,
     },
 }
 
-/// Build the `hooks` and `hook_mining` checks for Claude Code. Always returns
-/// exactly those two keys, in that order, so doctor's key set is stable.
+/// Build the `hooks` and `hook_mining` checks for Claude Code: exactly those
+/// two keys, in that order, so doctor's key set is stable.
 /// `process_env_mode` is doctor's own `IRONMEM_MCP_MODE`, passed in so tests
 /// don't mutate the process environment.
 pub(super) fn claude_hook_checks(
     home: Option<&Path>,
     process_env_mode: Option<&str>,
-) -> Vec<Check> {
+) -> [Check; 2] {
     let Some(home) = home else {
         return skipped(
             "Claude Code hooks: home directory unknown, skipped",
@@ -128,9 +175,9 @@ pub(super) fn claude_hook_checks(
             ),
             "hook mining: skipped (no Claude Code config)",
         ),
-        HookWiring::NoSettings => vec![
+        HookWiring::NoSettings => [
             Check::new(
-                "hooks",
+                HOOKS_KEY,
                 CheckStatus::Warn,
                 format!(
                     "Claude Code hooks: none wired ({} does not exist): \
@@ -141,15 +188,15 @@ pub(super) fn claude_hook_checks(
             .with_hint(INSTALL_HINT),
             no_miner_check(),
         ],
-        HookWiring::Unreadable(e) => vec![
+        HookWiring::Unreadable(e) => [
             Check::new(
-                "hooks",
+                HOOKS_KEY,
                 CheckStatus::Warn,
                 format!("Claude Code hooks: cannot read {}: {e}", path.display()),
             )
             .with_hint("fix the file by hand, then re-run scripts/install-ironmem.sh"),
             Check::new(
-                "hook_mining",
+                HOOK_MINING_KEY,
                 CheckStatus::Info,
                 "hook mining: skipped (settings.json unreadable)",
             ),
@@ -160,71 +207,70 @@ pub(super) fn claude_hook_checks(
         } => {
             let wired: WiredHooks = PLUGIN_HOOKS
                 .iter()
-                .map(|(event, name)| (*event, vec![format!("{PLUGIN_HOOK_COMMAND} {name}")]))
+                .map(|hook| (hook, vec![format!("{PLUGIN_HOOK_COMMAND} {}", hook.name)]))
                 .collect();
-            let env = settings_env_mode.as_deref();
+            let env = ModeEnv {
+                settings: settings_env_mode.as_deref(),
+                process: process_env_mode,
+            };
             // A hand-wired copy runs as well as the plugin's, so it can start,
             // recall and mine in the plugin copy's place.
             let candidates: WiredHooks = wired
                 .iter()
-                .map(|(event, commands)| {
-                    let extra = hand_wired.iter().filter(|(e, _)| e == event);
+                .map(|(hook, commands)| {
+                    let extra = hand_wired.iter().filter(|(h, _)| h.event == hook.event);
                     let all = commands.iter().chain(extra.flat_map(|(_, c)| c)).cloned();
-                    (*event, all.collect())
+                    (*hook, all.collect())
                 })
                 .collect();
-            let split = split_hand_wired(&wired, &hand_wired, env, process_env_mode);
+            let split = split_hand_wired(&wired, &hand_wired, env);
             // A `Maybe` here needs a dynamic hand-wired copy (the plugin's copy
             // never has one), which `split_hand_wired` already reports.
-            let (failures, _) = startup_failures(&candidates, env, process_env_mode);
-            let mut mining = mining_check(&candidates, env, process_env_mode, true);
-            if mined_only_by_hand_wired(&wired, &candidates, env, process_env_mode) {
+            let (failures, _) = startup_failures(&candidates, env);
+            let mut mining = mining_check(&candidates, env, true);
+            if mined_only_by_hand_wired(&wired, &candidates, env) {
                 add_hint(&mut mining, PLUGIN_OVERRIDE_HINT);
             }
-            vec![plugin_hooks_check(&split, &failures), mining]
+            [plugin_hooks_check(&split, &failures), mining]
         }
         HookWiring::Manual {
             wired,
             missing,
             settings_env_mode,
         } => {
-            let (failures, may_fail) =
-                startup_failures(&wired, settings_env_mode.as_deref(), process_env_mode);
-            vec![
+            let env = ModeEnv {
+                settings: settings_env_mode.as_deref(),
+                process: process_env_mode,
+            };
+            let (failures, may_fail) = startup_failures(&wired, env);
+            [
                 hooks_check(&path, &missing, &failures, &may_fail),
-                mining_check(
-                    &wired,
-                    settings_env_mode.as_deref(),
-                    process_env_mode,
-                    false,
-                ),
+                mining_check(&wired, env, false),
             ]
         }
     }
 }
 
+/// True when the run's mode lets the hook mine: the hook's own gate.
+fn can_mine(run: &RunMode) -> bool {
+    run.mode.as_ref().is_ok_and(|mode| mode.allows_writes())
+}
+
 /// True when some plugin miner mines only through a hand-wired copy: the
-/// plugin's own command doesn't run trusted (an override wins over the
-/// wrapper's default), so removing the copies, as the `hooks` hint says,
-/// would stop mining.
-fn mined_only_by_hand_wired(
-    wired: &WiredHooks,
-    candidates: &WiredHooks,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> bool {
-    let trusted = |hooks: &WiredHooks, event: &str| {
+/// plugin's own command can't mine (an override wins over the wrapper's
+/// default), so removing the copies, as the `hooks` hint says, would stop
+/// mining.
+fn mined_only_by_hand_wired(wired: &WiredHooks, candidates: &WiredHooks, env: ModeEnv<'_>) -> bool {
+    let mines = |hooks: &WiredHooks, event: &str| {
         hooks
             .iter()
-            .filter(|(e, _)| *e == event)
-            .any(|(e, commands)| {
-                let ((result, _), _) = event_mode(e, commands, settings_env, process_env);
-                result == Ok(McpAccessMode::Trusted)
-            })
+            .filter(|(h, _)| h.event == event)
+            .any(|(h, commands)| can_mine(&event_mode(h, commands, env)))
     };
-    MINING_EVENTS
+    PLUGIN_HOOKS
         .iter()
-        .any(|event| !trusted(wired, event) && trusted(candidates, event))
+        .filter(|h| h.mines)
+        .any(|h| !mines(wired, h.event) && mines(candidates, h.event))
 }
 
 /// Append `hint` to `check`'s hint unless it is already there.
@@ -236,18 +282,11 @@ fn add_hint(check: &mut Check, hint: &str) {
     };
 }
 
-fn skipped(hooks_summary: &str, mining_summary: &str) -> Vec<Check> {
-    vec![
-        Check::new("hooks", CheckStatus::Info, hooks_summary),
-        Check::new("hook_mining", CheckStatus::Info, mining_summary),
+fn skipped(hooks_summary: &str, mining_summary: &str) -> [Check; 2] {
+    [
+        Check::new(HOOKS_KEY, CheckStatus::Info, hooks_summary),
+        Check::new(HOOK_MINING_KEY, CheckStatus::Info, mining_summary),
     ]
-}
-
-fn plugin_hook_name(event: &str) -> &'static str {
-    PLUGIN_HOOKS
-        .iter()
-        .find(|(e, _)| *e == event)
-        .map_or("", |(_, name)| name)
 }
 
 fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
@@ -268,15 +307,15 @@ fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
     }
     let mut wired = Vec::new();
     let mut missing = Vec::new();
-    for (event, hook) in PLUGIN_HOOKS {
-        let matching: Vec<String> = commands_for(&doc, event)
+    for hook in &PLUGIN_HOOKS {
+        let matching: Vec<String> = commands_for(&doc, hook.event)
             .into_iter()
-            .filter(|c| runs_hook(c, hook))
+            .filter(|c| runs_hook(c, hook.name))
             .collect();
         if matching.is_empty() {
-            missing.push(event);
+            missing.push(hook);
         } else {
-            wired.push((event, matching));
+            wired.push((hook, matching));
         }
     }
     let settings_env_mode = doc
@@ -323,37 +362,17 @@ fn commands_for(doc: &Value, event: &str) -> Vec<String> {
         .collect()
 }
 
-/// The one mode result reported for `event`, with its raw value: each
-/// matching command's [`hook_mode_with_raw`], reduced by [`best_result`]
-/// (trusted without doctor's shell, then trusted via the shell, then unknown,
-/// then read-only or restricted, then invalid; settings order breaks ties).
-fn event_mode(
-    event: &str,
-    commands: &[String],
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> RawModeResult {
-    let hook = plugin_hook_name(event);
-    let results = commands
-        .iter()
-        .map(|c| hook_mode_with_raw(c, hook, settings_env, process_env))
-        .collect();
-    best_result(results)
-}
-
-/// What is lost when `event`'s hook does not run (it is missing or exits at
-/// startup), as a full clause. It follows "so" or "and if it does," in the
-/// startup entries (`startup_failure`, `possible_startup_failure`) and "and if
-/// it fails too," in `split_hand_wired`'s hand-wired entries, and is listed in
-/// parentheses, joined by "; ", for missing hooks.
-fn failure_consequence(event: &str) -> &'static str {
-    match event {
-        "SessionStart" => "no memory context is loaded at session start",
-        "UserPromptSubmit" => "prompt recall is off",
-        "Stop" => "workspace files are not mined when a session stops",
-        "PreCompact" => "workspace files are not mined before compaction",
-        _ => "an unknown hook does not run",
-    }
+/// The one mode result reported for `hook`, with its raw value: every run of
+/// it in its matching commands, reduced by [`best_result`] (can mine without
+/// doctor's shell, then via the shell, then unknown, then cannot mine, then
+/// invalid; settings order breaks ties).
+fn event_mode(hook: &PluginHook, commands: &[String], env: ModeEnv<'_>) -> RunMode {
+    best_result(
+        commands
+            .iter()
+            .flat_map(|c| hook_modes(c, hook.name, env))
+            .collect(),
+    )
 }
 
 /// Why `Config::load` rejects the raw mode value `raw`, with it quoted.
@@ -361,47 +380,45 @@ fn invalid_reason(raw: &str) -> String {
     format!("IRONMEM_MCP_MODE={raw:?} is not trusted, read-only or restricted")
 }
 
-/// `event` exits at startup because `Config::load` rejects its raw mode `raw`.
-fn startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
+/// `hook` exits at startup because `Config::load` rejects its raw mode `raw`.
+fn startup_failure(hook: &PluginHook, raw: &str, source: ModeSource) -> String {
     format!(
-        "{event} fails to start: {} ({}), so {}",
+        "{} fails to start: {} ({}), so {}",
+        hook.event,
         invalid_reason(raw),
         source_label(source),
-        failure_consequence(event)
+        hook.lost
     )
 }
 
-/// `event` may exit at startup: its mode `raw` is built by the shell.
-fn possible_startup_failure(event: &str, raw: &str, source: ModeSource) -> String {
+/// `hook` may exit at startup: its mode `raw` is built by the shell.
+fn possible_startup_failure(hook: &PluginHook, raw: &str, source: ModeSource) -> String {
     format!(
-        "{event}'s mode cannot be determined statically (IRONMEM_MCP_MODE={raw}, {}), so it \
+        "{}'s mode cannot be determined statically (IRONMEM_MCP_MODE={raw}, {}), so it \
          may fail to start, and if it does, {}",
+        hook.event,
         source_label(source),
-        failure_consequence(event)
+        hook.lost
     )
 }
 
-/// The startup outcome of the non-mining hooks (SessionStart,
+/// The startup outcome of the hooks that do not mine (SessionStart,
 /// UserPromptSubmit), by [`starts`]: entries for those that surely fail
 /// (`No`: `Config::load` rejects every run's mode, so they exit at startup),
 /// then entries for those that may fail (`Maybe`: no run is surely valid and
-/// one's mode is built by the shell). Each entry ends with its event's
-/// [`failure_consequence`]. Miners are left to `hook_mining`, which reports
+/// one's mode is built by the shell). Each entry ends with its hook's
+/// [`PluginHook::lost`]. Miners are left to `hook_mining`, which reports
 /// both outcomes for them.
-fn startup_failures(
-    wired: &WiredHooks,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> (Vec<String>, Vec<String>) {
+fn startup_failures(wired: &WiredHooks, env: ModeEnv<'_>) -> (Vec<String>, Vec<String>) {
     let (mut fail, mut may_fail) = (Vec::new(), Vec::new());
-    for (event, commands) in wired {
-        if MINING_EVENTS.contains(event) {
+    for (hook, commands) in wired {
+        if hook.mines {
             continue;
         }
-        match starts(event, commands, settings_env, process_env) {
-            Starts::No(raw, source) => fail.push(startup_failure(event, &raw, source)),
+        match starts(hook, commands, env) {
+            Starts::No(raw, source) => fail.push(startup_failure(hook, &raw, source)),
             Starts::Maybe(raw, source) => {
-                may_fail.push(possible_startup_failure(event, &raw, source))
+                may_fail.push(possible_startup_failure(hook, &raw, source))
             }
             Starts::Yes => {}
         }
@@ -421,31 +438,24 @@ enum Starts {
     No(String, ModeSource),
 }
 
-/// Whether `commands`, the copies of `event`, start: [`Starts::Yes`] when
+/// Whether `commands`, the copies of `hook`, start: [`Starts::Yes`] when
 /// any run of the hook has a valid mode, across commands and within one, so a
 /// dynamic or invalid run never hides a working one.
-fn starts(
-    event: &str,
-    commands: &[String],
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> Starts {
-    let hook = plugin_hook_name(event);
-    let results: Vec<_> = commands
+fn starts(hook: &PluginHook, commands: &[String], env: ModeEnv<'_>) -> Starts {
+    let runs: Vec<RunMode> = commands
         .iter()
-        .flat_map(|c| hook_modes_with_raw(c, hook, settings_env, process_env))
-        .map(|(result, _)| result)
+        .flat_map(|c| hook_modes(c, hook.name, env))
         .collect();
-    // No runs at all reads as the read-only default, which starts.
-    if results.is_empty() || results.iter().any(|(r, _)| r.is_ok()) {
+    // No runs at all reads as the unset default, which starts.
+    if runs.is_empty() || runs.iter().any(|r| r.mode.is_ok()) {
         return Starts::Yes;
     }
-    let unknown = results.iter().find_map(|(r, source)| match r {
-        Err(ModeError::Unknown(raw)) => Some(Starts::Maybe(raw.clone(), *source)),
+    let unknown = runs.iter().find_map(|r| match &r.mode {
+        Err(ModeError::Unknown(raw)) => Some(Starts::Maybe(raw.clone(), r.source)),
         _ => None,
     });
-    let invalid = results.iter().find_map(|(r, source)| match r {
-        Err(ModeError::Invalid(raw)) => Some(Starts::No(raw.clone(), *source)),
+    let invalid = runs.iter().find_map(|r| match &r.mode {
+        Err(ModeError::Invalid(raw)) => Some(Starts::No(raw.clone(), r.source)),
         _ => None,
     });
     unknown.or(invalid).unwrap_or(Starts::Yes)
@@ -473,27 +483,22 @@ struct HandWired {
 /// a failing plugin copy never gets that hint, because removing it would turn
 /// the hook off. When every copy fails, `startup_failures` (or `hook_mining`,
 /// for a miner) names the effect.
-fn split_hand_wired(
-    wired: &WiredHooks,
-    hand_wired: &WiredHooks,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> HandWired {
+fn split_hand_wired(wired: &WiredHooks, hand_wired: &WiredHooks, env: ModeEnv<'_>) -> HandWired {
     let mut out = HandWired {
         duplicated: Vec::new(),
         entries: Vec::new(),
         hints: Vec::new(),
     };
-    for (event, commands) in hand_wired {
-        let plugin_copy = wired.iter().find(|(e, _)| e == event).map(|(_, c)| c);
+    for (hook, commands) in hand_wired {
+        let event = hook.event;
+        let plugin_copy = wired.iter().find(|(h, _)| h.event == event).map(|(_, c)| c);
         // Never `None`: `wired` holds all of PLUGIN_HOOKS and `hand_wired`
-        // only events from it. Doctor stays total, so no `expect`.
-        let plugin =
-            plugin_copy.map_or(Starts::Yes, |c| starts(event, c, settings_env, process_env));
+        // only hooks from it. Doctor stays total, so no `expect`.
+        let plugin = plugin_copy.map_or(Starts::Yes, |c| starts(hook, c, env));
         // `plugin` is never `Starts::Maybe` (pinned by
         // `a_plugin_copy_never_has_a_dynamic_mode`), so the `_` arms below
         // stand for `Starts::Yes`.
-        let copy = starts(event, commands, settings_env, process_env);
+        let copy = starts(hook, commands, env);
         let (entry, hints): (String, &[&'static str]) = match (plugin, copy) {
             (Starts::No(raw, source), Starts::Yes) => (
                 format!(
@@ -512,7 +517,7 @@ fn split_hand_wired(
                     invalid_reason(&raw),
                     source_label(source),
                     source_label(copy_source),
-                    failure_consequence(event)
+                    hook.lost
                 ),
                 &[INVALID_MODE_HINT, DYNAMIC_MODE_HINT],
             ),
@@ -525,7 +530,7 @@ fn split_hand_wired(
                 &[INVALID_MODE_HINT],
             ),
             (_, Starts::Yes) => {
-                out.duplicated.push(*event);
+                out.duplicated.push(event);
                 continue;
             }
             (_, Starts::Maybe(raw, source)) => (
@@ -564,7 +569,7 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[String]) -> Check {
     } = hand_wired;
     if duplicated.is_empty() && entries.is_empty() && failures.is_empty() {
         return Check::new(
-            "hooks",
+            HOOKS_KEY,
             CheckStatus::Ok,
             "Claude Code hooks: supplied by the enabled ironmem plugin",
         );
@@ -592,7 +597,7 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[String]) -> Check {
         }
     }
     Check::new(
-        "hooks",
+        HOOKS_KEY,
         CheckStatus::Warn,
         format!("Claude Code hooks: {}", problems.join("; ")),
     )
@@ -601,10 +606,15 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[String]) -> Check {
 
 /// The manual install's `hooks` check: missing hooks, then hooks that fail to
 /// start (`failures`), then hooks that may (`may_fail`), each with one hint.
-fn hooks_check(path: &Path, missing: &[&str], failures: &[String], may_fail: &[String]) -> Check {
+fn hooks_check(
+    path: &Path,
+    missing: &[&PluginHook],
+    failures: &[String],
+    may_fail: &[String],
+) -> Check {
     if missing.is_empty() && failures.is_empty() && may_fail.is_empty() {
         return Check::new(
-            "hooks",
+            HOOKS_KEY,
             CheckStatus::Ok,
             format!(
                 "Claude Code hooks: all {} wired in {}",
@@ -616,10 +626,11 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String], may_fail: &[S
     let mut problems = Vec::new();
     let mut hints = Vec::new();
     if !missing.is_empty() {
-        let effects: Vec<&str> = missing.iter().map(|e| failure_consequence(e)).collect();
+        let events: Vec<&str> = missing.iter().map(|h| h.event).collect();
+        let effects: Vec<&str> = missing.iter().map(|h| h.lost).collect();
         problems.push(format!(
             "missing {} in {} ({})",
-            missing.join(", "),
+            events.join(", "),
             path.display(),
             effects.join("; ")
         ));
@@ -635,7 +646,7 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String], may_fail: &[S
         hints.push(DYNAMIC_MODE_HINT);
     }
     Check::new(
-        "hooks",
+        HOOKS_KEY,
         CheckStatus::Warn,
         format!("Claude Code hooks: {}", problems.join("; ")),
     )
@@ -644,9 +655,12 @@ fn hooks_check(path: &Path, missing: &[&str], failures: &[String], may_fail: &[S
 
 fn no_miner_check() -> Check {
     Check::new(
-        "hook_mining",
+        HOOK_MINING_KEY,
         CheckStatus::Warn,
-        "no Stop or PreCompact hook is wired: workspace files are not mined",
+        format!(
+            "no {} hook is wired: workspace files are not mined",
+            miner_events(" or ")
+        ),
     )
     .with_hint(INSTALL_HINT)
 }
@@ -769,48 +783,49 @@ fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> Stri
 
 /// The `hook_mining` check: a headline, then one `<Event>: <mode> (<source>)
 /// -> <outcome>` entry per wired miner, joined with `; ` because doctor
-/// renders each summary as one line. Ok only when every wired miner mines;
-/// the hint holds one entry per distinct [`NoMineCause`], in the order of the
-/// entries, joined with [`HINT_JOINER`]. `plugin` says the miners run on the
-/// plugin path (the plugin's hooks plus any hand-wired copies).
-fn mining_check(
-    wired: &WiredHooks,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-    plugin: bool,
-) -> Check {
-    let miners: Vec<&(&'static str, Vec<String>)> = wired
-        .iter()
-        .filter(|(event, _)| MINING_EVENTS.contains(event))
-        .collect();
+/// renders each summary as one line. Ok only when every wired miner mines
+/// (its mode passes [`can_mine`], the hook's own gate); the hint holds one
+/// entry per distinct [`NoMineCause`], in the order of the entries, joined
+/// with [`HINT_JOINER`]. `plugin` says the miners run on the plugin path (the
+/// plugin's hooks plus any hand-wired copies).
+fn mining_check(wired: &WiredHooks, env: ModeEnv<'_>, plugin: bool) -> Check {
+    let miners: Vec<&(&'static PluginHook, Vec<String>)> =
+        wired.iter().filter(|(hook, _)| hook.mines).collect();
     if miners.is_empty() {
         return no_miner_check();
     }
     let (mut mined, mut not_mined, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
     let mut lines = Vec::new();
     let mut causes: Vec<CauseGroup> = Vec::new();
-    for (event, commands) in miners {
-        let ((result, source), raw) = event_mode(event, commands, settings_env, process_env);
-        let label = source_label(source);
-        lines.push(match result {
-            Ok(McpAccessMode::Trusted) => {
-                mined.push(*event);
-                if source == ModeSource::Environment {
+    for (hook, commands) in miners {
+        let event = hook.event;
+        let run = event_mode(hook, commands, env);
+        let label = source_label(run.source);
+        let mines = can_mine(&run);
+        lines.push(match run.mode {
+            Ok(mode) if mines => {
+                mined.push(event);
+                if run.source == ModeSource::Environment {
                     format!(
-                        "{event}: trusted (inherited from this shell; Claude Code must be \
-                         launched with it) -> mined"
+                        "{event}: {} (inherited from this shell; Claude Code must be \
+                         launched with it) -> mined",
+                        mode.as_str()
                     )
                 } else {
-                    format!("{event}: trusted ({label}) -> mined")
+                    format!("{event}: {} ({label}) -> mined", mode.as_str())
                 }
             }
             Ok(mode) => {
-                not_mined.push(*event);
-                add_cause(&mut causes, NoMineCause::of(source, raw, plugin), event);
+                not_mined.push(event);
+                add_cause(
+                    &mut causes,
+                    NoMineCause::of(run.source, run.raw, plugin),
+                    event,
+                );
                 format!("{event}: {} ({label}) -> not mined", mode.as_str())
             }
             Err(ModeError::Invalid(raw)) => {
-                not_mined.push(*event);
+                not_mined.push(event);
                 add_cause(&mut causes, NoMineCause::Invalid, event);
                 format!(
                     "{event}: {raw:?} ({label}) -> fails to start: {}",
@@ -818,7 +833,7 @@ fn mining_check(
                 )
             }
             Err(ModeError::Unknown(raw)) => {
-                unknown.push(*event);
+                unknown.push(event);
                 add_cause(&mut causes, NoMineCause::Dynamic, event);
                 format!("{event}: {raw} ({label}) -> mode cannot be determined statically")
             }
@@ -834,7 +849,7 @@ fn mining_check(
         mining_headline(&mined, &not_mined, &unknown),
         lines.join("; ")
     );
-    let check = Check::new("hook_mining", status, summary);
+    let check = Check::new(HOOK_MINING_KEY, status, summary);
     if causes.is_empty() {
         return check;
     }
@@ -896,13 +911,83 @@ mod tests {
             PLUGIN_HOOKS.len(),
             "event count drifted from hooks.json"
         );
-        for (event, name) in PLUGIN_HOOKS {
+        for hook in &PLUGIN_HOOKS {
+            let (event, name) = (hook.event, hook.name);
             let cmd = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(
                 runs_hook(cmd, name),
                 "{event}: `{cmd}` should run hook {name}"
             );
             assert_eq!(cmd, format!("{PLUGIN_HOOK_COMMAND} {name}"), "{event}");
+        }
+    }
+
+    #[test]
+    fn plugin_hook_mines_flags_follow_the_hooks_own_rule() {
+        for hook in &PLUGIN_HOOKS {
+            assert_eq!(
+                hook.mines,
+                crate::hook::hook_mines_workspace(hook.name),
+                "{}",
+                hook.event
+            );
+        }
+        assert_eq!(miner_events(" and "), "Stop and PreCompact");
+    }
+
+    #[test]
+    fn the_plugin_wrapper_defaults_to_the_mode_doctor_assumes() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../.claude-plugin");
+        let wrapper = std::fs::read_to_string(format!("{root}/bin/ironmem-mcp.sh")).unwrap();
+        let lines: Vec<&str> = wrapper
+            .lines()
+            .filter(|l| l.trim_start().starts_with("export IRONMEM_MCP_MODE="))
+            .collect();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let default = lines[0]
+            .trim()
+            .strip_prefix(r#"export IRONMEM_MCP_MODE="${IRONMEM_MCP_MODE:-"#)
+            .and_then(|rest| rest.strip_suffix(r#"}""#))
+            .unwrap_or_else(|| panic!("unexpected wrapper line: {}", lines[0]));
+        assert_eq!(
+            crate::config::McpAccessMode::parse(default).unwrap(),
+            super::super::hook_command::WRAPPER_DEFAULT
+        );
+        // The plugin's hook script runs its hooks through that wrapper.
+        let hook_script = std::fs::read_to_string(format!("{root}/hooks/ironmem-hook.sh")).unwrap();
+        assert!(
+            hook_script.contains(r#""$PLUGIN_ROOT/bin/ironmem-mcp.sh" hook "$HOOK_NAME""#),
+            "{hook_script}"
+        );
+    }
+
+    /// Every [`McpAccessMode`]; the match fails to compile when one is added.
+    fn every_mode() -> [crate::config::McpAccessMode; 3] {
+        use crate::config::McpAccessMode::*;
+        let all = [Trusted, ReadOnly, Restricted];
+        for mode in all {
+            match mode {
+                Trusted | ReadOnly | Restricted => {}
+            }
+        }
+        all
+    }
+
+    #[test]
+    fn a_miner_is_mined_exactly_when_its_mode_allows_writes() {
+        for mode in every_mode() {
+            let raw = mode.as_str();
+            let stop = format!("IRONMEM_MCP_MODE={raw} ironmem hook stop");
+            let c = mining_of(&settings_with(&[("Stop", stop.as_str())]), None);
+            let mined = format!("Stop: {raw} (set in the hook command) -> mined");
+            let not_mined = format!("Stop: {raw} (set in the hook command) -> not mined");
+            if mode.allows_writes() {
+                assert_eq!(c.status, CheckStatus::Ok, "{raw}: {}", c.summary);
+                assert!(c.summary.contains(&mined), "{raw}: {}", c.summary);
+            } else {
+                assert_eq!(c.status, CheckStatus::Warn, "{raw}: {}", c.summary);
+                assert!(c.summary.contains(&not_mined), "{raw}: {}", c.summary);
+            }
         }
     }
 
@@ -972,8 +1057,13 @@ mod tests {
             "'/Users/Jo Smith/.ironrace/bin/ironmem'",
             r"'/Users/Jo Smith/it'\''s here/bin/ironmem'",
         ] {
-            let cmds =
-                PLUGIN_HOOKS.map(|(e, n)| (e, format!("{program} hook {n} --harness claude-code")));
+            let cmds: Vec<(&str, String)> = PLUGIN_HOOKS
+                .iter()
+                .map(|h| {
+                    let n = h.name;
+                    (h.event, format!("{program} hook {n} --harness claude-code"))
+                })
+                .collect();
             let refs: Vec<(&str, &str)> = cmds.iter().map(|(e, c)| (*e, c.as_str())).collect();
             let home = home_with_settings(&settings_with(&refs));
             let checks = claude_hook_checks(Some(home.path()), None);
@@ -1281,7 +1371,8 @@ mod tests {
 
     fn mining_of(settings: &str, process_env: Option<&str>) -> Check {
         let home = home_with_settings(settings);
-        claude_hook_checks(Some(home.path()), process_env).remove(1)
+        let [_, mining] = claude_hook_checks(Some(home.path()), process_env);
+        mining
     }
 
     #[test]
@@ -2152,17 +2243,26 @@ mod tests {
     fn a_plugin_copy_never_has_a_dynamic_mode() {
         // split_hand_wired relies on this: env values are literal and the
         // plugin's command sets no mode, so its `Starts::Maybe` case never runs.
-        for (event, name) in PLUGIN_HOOKS {
+        for hook in &PLUGIN_HOOKS {
+            let (event, name) = (hook.event, hook.name);
             let plugin = [format!("{PLUGIN_HOOK_COMMAND} {name}")];
+            let settings = ModeEnv {
+                settings: Some("$M"),
+                process: None,
+            };
             assert_eq!(
-                starts(event, &plugin, Some("$M"), None),
+                starts(hook, &plugin, settings),
                 Starts::No("$M".to_owned(), ModeSource::SettingsEnv),
                 "{event}"
             );
             // A defensive case: the CLI's `Config::load` rejects this value
             // in doctor's own environment before doctor runs.
+            let shell = ModeEnv {
+                settings: None,
+                process: Some("$(cat /m)"),
+            };
             assert_eq!(
-                starts(event, &plugin, None, Some("$(cat /m)")),
+                starts(hook, &plugin, shell),
                 Starts::No("$(cat /m)".to_owned(), ModeSource::Environment),
                 "{event}"
             );

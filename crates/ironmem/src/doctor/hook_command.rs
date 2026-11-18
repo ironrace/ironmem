@@ -3,12 +3,27 @@
 //! Answers two questions about a hook command string: does it run
 //! `ironmem hook <name>`, and in which `IRONMEM_MCP_MODE` does it run. It is
 //! a simple-command reader, not a shell; the limits are documented on
-//! [`runs_hook`] and [`hook_mode_with_raw`]. Diagnose-only: it parses strings and never
+//! [`runs_hook`] and [`hook_modes`]. Diagnose-only: it parses strings and never
 //! runs anything or touches the filesystem.
 
 use crate::config::McpAccessMode;
 
 const MODE_VAR: &str = "IRONMEM_MCP_MODE";
+
+/// The mode the plugin wrapper `.claude-plugin/bin/ironmem-mcp.sh` gives a
+/// hook when `IRONMEM_MCP_MODE` is unset or empty
+/// (`${IRONMEM_MCP_MODE:-trusted}`). A unit test pins it to that line.
+pub(super) const WRAPPER_DEFAULT: McpAccessMode = McpAccessMode::Trusted;
+
+/// Where a hook can get `IRONMEM_MCP_MODE` from besides its own command.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct ModeEnv<'a> {
+    /// `env.IRONMEM_MCP_MODE` in settings.json.
+    pub(super) settings: Option<&'a str>,
+    /// `IRONMEM_MCP_MODE` in doctor's own environment, used as a stand-in for
+    /// the environment Claude Code passes to its hooks.
+    pub(super) process: Option<&'a str>,
+}
 
 /// Where a hook's effective `IRONMEM_MCP_MODE` came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +38,7 @@ pub(super) enum ModeSource {
     Environment,
     /// The plugin wrapper's `${IRONMEM_MCP_MODE:-trusted}` default.
     PluginWrapper,
-    /// Nothing set it: `Config` defaults to read-only.
+    /// Nothing set it: `Config::load` uses [`McpAccessMode::UNSET_DEFAULT`].
     Default,
 }
 
@@ -36,7 +51,26 @@ pub(super) enum ModeError {
     Unknown(String),
 }
 
-pub(super) type ModeResult = (Result<McpAccessMode, ModeError>, ModeSource);
+/// The mode one run of a hook gets, where that came from, and the raw
+/// `IRONMEM_MCP_MODE` value it was read from (`None` for the wrapper's
+/// default and the unset default), so hints can quote what the file says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RunMode {
+    pub(super) mode: Result<McpAccessMode, ModeError>,
+    pub(super) source: ModeSource,
+    pub(super) raw: Option<String>,
+}
+
+impl RunMode {
+    /// A mode nothing in the hook's command or environment set.
+    fn defaulted(mode: McpAccessMode, source: ModeSource) -> Self {
+        Self {
+            mode: Ok(mode),
+            source,
+            raw: None,
+        }
+    }
+}
 
 pub(super) fn source_label(source: ModeSource) -> &'static str {
     match source {
@@ -434,24 +468,19 @@ pub(super) fn runs_hook(command: &str, hook: &str) -> bool {
     invocations(command, None).iter().any(|i| i.hook == hook)
 }
 
-/// The mode of `command` with the raw value dropped: test shorthand for
-/// [`hook_mode_with_raw`], which doctor itself calls.
+/// The best mode of the `hook` runs in `command`, without its raw value:
+/// test shorthand for [`best_result`] over [`hook_modes`].
 #[cfg(test)]
 pub(super) fn hook_mode(
     command: &str,
     hook: &str,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> ModeResult {
-    hook_mode_with_raw(command, hook, settings_env, process_env).0
+    env: ModeEnv<'_>,
+) -> (Result<McpAccessMode, ModeError>, ModeSource) {
+    let run = best_result(hook_modes(command, hook, env));
+    (run.mode, run.source)
 }
 
-/// A [`ModeResult`] with the raw `IRONMEM_MCP_MODE` value it was read from
-/// (`None` for the wrapper's default and the read-only default).
-pub(super) type RawModeResult = (ModeResult, Option<String>);
-
-/// The mode the `hook` run(s) in `command` get, where that came from, and
-/// the raw value it was read from, so hints can quote what the file says.
+/// The [`RunMode`] of every run of `hook` in `command`, in order.
 ///
 /// Only the same simple command counts: the mode comes from the assignment
 /// words (or `env` assignments) of the command that runs the hook, or from an
@@ -459,59 +488,31 @@ pub(super) type RawModeResult = (ModeResult, Option<String>);
 /// own assignment wins. It never comes from a later or a different simple
 /// command, so `ironmem hook stop; IRONMEM_MCP_MODE=trusted true` runs
 /// read-only and `IRONMEM_MCP_MODE=bogus true || ironmem hook stop` runs
-/// in the default mode. When the command holds several runs of `hook`, one is
-/// picked by [`best_result`].
+/// in the default mode. Callers that report one result for several runs
+/// reduce them with [`best_result`].
 ///
 /// With no inline value the order is settings.json `env`, then the inherited
-/// environment, then the plugin wrapper's trusted default (an empty value
+/// environment, then the plugin wrapper's [`WRAPPER_DEFAULT`] (an empty value
 /// counts as unset to the wrapper, but `Config::load` rejects it), then
-/// read-only. A value containing `$` or a backtick is [`ModeError::Unknown`].
-/// The command-reading limits are listed on [`runs_hook`].
-pub(super) fn hook_mode_with_raw(
-    command: &str,
-    hook: &str,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> RawModeResult {
-    best_result(hook_modes_with_raw(
-        command,
-        hook,
-        settings_env,
-        process_env,
-    ))
-}
-
-/// The [`hook_mode_with_raw`] result of every run of `hook` in `command`, in
-/// order and unreduced, for callers that need to know whether any run starts.
-pub(super) fn hook_modes_with_raw(
-    command: &str,
-    hook: &str,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> Vec<RawModeResult> {
+/// [`McpAccessMode::UNSET_DEFAULT`]. A value containing `$` or a backtick is
+/// [`ModeError::Unknown`]. The command-reading limits are listed on
+/// [`runs_hook`].
+pub(super) fn hook_modes(command: &str, hook: &str, env: ModeEnv<'_>) -> Vec<RunMode> {
     invocations(command, None)
         .iter()
         .filter(|i| i.hook == hook)
-        .map(|i| {
-            let result = invocation_mode(i, settings_env, process_env);
-            let raw = match result.1 {
-                ModeSource::Inline => i.mode.as_ref().map(|v| v.raw.clone()),
-                ModeSource::SettingsEnv => settings_env.map(str::to_owned),
-                ModeSource::Environment => process_env.map(str::to_owned),
-                ModeSource::PluginWrapper | ModeSource::Default => None,
-            };
-            (result, raw)
-        })
+        .map(|i| invocation_mode(i, env))
         .collect()
 }
 
-/// How good a result is for mining, lowest first: trusted without doctor's
-/// shell, trusted via the shell, unknown (it may be trusted), read-only or
-/// restricted, then invalid (the hook exits at startup).
-fn rank(result: &ModeResult) -> u8 {
-    match result {
-        (Ok(McpAccessMode::Trusted), source) if *source != ModeSource::Environment => 0,
-        (Ok(McpAccessMode::Trusted), _) => 1,
+/// How good a run is for mining, lowest first: can mine (its mode
+/// [`McpAccessMode::allows_writes`], the hook's own gate) without doctor's
+/// shell, can mine via the shell, unknown (it may mine), cannot mine, then
+/// invalid (the hook exits at startup).
+fn rank(run: &RunMode) -> u8 {
+    match (&run.mode, run.source) {
+        (Ok(mode), source) if mode.allows_writes() && source != ModeSource::Environment => 0,
+        (Ok(mode), _) if mode.allows_writes() => 1,
         (Err(ModeError::Unknown(_)), _) => 2,
         (Ok(_), _) => 3,
         (Err(ModeError::Invalid(_)), _) => 4,
@@ -521,47 +522,57 @@ fn rank(result: &ModeResult) -> u8 {
 /// The one result to report for several runs of the same hook (in one
 /// command, or across an event's commands): the best by [`rank`], the first
 /// in order among equals, so the order of commands decides only ties. With
-/// no runs, read-only by default.
-pub(super) fn best_result(results: Vec<RawModeResult>) -> RawModeResult {
-    results
-        .into_iter()
-        .min_by_key(|(result, _)| rank(result))
-        .unwrap_or(((Ok(McpAccessMode::ReadOnly), ModeSource::Default), None))
+/// no runs, the unset default.
+pub(super) fn best_result(runs: Vec<RunMode>) -> RunMode {
+    runs.into_iter()
+        .min_by_key(rank)
+        .unwrap_or_else(|| RunMode::defaulted(McpAccessMode::UNSET_DEFAULT, ModeSource::Default))
 }
 
-fn invocation_mode(
-    run: &Invocation,
-    settings_env: Option<&str>,
-    process_env: Option<&str>,
-) -> ModeResult {
-    let (raw, dynamic, source) = match (&run.mode, settings_env, process_env) {
+fn invocation_mode(run: &Invocation, env: ModeEnv<'_>) -> RunMode {
+    let (raw, dynamic, source) = match (&run.mode, env.settings, env.process) {
         (Some(v), _, _) => (v.raw.as_str(), v.dynamic, ModeSource::Inline),
         (None, Some(v), _) => (v, false, ModeSource::SettingsEnv),
         (None, None, Some(v)) => (v, false, ModeSource::Environment),
         (None, None, None) if run.wrapper => {
-            return (Ok(McpAccessMode::Trusted), ModeSource::PluginWrapper)
+            return RunMode::defaulted(WRAPPER_DEFAULT, ModeSource::PluginWrapper)
         }
-        (None, None, None) => return (Ok(McpAccessMode::ReadOnly), ModeSource::Default),
+        (None, None, None) => {
+            return RunMode::defaulted(McpAccessMode::UNSET_DEFAULT, ModeSource::Default)
+        }
+    };
+    let read = |mode| RunMode {
+        mode,
+        source,
+        raw: Some(raw.to_owned()),
     };
     if dynamic {
-        return (Err(ModeError::Unknown(raw.to_owned())), source);
+        return read(Err(ModeError::Unknown(raw.to_owned())));
     }
     if run.wrapper && raw.is_empty() {
-        return (Ok(McpAccessMode::Trusted), ModeSource::PluginWrapper);
+        return RunMode::defaulted(WRAPPER_DEFAULT, ModeSource::PluginWrapper);
     }
     match McpAccessMode::parse(raw) {
-        // The wrapper defaults to trusted, so this holds without doctor's shell.
-        Ok(McpAccessMode::Trusted) if run.wrapper && source == ModeSource::Environment => {
-            (Ok(McpAccessMode::Trusted), ModeSource::PluginWrapper)
+        // The wrapper defaults to this mode, so it holds without doctor's shell.
+        Ok(mode) if run.wrapper && source == ModeSource::Environment && mode == WRAPPER_DEFAULT => {
+            RunMode::defaulted(mode, ModeSource::PluginWrapper)
         }
-        Ok(mode) => (Ok(mode), source),
-        Err(_) => (Err(ModeError::Invalid(raw.to_owned())), source),
+        Ok(mode) => read(Ok(mode)),
+        Err(_) => read(Err(ModeError::Invalid(raw.to_owned()))),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only doctor's own environment sets IRONMEM_MCP_MODE, to `mode`.
+    fn shell(mode: &str) -> ModeEnv<'_> {
+        ModeEnv {
+            settings: None,
+            process: Some(mode),
+        }
+    }
 
     #[test]
     fn runs_hook_matches_direct_wrapper_and_plugin_script_forms() {
@@ -593,36 +604,48 @@ mod tests {
         use McpAccessMode::*;
         let bare = "~/.ironrace/bin/ironmem hook stop";
         assert_eq!(
-            hook_mode(bare, "stop", None, None),
+            hook_mode(bare, "stop", ModeEnv::default()),
             (Ok(ReadOnly), ModeSource::Default)
         );
         assert_eq!(
-            hook_mode(bare, "stop", None, Some("trusted")),
+            hook_mode(bare, "stop", shell("trusted")),
             (Ok(Trusted), ModeSource::Environment)
         );
         assert_eq!(
-            hook_mode(bare, "stop", Some("trusted"), Some("read-only")),
+            hook_mode(
+                bare,
+                "stop",
+                ModeEnv {
+                    settings: Some("trusted"),
+                    process: Some("read-only")
+                }
+            ),
             (Ok(Trusted), ModeSource::SettingsEnv)
         );
         assert_eq!(
             hook_mode(
                 "IRONMEM_MCP_MODE='read-only' ironmem hook stop",
                 "stop",
-                Some("trusted"),
-                Some("trusted")
+                ModeEnv {
+                    settings: Some("trusted"),
+                    process: Some("trusted")
+                }
             ),
             (Ok(ReadOnly), ModeSource::Inline)
         );
         assert_eq!(
-            hook_mode("bash /p/hooks/ironmem-hook.sh stop", "stop", None, None),
+            hook_mode(
+                "bash /p/hooks/ironmem-hook.sh stop",
+                "stop",
+                ModeEnv::default()
+            ),
             (Ok(Trusted), ModeSource::PluginWrapper)
         );
         assert_eq!(
             hook_mode(
                 "bash /p/hooks/ironmem-hook.sh stop",
                 "stop",
-                None,
-                Some("read-only")
+                shell("read-only")
             ),
             (Ok(ReadOnly), ModeSource::Environment),
             "the wrapper only defaults; an inherited mode wins"
@@ -630,8 +653,7 @@ mod tests {
         assert!(hook_mode(
             "IRONMEM_MCP_MODE=bogus ironmem hook stop",
             "stop",
-            None,
-            None
+            ModeEnv::default()
         )
         .0
         .is_err());
@@ -666,8 +688,7 @@ mod tests {
             hook_mode(
                 "export IRONMEM_MCP_MODE=trusted; ironmem hook stop",
                 "stop",
-                None,
-                None
+                ModeEnv::default()
             ),
             (Ok(Trusted), ModeSource::Inline)
         );
@@ -675,8 +696,7 @@ mod tests {
             hook_mode(
                 "export IRONMEM_MCP_MODE=\"read-only\"; ironmem hook stop",
                 "stop",
-                None,
-                None
+                ModeEnv::default()
             ),
             (Ok(ReadOnly), ModeSource::Inline)
         );
@@ -687,33 +707,33 @@ mod tests {
         use McpAccessMode::*;
         let later = "ironmem hook stop; IRONMEM_MCP_MODE=trusted true";
         assert_eq!(
-            hook_mode(later, "stop", None, None),
+            hook_mode(later, "stop", ModeEnv::default()),
             (Ok(ReadOnly), ModeSource::Default)
         );
         let two = "IRONMEM_MCP_MODE=read-only ironmem hook precompact; \
                    IRONMEM_MCP_MODE=trusted ironmem hook stop";
         assert_eq!(
-            hook_mode(two, "stop", None, None),
+            hook_mode(two, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::Inline)
         );
         assert_eq!(
-            hook_mode(two, "precompact", None, None),
+            hook_mode(two, "precompact", ModeEnv::default()),
             (Ok(ReadOnly), ModeSource::Inline)
         );
         let exported = "export IRONMEM_MCP_MODE=trusted; ironmem hook stop";
         assert_eq!(
-            hook_mode(exported, "stop", None, None),
+            hook_mode(exported, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::Inline)
         );
         let inline_wins =
             "export IRONMEM_MCP_MODE=trusted; IRONMEM_MCP_MODE=read-only ironmem hook stop";
         assert_eq!(
-            hook_mode(inline_wins, "stop", None, None),
+            hook_mode(inline_wins, "stop", ModeEnv::default()),
             (Ok(ReadOnly), ModeSource::Inline)
         );
         let late_export = "ironmem hook stop; export IRONMEM_MCP_MODE=trusted";
         assert_eq!(
-            hook_mode(late_export, "stop", None, None),
+            hook_mode(late_export, "stop", ModeEnv::default()),
             (Ok(ReadOnly), ModeSource::Default)
         );
     }
@@ -743,12 +763,12 @@ mod tests {
         use McpAccessMode::*;
         let env = "env IRONMEM_MCP_MODE=trusted ironmem hook stop";
         assert_eq!(
-            hook_mode(env, "stop", None, None),
+            hook_mode(env, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::Inline)
         );
         let sh = "IRONMEM_MCP_MODE=trusted sh -c 'ironmem hook stop'";
         assert_eq!(
-            hook_mode(sh, "stop", None, None),
+            hook_mode(sh, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::Inline)
         );
     }
@@ -766,7 +786,7 @@ mod tests {
         ] {
             assert!(runs_hook(cmd, "stop"), "{cmd}");
             assert_eq!(
-                hook_mode(cmd, "stop", None, None),
+                hook_mode(cmd, "stop", ModeEnv::default()),
                 (Err(ModeError::Unknown(raw.to_owned())), ModeSource::Inline),
                 "{cmd}"
             );
@@ -779,7 +799,7 @@ mod tests {
         let cmd = "bash /p/bin/ironmem-mcp.sh hook stop";
         assert!(runs_hook(cmd, "stop"));
         assert_eq!(
-            hook_mode(cmd, "stop", None, None),
+            hook_mode(cmd, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::PluginWrapper)
         );
         assert!(runs_hook(
@@ -804,7 +824,7 @@ mod tests {
         assert!(runs_hook("env - ironmem hook stop", "stop"));
         let chdir = "env -C /tmp IRONMEM_MCP_MODE=trusted ironmem hook stop";
         assert_eq!(
-            hook_mode(chdir, "stop", None, None),
+            hook_mode(chdir, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::Inline)
         );
         assert!(runs_hook("bash -o pipefail -c 'ironmem hook stop'", "stop"));
@@ -829,13 +849,17 @@ mod tests {
     #[test]
     fn invalid_mode_carries_the_raw_value() {
         assert_eq!(
-            hook_mode("IRONMEM_MCP_MODE= ironmem hook stop", "stop", None, None),
+            hook_mode(
+                "IRONMEM_MCP_MODE= ironmem hook stop",
+                "stop",
+                ModeEnv::default()
+            ),
             (Err(ModeError::Invalid(String::new())), ModeSource::Inline)
         );
         // A defensive case: the CLI's `Config::load` rejects an invalid
         // IRONMEM_MCP_MODE in doctor's own environment before doctor runs.
         assert_eq!(
-            hook_mode("ironmem hook stop", "stop", None, Some("Bogus")),
+            hook_mode("ironmem hook stop", "stop", shell("Bogus")),
             (
                 Err(ModeError::Invalid("Bogus".to_owned())),
                 ModeSource::Environment
@@ -849,7 +873,7 @@ mod tests {
         let cmd = "env -i IRONMEM_MCP_MODE=trusted ironmem hook stop";
         assert!(runs_hook(cmd, "stop"));
         assert_eq!(
-            hook_mode(cmd, "stop", None, None),
+            hook_mode(cmd, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::Inline)
         );
     }
@@ -874,7 +898,7 @@ mod tests {
         use McpAccessMode::*;
         let cmd = "ironmem hook stop; IRONMEM_MCP_MODE=trusted ironmem hook stop";
         assert_eq!(
-            hook_mode(cmd, "stop", None, None),
+            hook_mode(cmd, "stop", ModeEnv::default()),
             (Ok(Trusted), ModeSource::Inline)
         );
     }
@@ -886,11 +910,11 @@ mod tests {
             "ironmem hook stop; IRONMEM_MCP_MODE=$M ironmem hook stop",
             "IRONMEM_MCP_MODE=$M ironmem hook stop; ironmem hook stop",
         ] {
-            assert_eq!(hook_mode(cmd, "stop", None, None), unknown, "{cmd}");
+            assert_eq!(hook_mode(cmd, "stop", ModeEnv::default()), unknown, "{cmd}");
         }
         let with_invalid =
             "IRONMEM_MCP_MODE=bogus ironmem hook stop; IRONMEM_MCP_MODE=$M ironmem hook stop";
-        assert_eq!(hook_mode(with_invalid, "stop", None, None), unknown);
+        assert_eq!(hook_mode(with_invalid, "stop", ModeEnv::default()), unknown);
     }
 
     #[test]
@@ -904,7 +928,7 @@ mod tests {
             "(IRONMEM_MCP_MODE=bogus true) ; ironmem hook stop",
         ] {
             assert_eq!(
-                hook_mode(cmd, "stop", None, None),
+                hook_mode(cmd, "stop", ModeEnv::default()),
                 (Ok(ReadOnly), ModeSource::Default),
                 "{cmd}"
             );
@@ -913,7 +937,7 @@ mod tests {
         // does across commands: a valid mode beats one that fails to start.
         let two_runs = "IRONMEM_MCP_MODE=bogus ironmem hook stop || ironmem hook stop";
         assert_eq!(
-            hook_mode(two_runs, "stop", None, None),
+            hook_mode(two_runs, "stop", ModeEnv::default()),
             (Ok(ReadOnly), ModeSource::Default)
         );
     }

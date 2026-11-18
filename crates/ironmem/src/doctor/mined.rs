@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use chrono::{NaiveDateTime, TimeDelta};
 
+use super::hooks::miner_events;
 use super::{is_db_busy, Check, CheckStatus};
 use crate::db::schema::Database;
 use crate::MemoryError;
@@ -70,7 +71,10 @@ fn mined_rows_check(newest: Result<Option<String>, MemoryError>, now: NaiveDateT
                 CheckStatus::Info,
                 "no mined rows yet: no workspace file has been mined into this store",
             )
-            .with_hint("mining runs in the Stop and PreCompact hooks; see the hook_mining line")
+            .with_hint(format!(
+                "mining runs in the {} hooks; see the hook_mining line",
+                miner_events(" and ")
+            ))
         }
         Ok(Some(s)) => s,
     };
