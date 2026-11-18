@@ -604,29 +604,24 @@ the first `[FAIL]`:
   harness config is reported **unreadable** or **malformed** (also a `[WARN]`),
   fix the file by hand (permissions/encoding, or the JSON/TOML syntax) before
   re-registering.
-- **`hooks` warning** (a `[WARN]`) → one of: `settings.json` does not exist
-  (doctor says "none wired"), `settings.json` cannot be read, some of the
-  plugin's four hooks (SessionStart, UserPromptSubmit, Stop, PreCompact) are
-  missing, a hook fails or may fail to start, or the plugin and `settings.json`
-  both wire the same hooks, so they run twice. For a missing hook the line names
-  each one and what is off without it, e.g. "prompt recall is off". Each state
-  has its own next step, and the line's hint says which. If `settings.json` does
-  not exist or hooks are missing, re-run `scripts/install-ironmem.sh`, which
-  appends only the missing ones and leaves your other hooks alone, or install
-  the plugin. If a hook fails or may fail to start, set `IRONMEM_MCP_MODE` to a
-  literal `trusted`, `read-only` or `restricted` where the line says it comes
-  from (the hook command, `settings.json` `env` or your shell), or remove it;
-  re-running the installer does not change a hook that is already wired. If
-  it says the hooks run twice, remove the hand-wired copies from
-  `settings.json`. If it cannot read `settings.json`, fix the file by hand, then
-  re-run the installer.
+- **`hooks` warning** (a `[WARN]`) → the plugin's four hooks (SessionStart,
+  UserPromptSubmit, Stop, PreCompact) are not all wired and working:
+  `settings.json` does not exist or cannot be read, some hooks are missing, a
+  hook fails or may fail to start, or the hooks run twice. The line names the
+  hooks affected; for a missing or failing hook it also says what is off
+  without it, e.g. "prompt recall is off". The hint on the line beneath says
+  what to do for that case; follow it. Re-running `scripts/install-ironmem.sh`
+  appends only the missing hooks and leaves every hook that is already wired
+  alone, so it fixes a missing hook or a missing `settings.json`, but not a
+  hook that fails to start or runs twice, and not an unreadable
+  `settings.json` until you have fixed the file by hand.
 - **`hook_mining` not mining** (a `[WARN]`) → a Stop or PreCompact hook does not
   mine, or neither is wired. A wired hook does not mine when its
   `IRONMEM_MCP_MODE` is `read-only` or `restricted`, or is invalid (the hook
   fails to start). When the mode cannot be judged statically, the line instead
-  says the hook "may not be mined". A plugin hook whose default is overridden to a
-  non-trusted mode by `settings.json` `env` or the shell also warns. The line
-  also says where each hook's mode came from. Read-only is the expected state
+  says the hook "may not be mined". A plugin hook whose default is overridden
+  to a non-trusted mode by `settings.json` `env` or the shell also warns. The
+  line also says where each hook's mode came from. Read-only is the expected state
   for a script install: MCP writes and prompt recall still work. Prefixing the
   Stop and PreCompact commands with `IRONMEM_MCP_MODE=trusted` turns mining on,
   at the cost of loading the embedding model and rebuilding the vector index on
