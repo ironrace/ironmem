@@ -802,13 +802,14 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "When unsure between an envelope class and `logic`, the class is `logic`.",
     "If the issue fetch fails, or the result has no `labels` field, stop and report the failure; never route an issue whose labels were not read.",
     "Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved.",
-    "A non-zero exit, a run that could not be made, output that is not JSON, or a report that fits none of the three states above is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.",
+    "A non-zero exit, a run that could not be made, output that is not JSON, or a report that is none of approved, pending or `null` is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.",
     "Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.",
     "Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `\"approved\"`; keep that object's `gate_commands`.",
     "failed `status` read gets neither command: its fix line gives the command that was run, its exit status if it had one, and its error; for an `ironmem` that is missing or too old, it also says to install a current one.",
     "with the fix rule 1 gives for that state (not onboarded, pending, or a failed `status` read)",
     # Rule 6 judges the remainder, not the issue, so without this a phase 2
-    # lost to a missing prerequisite or a failed read left no line in *Why*.
+    # lost to a missing prerequisite or a failed read would leave no line in
+    # *Why*.
     "When the remainder would meet rule 1 or rule 3 but for a prerequisite, a failed read included, keep the single verdict and add that rule's `Missing AUTOPILOT prerequisite:` or `Missing GOAL prerequisite:` line to *Why*.",
     "Never infer gate commands from the repo.",
     "For both `gh label list` reads, a non-zero exit, an auth error or a rate limit is a failed read: it counts as not meeting the requirement, and the router reports it as a failed read, naming the command and its error, never as a missing label and with no label-creation fix line.",
@@ -816,6 +817,26 @@ EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "which must still be on the issue when `advance` runs",
     "once that dispatch has succeeded and pushed its branch",
     "acts on every succeeded `agent:ready` issue in the repo, not only this one.",
+    # What `status` does with a name it will not answer for: exit 1, which
+    # the router must read as a failed read and never as "not onboarded".
+    "A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name, and so does a stored config that does not parse, under that name or another spelling of it: a failed read, not `null`.",
+    # The fix-line commands. `--db '<db>'` is what makes `onboard` and
+    # `approve` act on the database `status` read; a mirror that drops it
+    # sends the user to approve in a different one.
+    "`ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`",
+    "`ironmem autopilot approve <owner>/<repo> --db '<db>'`",
+    "`ironmem autopilot labels <owner>/<repo>`",
+    "gate config `\"pending\"` → review its `gate_commands` and `manifest_warnings`, re-run that `onboard` command first if `proposed_at` is old or the checkout's build setup has changed since, then that `approve` command",
+    # The phase-2 GOAL recheck reads the database the Step 2 read named.
+    "`ironmem autopilot status <owner>/<repo> --db '<db>'`",
+]
+# A read of the gate config straight from Autopilot's drawer, which the
+# router must not make: it runs `ironmem autopilot status`. Stated here
+# independently of the lint's own list, like the pins above.
+EVALUATE_ISSUE_FORBIDDEN_DRAWER_READ_SNIPPETS = [
+    "backlog-lineage",
+    'logical_key="gate-config:',
+    "gate-config:<slug>",
 ]
 # Route pins whose wording differs per surface. The two-phase confirm rule is
 # a list item in the spec and inline prose in the mirrors; the bare
@@ -861,6 +882,36 @@ def test_lint_requires_evaluate_issue_route_contract(tmp_path, rel, snippet):
 
     assert r.returncode == 1
     assert f"{rel}: missing evaluate-issue route contract snippet {snippet!r}" in r.stdout
+
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+@pytest.mark.parametrize("snippet", EVALUATE_ISSUE_FORBIDDEN_DRAWER_READ_SNIPPETS)
+def test_lint_rejects_the_gate_config_drawer_read_in_a_router_surface(tmp_path, rel, snippet):
+    # The required pins are presence checks: a surface that carries a drawer
+    # read beside the `status` command satisfies every one of them.
+    fixture = copy_fixture(tmp_path)
+    surface = fixture / rel
+    surface.write_text(surface.read_text() + f"\n{snippet}\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: forbidden gate-config drawer read {snippet!r}" in r.stdout
+
+
+@pytest.mark.parametrize("rel", EVALUATE_ISSUE_SURFACES)
+def test_lint_rejects_the_gate_config_drawer_read_inside_an_html_comment(tmp_path, rel):
+    # Unlike a required pin, a forbidden one is matched on the raw text: the
+    # router is a model reading the file, comments included.
+    fixture = copy_fixture(tmp_path)
+    surface = fixture / rel
+    snippet = EVALUATE_ISSUE_FORBIDDEN_DRAWER_READ_SNIPPETS[0]
+    surface.write_text(surface.read_text() + f"\n<!-- {snippet} -->\n")
+
+    r = run({"COLLAB_LINT_ROOT": str(fixture)})
+
+    assert r.returncode == 1
+    assert f"{rel}: forbidden gate-config drawer read {snippet!r}" in r.stdout
 
 
 @pytest.mark.parametrize("rel,snippet", EVALUATE_ISSUE_SURFACE_ROUTE_CASES)

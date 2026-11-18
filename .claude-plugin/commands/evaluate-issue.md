@@ -67,15 +67,18 @@ tracing.**
    reads; none creates, labels, or onboards anything:
    - **Approved gate config** — run
      `ironmem autopilot status <owner>/<repo> --json` (read-only: it never
-     creates or migrates the database, and asks `gh` only to list labels).
+     creates or migrates the database, though SQLite may leave `-wal`/`-shm`
+     side files beside it, and asks `gh` only to list labels).
      Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `"approved"`; keep that object's `gate_commands`.
      Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
      A `null` `gate_config` is a repo not onboarded under that exact name in
-     the database the report names in `db`; a `state` of `"pending"` is a
-     proposal nobody has approved.
+     the database the report names in `db` (a repo onboarded in another
+     database reads the same way); a `state` of `"pending"` is a proposal
+     nobody has approved.
+     A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name, and so does a stored config that does not parse, under that name or another spelling of it: a failed read, not `null`.
      Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
-     A non-zero exit, a run that could not be made, output that is not JSON, or a report that fits none of the three states above is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
-     An `ironmem` missing from `PATH` or older than `status` fails this way; the fix is a current install.
+     A non-zero exit, a run that could not be made, output that is not JSON, or a report that is none of approved, pending or `null` is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
+     An `ironmem` missing from `PATH` or too old to have the `status` subcommand fails this way; the fix is a current install.
    - **Agent labels** —
      `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`
      must list all three of `agent:ready`, `agent:blocked`, `agent:exhausted`.
@@ -148,10 +151,9 @@ not justify COLLAB — it drives the review tier recommendation instead.
    `ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`
    then `ironmem autopilot approve <owner>/<repo> --db '<db>'`, where `<db>`
    is the path the report gave in `db` (write any `'` in `<checkout>` or
-   `<db>` as `'\''`); gate config `"pending"` → review its `gate_commands` and
-   `manifest_warnings`, re-run that `onboard` command first if `proposed_at`
-   is old or the checkout's build setup has changed since, then that
-   `approve` command; agent labels missing →
+   `<db>` as `'\''`);
+   gate config `"pending"` → review its `gate_commands` and `manifest_warnings`, re-run that `onboard` command first if `proposed_at` is old or the checkout's build setup has changed since, then that `approve` command;
+   agent labels missing →
    `ironmem autopilot labels <owner>/<repo>`; `risk:<expected class>` label
    missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`;
    issue carries `risk:<other>` → name it; removing it is a human's risk
@@ -262,10 +264,12 @@ For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the
 user**. On an explicit yes, invoke the recommended path; for a two-phase
 verdict, phase 1 only — phase 2 is the user's to run after phase 1's PR
 merges. A phase-2 GOAL is printed as a ready-to-run command: before running
-it, the user runs `ironmem autopilot status <owner>/<repo>` for the issue's
-repo (the Step 2 read, as text) and confirms that the gate config is still
-approved and that its `gate_commands` still match the printed
-condition. Rerunning
+it, the user runs
+`ironmem autopilot status <owner>/<repo> --db '<db>'`
+for the issue's repo (the Step 2 read, as text, against the database that
+read named in `db`; write any `'` in `<db>` as `'\''`) and confirms that the
+gate config is still approved and that its `gate_commands` still match the
+printed condition. Rerunning
 `/evaluate-issue` on the parent is not the mechanism; it would re-score the
 original issue and print the same two-phase verdict. A
 phase-2 AUTOPILOT is printed as an instruction: the user opens the remainder

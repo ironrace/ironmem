@@ -93,20 +93,22 @@ Goal: a rough estimate of how much code the issue touches.
    onboards anything:
    - **Approved gate config.** Run
      `ironmem autopilot status <owner>/<repo> --json`. It is read-only: it
-     opens the database read-only, never creates or migrates it, and asks
-     `gh` only to list labels.
+     opens the database read-only, never creates or migrates it (SQLite may
+     leave `-wal`/`-shm` side files beside a WAL database), and asks `gh`
+     only to list labels.
      Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `"approved"`; keep that object's `gate_commands`.
      A GOAL command's condition is built from those `gate_commands`.
      Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
+     The `labels` section is left unused because moving the router's label
+     reads onto it is a separate change, tracked in #428.
      A `gate_config` of `null` is a repo not onboarded under that exact name
      in the database the report names in `db`; a repo onboarded in another
-     database reads the same way. A name that differs from an onboarded one
-     only in letter case, or in whether it names a host, does not read as
-     `null`: `status` exits 1 and names the stored name, which is a failed
-     read. A `state` of `"pending"` is a proposal nobody has approved.
+     database reads the same way.
+     A name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1 naming the stored name, and so does a stored config that does not parse, under that name or another spelling of it: a failed read, not `null`.
+     A `state` of `"pending"` is a proposal nobody has approved.
      Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
-     A non-zero exit, a run that could not be made, output that is not JSON, or a report that fits none of the three states above is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
-     An `ironmem` missing from `PATH` or older than `status` fails this way; the fix is a current install.
+     A non-zero exit, a run that could not be made, output that is not JSON, or a report that is none of approved, pending or `null` is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
+     An `ironmem` missing from `PATH` or too old to have the `status` subcommand fails this way; the fix is a current install.
    - **Agent labels.** Run
      `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`.
      The repo qualifies only when the output contains all three of
@@ -201,9 +203,7 @@ the command that supplies it, then continue down the table:
 - repo not onboarded (`gate_config` `null`) → `ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`, then `ironmem autopilot approve <owner>/<repo> --db '<db>'`
   (`<db>` is the path the report gave in `db`; `<checkout>` and `<db>` are
   single-quoted: write any `'` in them as `'\''`)
-- gate config `"pending"` → review its `gate_commands` and `manifest_warnings`
-  (re-run that `onboard` command first if `proposed_at` is old or the
-  checkout's build setup has changed since), then that `approve` command
+- gate config `"pending"` → review its `gate_commands` and `manifest_warnings`, re-run that `onboard` command first if `proposed_at` is old or the checkout's build setup has changed since, then that `approve` command
 - a failed `status` read gets neither command: its fix line gives the command that was run, its exit status if it had one, and its error; for an `ironmem` that is missing or too old, it also says to install a current one.
 - agent labels missing → `ironmem autopilot labels <owner>/<repo>`
 - `risk:<expected class>` label missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`
@@ -383,10 +383,12 @@ For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the
 user**. On an explicit yes, invoke the recommended path. On a yes to a
 two-phase verdict, invoke phase 1 only; phase 2 is the user's to run after
 phase 1's PR merges. A phase-2 GOAL is printed as a ready-to-run command:
-before running it, the user runs `ironmem autopilot status <owner>/<repo>`
-for the issue's repo (the Step 2 read, as text) and confirms that the gate
-config is still approved and that its `gate_commands` still match the printed
-condition. Rerunning `/evaluate-issue` on the parent is not the mechanism; it
+before running it, the user runs
+`ironmem autopilot status <owner>/<repo> --db '<db>'`
+for the issue's repo (the Step 2 read, as text, against the database that
+read named in `db`; write any `'` in `<db>` as `'\''`) and confirms that the
+gate config is still approved and that its `gate_commands` still match the
+printed condition. Rerunning `/evaluate-issue` on the parent is not the mechanism; it
 would re-score the original issue and print the same two-phase verdict. A
 phase-2 AUTOPILOT is printed as an instruction: the user opens the remainder
 issue, then runs `/evaluate-issue <remainder number>` on it. The router never
@@ -548,7 +550,8 @@ is unprotected
 (`gh api repos/jeffreycrum/tenfourpro/branches/main --jq .protected` printed
 `false` on 2026-11-16), so nothing in this allowlist stops a force push to it;
 protect `main` before an unattended run. Before running it, the user runs
-`ironmem autopilot status jeffreycrum/tenfourpro` and confirms the config is
+`ironmem autopilot status jeffreycrum/tenfourpro --db '<db>'`, with the
+path the Step 2 report gave in `db`, and confirms the config is
 still approved and its `gate_commands` still match `npm test`. When the loop
 ends, the user opens the PR, and a human reviews and merges it.
 

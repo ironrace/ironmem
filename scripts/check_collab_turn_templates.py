@@ -543,15 +543,21 @@ REQUIRED_EVALUATE_ISSUE_SNIPPETS = [
 #     condition and fail-closed rule, that only the status exit status,
 #     `gate_config` and `db` are used (never the report's `labels` section), the
 #     status-read rule (a non-zero exit, a run that could not be made, output
-#     that is not JSON, or a report that fits none of the three states is
-#     reported as a failed read, never as a repo that is not onboarded),
-#     rule 1's failed-read fix line (a failed `status` read gets neither
-#     onboard nor approve), rule 3's pointer to rule 1's fix, and the
+#     that is not JSON, or a report that is none of approved, pending or
+#     `null` is reported as a failed read, never as a repo that is not
+#     onboarded), the exit-1 rule for a name that only resembles an onboarded
+#     one and for a stored config that does not parse (a failed read, not
+#     `null`), rule 1's failed-read fix line (a failed `status` read gets
+#     neither onboard nor approve), rule 3's pointer to rule 1's fix, and the
 #     label-read rule (a failed read is reported as one, never as a missing
 #     label);
 #   - rule 1's unreadable-labels rule, its unsure-class-is-`logic` rule, and
 #     the requirement that the `risk:*` label survive until `advance`;
-#   - both missing-prerequisite lines;
+#   - rule 1's fix-line commands (`onboard` and `approve`, each with
+#     `--db '<db>'`, and `labels`) and its fix line for a pending config;
+#   - both missing-prerequisite lines, and rule 6's keep-the-single-verdict
+#     line for a remainder missing a prerequisite;
+#   - the phase-2 GOAL recheck command, `status` with `--db '<db>'`;
 #   - the AUTOPILOT commands: the router never applies the labels, `advance`
 #     waits for a succeeded, pushed dispatch, `--reviewer codex`, and the
 #     repo-wide reach of `advance`;
@@ -596,9 +602,9 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "`gate_config`, another `state`, or a `gate_commands` that is missing, "
     "empty or has a blank entry — means not approved.",
     "A non-zero exit, a run that could not be made, output that is not JSON, "
-    "or a report that fits none of the three states above is a failed read: "
-    "the router reports it as one, naming the command and its error, never "
-    "as a repo that is not onboarded and with no onboard fix line.",
+    "or a report that is none of approved, pending or `null` is a failed "
+    "read: the router reports it as one, naming the command and its error, "
+    "never as a repo that is not onboarded and with no onboard fix line.",
     "Use only its exit status, `gate_config` and `db`: the label requirements "
     "come from the two `gh label list` reads below, never from its `labels` "
     "section.",
@@ -623,6 +629,30 @@ REQUIRED_EVALUATE_ISSUE_ROUTE_SNIPPETS = [
     "which must still be on the issue when `advance` runs",
     "once that dispatch has succeeded and pushed its branch",
     "acts on every succeeded `agent:ready` issue in the repo, not only this one.",
+    "A name that differs from an onboarded one only in letter case, or in "
+    "whether it names a host, exits 1 naming the stored name, and so does a "
+    "stored config that does not parse, under that name or another spelling "
+    "of it: a failed read, not `null`.",
+    "`ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`",
+    "`ironmem autopilot approve <owner>/<repo> --db '<db>'`",
+    "`ironmem autopilot labels <owner>/<repo>`",
+    "gate config `\"pending\"` → review its `gate_commands` and "
+    "`manifest_warnings`, re-run that `onboard` command first if "
+    "`proposed_at` is old or the checkout's build setup has changed since, "
+    "then that `approve` command",
+    "`ironmem autopilot status <owner>/<repo> --db '<db>'`",
+]
+# A read of the gate config straight from Autopilot's drawer, by wing, room
+# and logical key (#420). The router must not make one: it reads the gate
+# config with `ironmem autopilot status`. The pins above are presence checks,
+# so a surface that carries such a read beside the `status` command satisfies
+# all of them. These are matched on the raw text, comments included, like the
+# other FORBIDDEN lists: the router is a model reading the file, and rejecting
+# the read inside a comment is stricter, not weaker.
+FORBIDDEN_EVALUATE_ISSUE_DRAWER_READ_SNIPPETS = [
+    "backlog-lineage",
+    'logical_key="gate-config:',
+    "gate-config:<slug>",
 ]
 # Route pins whose wording differs per surface. The two-phase confirm rule is
 # a list item in the spec and inline prose in the mirrors, and the shared
@@ -970,7 +1000,8 @@ def check_no_uninstalled_skill_references() -> None:
 
 
 def check_evaluate_issue_surfaces() -> None:
-    """Keep the evaluator's SPLIT and route contracts in its three mirrors."""
+    """Keep the evaluator's SPLIT and route contracts in its three mirrors,
+    and the gate-config drawer read out of them."""
     for path in (EVALUATE_ISSUE_DOC, EVALUATE_ISSUE_CLAUDE, EVALUATE_ISSUE_CODEX):
         rel = path.relative_to(ROOT)
         if not path.exists():
@@ -986,6 +1017,12 @@ def check_evaluate_issue_surfaces() -> None:
             if snippet not in body:
                 err(f"{rel}: missing evaluate-issue route contract "
                     f"snippet {snippet!r}")
+        raw = path.read_text()
+        for snippet in FORBIDDEN_EVALUATE_ISSUE_DRAWER_READ_SNIPPETS:
+            if snippet in raw:
+                err(f"{rel}: forbidden gate-config drawer read {snippet!r} — "
+                    f"the router reads the gate config with `ironmem "
+                    f"autopilot status`, never from Autopilot's drawer")
 
 
 def check_task_budget_surface_contracts() -> None:
