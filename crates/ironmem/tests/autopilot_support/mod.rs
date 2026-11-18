@@ -60,6 +60,10 @@ pub fn make_repo(path: &Path) {
     // Pinned: the global config signs and runs hooks; worktrees share this.
     git(path, &["config", "commit.gpgsign", "false"]);
     git(path, &["config", "core.hooksPath", "/dev/null"]);
+    // Off: `git commit` otherwise starts a detached `git maintenance run
+    // --auto`, which creates and removes `.git/objects/maintenance.lock`
+    // after this function returns, while a test may be comparing the tree.
+    git(path, &["config", "maintenance.auto", "false"]);
     std::fs::write(path.join("README.md"), "seed\n").unwrap();
     git(path, &["add", "README.md"]);
     git(path, &["commit", "-qm", "seed"]);
