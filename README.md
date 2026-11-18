@@ -609,8 +609,10 @@ the first `[FAIL]`:
   the line names each one and what is off without it, e.g. "prompt recall is
   off". Re-run `scripts/install-ironmem.sh`, which appends only the missing
   ones and leaves your other hooks alone, or install the plugin.
-- **`hook_mining` cannot mine** (a `[WARN]`) → the Stop/PreCompact hooks run
-  read-only, so new transcripts are not mined. This is the expected state for
+- **`hook_mining` cannot mine** (a `[WARN]`) → usually the Stop/PreCompact hooks
+  run read-only, so new transcripts are not mined. The warning also fires when no
+  Stop or PreCompact hook is wired, or when a hook's `IRONMEM_MCP_MODE` is invalid
+  or cannot be judged statically. This is the expected state for
   a script install: MCP writes and prompt recall still work. The line says
   where each hook's mode came from. Prefixing those two commands with
   `IRONMEM_MCP_MODE=trusted` turns mining on, at the cost of loading the
