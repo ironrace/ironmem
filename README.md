@@ -607,21 +607,22 @@ the first `[FAIL]`:
 - **`hooks` warning** (a `[WARN]`) → the plugin's four hooks (SessionStart,
   UserPromptSubmit, Stop, PreCompact) are not all wired and working:
   `settings.json` does not exist or cannot be read, some hooks are missing, a
-  hook fails or may fail to start, or the hooks run twice. The line names the
-  hooks affected; for a missing or failing hook it also says what is off
-  without it, e.g. "prompt recall is off". The hint on the line beneath says
-  what to do for that case; follow it. Re-running `scripts/install-ironmem.sh`
-  appends only the missing hooks and leaves every hook that is already wired
-  alone, so it fixes a missing hook or a missing `settings.json`, but not a
-  hook that fails to start or runs twice, and not an unreadable
-  `settings.json` until you have fixed the file by hand.
+  hook fails or may fail to start, or the hooks run twice. Where hooks are
+  affected the line names them; for a missing hook, or one that fails to start
+  with no other copy running, it also says what is off without it, e.g. "prompt
+  recall is off". The hint on the line beneath says what to do for that case;
+  follow it. Re-running `scripts/install-ironmem.sh` appends only the missing
+  hooks and leaves every hook that is already wired alone, so it fixes a missing
+  hook or a missing `settings.json`, but not a hook that fails to start or runs
+  twice, and not an unreadable `settings.json` until you have fixed the file by
+  hand.
 - **`hook_mining` not mining** (a `[WARN]`) → a Stop or PreCompact hook does not
   mine, or neither is wired. A wired hook does not mine when its
   `IRONMEM_MCP_MODE` is `read-only` or `restricted`, or is invalid (the hook
   fails to start). When the mode cannot be judged statically, the line instead
-  says the hook "may not be mined". A plugin hook whose default is overridden
-  to a non-trusted mode by `settings.json` `env` or the shell also warns. The
-  line also says where each hook's mode came from. Read-only is the expected state
+  says the hook "may not be mined". A plugin hook whose default is overridden to
+  a non-trusted mode by `settings.json` `env` or the shell also warns. The line
+  also says where each hook's mode came from. Read-only is the expected state
   for a script install: MCP writes and prompt recall still work. Prefixing the
   Stop and PreCompact commands with `IRONMEM_MCP_MODE=trusted` turns mining on,
   at the cost of loading the embedding model and rebuilding the vector index on
