@@ -395,12 +395,14 @@ fn is_scoped(filters: &SearchFilters) -> bool {
 /// Vector candidates for one query (plus the optional content-word variant),
 /// as drawer ids in rank order.
 ///
-/// Unscoped searches take the top `overfetch` of the whole index and drop
+/// Unscoped searches take the top `overfetch` across the index and drop
 /// superseded rows, exactly as they always have. A wing/room-scoped search
-/// instead filters to the scope and widens the vector search until it holds
-/// `overfetch` in-scope candidates or has covered the index; the old
-/// scope-agnostic top-k could hold none of the scope's drawers, which left a
-/// scoped search empty although matching drawers existed.
+/// instead filters to the scope and widens the vector search (`k` doubling, up
+/// to the index size) until it holds `overfetch` in-scope candidates or `k` has
+/// reached the index size. The index is approximate, so even a search at that
+/// size can miss a drawer its graph does not reach. The old scope-agnostic
+/// top-k could hold none of the scope's drawers, which left a scoped search
+/// empty although matching drawers existed.
 fn hnsw_candidates(
     app: &App,
     primary: &[f32],
@@ -479,7 +481,8 @@ fn keep_in_scope(
 /// The cap is the index size seen on the first search, so `k` strictly
 /// increases toward a fixed bound and the loop ends even if another writer
 /// grows the index meanwhile. A scope that holds nothing ends with one search
-/// over the whole index. At most `overfetch` ids are returned.
+/// at `k` = the index size, with no further check. At most `overfetch` ids are
+/// returned.
 fn widen_until_in_scope<S, F>(
     overfetch: usize,
     mut search: S,
@@ -1182,22 +1185,47 @@ mod tests {
         assert!(in_a.iter().all(|id| id.starts_with('a')));
     }
 
+    /// The unscoped candidate sequence exactly as `search` built it before
+    /// scoped widening existed (copied from the code at 105b3f47).
+    fn old_unscoped_candidates(
+        app: &App,
+        primary_vec: &[f32],
+        content: Option<&[f32]>,
+        overfetch: usize,
+    ) -> Vec<String> {
+        let state = app.index_state.read().unwrap();
+        let primary_hnsw = state.index.search(primary_vec, overfetch);
+        let hnsw_results = if let Some(cv) = content {
+            let content_hnsw = state.index.search(cv, overfetch);
+            union_hnsw(primary_hnsw, content_hnsw, overfetch)
+        } else {
+            primary_hnsw
+        };
+        let hnsw_ids: Vec<String> = hnsw_results
+            .iter()
+            .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
+            .collect();
+        drop(state);
+        filter_superseded_candidate_ids(app, hnsw_ids, false).unwrap()
+    }
+
     #[test]
     fn unscoped_candidates_are_the_plain_global_top_k() {
         let app = app_with_scope_outside_top_k();
         let q = query_vec();
 
         let unscoped = hnsw_candidates(&app, &q, None, 30, &scope(None, None)).unwrap();
-        let (plain_top_k, _) = search_index_ids(&app, &q, None, 30).unwrap();
-        assert_eq!(unscoped, plain_top_k);
+        assert_eq!(unscoped, old_unscoped_candidates(&app, &q, None, 30));
         assert_eq!(unscoped.len(), 30);
         assert!(!unscoped.contains(&"b00".to_string()));
 
         // Same with the content-word variant: one union capped at overfetch.
         let cv = near_query(7, 0.3);
         let with_variant = hnsw_candidates(&app, &q, Some(&cv), 30, &scope(None, None)).unwrap();
-        let (variant_top_k, _) = search_index_ids(&app, &q, Some(&cv), 30).unwrap();
-        assert_eq!(with_variant, variant_top_k);
+        assert_eq!(
+            with_variant,
+            old_unscoped_candidates(&app, &q, Some(&cv), 30)
+        );
         assert_eq!(with_variant.len(), 30);
     }
 
@@ -1248,7 +1276,7 @@ mod tests {
     }
 
     #[test]
-    fn widen_over_an_empty_scope_searches_the_whole_index_once_and_stops() {
+    fn widen_over_an_empty_scope_ends_with_one_search_at_the_index_size() {
         let (kept, ks) = run_widen(30, 100, 1000);
         assert_eq!(ks, vec![30, 60, 100]);
         assert!(kept.is_empty());

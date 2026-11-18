@@ -190,8 +190,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Wing/room-scoped search finds matches outside the global top results.** Scope
   was applied after taking the top vector candidates across every wing, so a
   scoped search could come back empty while matching drawers existed. Scoped
-  searches now widen the vector search until they have enough in-scope candidates
-  or have covered the index.
+  searches now widen the vector search, doubling it up to the size of the index,
+  until they have enough in-scope candidates. The vector index is approximate, so
+  a drawer its graph search does not reach can still be missed.
 
 ## [0.7.0] - 2026-11-09
 
