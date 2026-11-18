@@ -11,10 +11,10 @@
 //!
 //! The gate config is read by [`read_gate_config_status`] through
 //! [`ReadOnlyDb`], a type with no write or migrate method, over a connection
-//! opened `SQLITE_OPEN_READ_ONLY`. The
-//! labels are read with one `gh label list`. Nothing here writes the
-//! database file or creates a drawer or a label, though a read-only
-//! connection to a WAL-mode database may create the `-wal`/`-shm` side files.
+//! opened `SQLITE_OPEN_READ_ONLY`. The labels are read with one
+//! `gh label list`. Nothing here writes the database file or creates a drawer
+//! or a label, though a read-only connection to a WAL-mode database may create
+//! the `-wal`/`-shm` side files.
 //!
 //! The label half is read-only because this module only ever builds a
 //! `label list` argv, not because a type forbids more.
@@ -155,10 +155,11 @@ impl LabelStatus {
     }
 }
 
-/// Refuse a repo string `gh --repo` would not accept: `owner/name` or
-/// `host/owner/name`, each segment non-empty, made only of ASCII letters,
-/// digits, `.`, `_` and `-`, and not starting with `-`. Letter case cannot be
-/// checked here, so `OWNER/REPO` is simply not onboarded.
+/// Refuse a string that is not shaped like a repo name. The shape is
+/// `owner/name` or `host/owner/name`, each part non-empty, made only of ASCII
+/// letters, digits, `.`, `_` and `-`, and not starting with `-`. This does not
+/// know every name `gh` refuses, and letter case cannot be checked here, so
+/// `OWNER/REPO` is simply not onboarded.
 fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
     validate_repo(repo)?;
     let segments: Vec<&str> = repo.split('/').collect();
@@ -173,8 +174,8 @@ fn check_repo_shape(repo: &str) -> Result<(), MemoryError> {
         Ok(())
     } else {
         Err(MemoryError::Validation(format!(
-            "'{repo}' is not a repo name — expected `owner/name` (or `host/owner/name`) made of \
-             letters, digits, `.`, `_` and `-`"
+            "'{repo}' is not a repo name — expected `owner/name` (or `host/owner/name`), each \
+             part made of letters, digits, `.`, `_` and `-`, and not starting with `-`"
         )))
     }
 }
@@ -571,7 +572,11 @@ mod tests {
             let err = read_gate_config_status(&path, bad).unwrap_err();
             match err {
                 MemoryError::Validation(message) => {
-                    assert!(message.contains("is not a repo name"), "{bad}: {message}")
+                    assert!(message.contains("is not a repo name"), "{bad}: {message}");
+                    assert!(
+                        message.contains("not starting with `-`"),
+                        "{bad}: {message}"
+                    );
                 }
                 other => panic!("{bad}: expected Validation, got {other:?}"),
             }
@@ -773,7 +778,7 @@ mod tests {
             let db = Database::open(&path).unwrap();
             crate::autopilot::write_current(
                 &db,
-                &format!("gate-config:{}", crate::autopilot::repo_slug("owner/repo")),
+                &crate::autopilot::gate_config::gate_config_key("owner/repo"),
                 r#"{"repo":"owner/repo","state":"approved","gate_commands":[],"proposed_at":"2026-01-01T00:00:00+00:00","approved_at":null}"#,
             )
             .unwrap();
@@ -783,7 +788,8 @@ mod tests {
 
         assert!(matches!(err, MemoryError::Json(_)), "{err:?}");
         assert!(
-            err.to_string().contains("gate_commands must not be empty"),
+            err.to_string()
+                .contains(crate::autopilot::EMPTY_GATE_COMMANDS_MSG),
             "{err}"
         );
     }

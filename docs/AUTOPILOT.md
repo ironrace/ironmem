@@ -883,7 +883,7 @@ descriptions.
 | Exit status | Meaning |
 |---|---|
 | `0` | A report was printed. This includes a repo that is not onboarded and labels that could not be read; the report says which. |
-| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`) made of letters, digits, `.`, `_` and `-`, the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
+| `1` | The gate config could not be read: the repo is not an `owner/name` (or `host/owner/name`), each part made of letters, digits, `.`, `_` and `-` and not starting with `-`, the database is missing, is not an ironmem database or is not readable, or the stored config does not parse or belongs to another repo name (two names that differ only in `/` versus `-` share one), or an ironmem environment setting is invalid (for example `IRONMEM_MCP_MODE`, as for every command). Reading a WAL database from a read-only directory fails this way when its `-wal`/`-shm` side files are missing, because SQLite cannot create them. Nothing is printed on stdout. |
 | `2` | A usage error. An `ironmem` too old to know `status` also exits 2. |
 
 `--json` prints this shape:

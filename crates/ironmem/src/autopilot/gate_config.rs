@@ -200,7 +200,7 @@ fn validate_wall_clock_timeout(secs: Option<u64>) -> Result<(), String> {
     Ok(())
 }
 
-fn gate_config_key(repo: &str) -> String {
+pub(super) fn gate_config_key(repo: &str) -> String {
     format!("gate-config:{}", repo_slug(repo))
 }
 

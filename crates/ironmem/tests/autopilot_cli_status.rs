@@ -85,11 +85,27 @@ impl Fixture {
             .unwrap()
     }
 
-    /// `ironmem autopilot status <repo> --db <db> --path <path_arg>` (the text
-    /// report)
-    /// with the stub answering `labels`, or failing with `fail` on stderr.
-    /// Ambient `IRONMEM_*` settings are removed so a developer's shell cannot
+    /// The one place a run's environment is set: `path_var` as `PATH`, the
+    /// stub answering `labels` (or failing with `fail` on stderr), and the
+    /// ambient `IRONMEM_*` settings removed so a developer's shell cannot
     /// change the result.
+    fn env(&self, command: &mut Command, path_var: &Path, labels: &str, fail: Option<&str>) {
+        command
+            .env("PATH", path_var)
+            .env("GH_LOG", self.log_path())
+            .env("GH_LABELS", labels)
+            .env_remove("IRONMEM_DB_PATH")
+            .env_remove("IRONMEM_MCP_MODE")
+            .env_remove("IRONMEM_EMBED_MODE");
+        if let Some(message) = fail {
+            command.env("GH_FAIL", message);
+        } else {
+            command.env_remove("GH_FAIL");
+        }
+    }
+
+    /// `ironmem autopilot status <repo> --db <db> --path <path_arg>` (the text
+    /// report), in the environment [`Fixture::env`] sets.
     fn plain(
         &self,
         repo: &str,
@@ -105,18 +121,8 @@ impl Fixture {
             .arg("--db")
             .arg(db)
             .arg("--path")
-            .arg(path_arg)
-            .env("PATH", path_var)
-            .env("GH_LOG", self.log_path())
-            .env("GH_LABELS", labels)
-            .env_remove("IRONMEM_DB_PATH")
-            .env_remove("IRONMEM_MCP_MODE")
-            .env_remove("IRONMEM_EMBED_MODE");
-        if let Some(message) = fail {
-            command.env("GH_FAIL", message);
-        } else {
-            command.env_remove("GH_FAIL");
-        }
+            .arg(path_arg);
+        self.env(&mut command, path_var, labels, fail);
         command
     }
 
@@ -664,22 +670,23 @@ fn hints_name_the_absolute_database_when_db_was_given_relative() {
 }
 
 #[test]
-fn a_repo_name_gh_would_not_accept_exits_one() {
+fn a_dash_led_repo_name_exits_one() {
     let fixture = Fixture::new();
     fixture.propose(REPO, &["cargo test"]);
 
     // After `--`, so clap passes the dash-led name through as the repo.
-    let output = ironmem()
+    let mut command = ironmem();
+    command
         .args(["autopilot", "status", "--json", "--db"])
         .arg(fixture.db_path())
-        .args(["--", "-R/x"])
-        .env("PATH", isolated_path(&fixture.stubs()))
-        .env("GH_LOG", fixture.log_path())
-        .env_remove("IRONMEM_DB_PATH")
-        .env_remove("IRONMEM_MCP_MODE")
-        .env_remove("IRONMEM_EMBED_MODE")
-        .output()
-        .unwrap();
+        .args(["--", "-R/x"]);
+    fixture.env(
+        &mut command,
+        &isolated_path(&fixture.stubs()),
+        ALL_LABELS,
+        None,
+    );
+    let output = command.output().unwrap();
 
     assert_unreadable(&fixture, &output, &["is not a repo name"]);
 }
