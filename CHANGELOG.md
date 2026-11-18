@@ -187,6 +187,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   silently scored as zero keyword hits. Each token is now quoted, so a hyphenated
   word matches as a phrase (`non` then `plugin`, adjacent). A token with no
   letter or digit is dropped.
+- **Wing/room-scoped search finds matches outside the global top results.** Scope
+  was applied after taking the top vector candidates across every wing, so a
+  scoped search could come back empty while matching drawers existed. Scoped
+  searches now widen the vector search until they have enough in-scope candidates
+  or have covered the index.
 
 ## [0.7.0] - 2026-11-09
 

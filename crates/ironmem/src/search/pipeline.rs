@@ -95,31 +95,13 @@ pub fn search(
     // Step 3: HNSW search — overfetch at 5× limit, clamped to MAX_OVERFETCH.
     let overfetch = limit.saturating_mul(5).clamp(30, tunables::max_overfetch());
 
-    let state = app
-        .index_state
-        .read()
-        .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
-
-    let primary_hnsw = state.index.search(&primary_vec, overfetch);
-
-    let hnsw_results = if let Some(cv) = maybe_content_vec {
-        let content_hnsw = state.index.search(&cv, overfetch);
-        union_hnsw(primary_hnsw, content_hnsw, overfetch)
-    } else {
-        primary_hnsw
-    };
-
-    let hnsw_ids: Vec<String> = hnsw_results
-        .iter()
-        .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
-        .collect();
-
-    drop(state);
-
-    // HNSW is intentionally scope-agnostic. Remove only retained historical
-    // rows here so default retrieval cannot use them for RRF or PRF expansion;
-    // wing/room and collab-message behavior remains in the final filter.
-    let hnsw_ids = filter_superseded_candidate_ids(app, hnsw_ids, filters.include_superseded)?;
+    let hnsw_ids = hnsw_candidates(
+        app,
+        &primary_vec,
+        maybe_content_vec.as_deref(),
+        overfetch,
+        filters,
+    )?;
     let total_candidates = hnsw_ids.len();
 
     // Step 4: BM25 full-text search.
@@ -254,18 +236,7 @@ pub fn search(
                 emb.embed_one(&expanded_query).map_err(MemoryError::Embed)?
             };
 
-            let state = app
-                .index_state
-                .read()
-                .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
-            let exp_hnsw_raw = state.index.search(&expanded_vec, overfetch);
-            let exp_hnsw_ids: Vec<String> = exp_hnsw_raw
-                .iter()
-                .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
-                .collect();
-            drop(state);
-            let exp_hnsw_ids =
-                filter_superseded_candidate_ids(app, exp_hnsw_ids, filters.include_superseded)?;
+            let exp_hnsw_ids = hnsw_candidates(app, &expanded_vec, None, overfetch, filters)?;
 
             let exp_bm25_pairs = app.db.bm25_search_with_history(
                 &expanded_query,
@@ -287,8 +258,9 @@ pub fn search(
 
     // Step 6: Fetch drawer metadata with filters. When PRF fetched foreground /
     // background drawers, carry those forward to avoid repeating the same lookup.
-    // Cached drawers still must satisfy final filters because HNSW candidates are
-    // not SQL-filtered before PRF.
+    // Cached drawers still must satisfy final filters: PRF's foreground fetch is
+    // not scope-filtered, and a scope-filtered candidate list can still hold
+    // BM25-only ids.
     let mut drawers: HashMap<String, Drawer> = HashMap::new();
     let mut missing_candidate_ids: Vec<&str> = Vec::new();
     for id in &merged_ids {
@@ -413,6 +385,122 @@ pub fn search(
         bm25_hit_count,
         content_word_variant_fired,
     })
+}
+
+/// True when the caller restricted the search to a wing or room.
+fn is_scoped(filters: &SearchFilters) -> bool {
+    filters.wing.is_some() || filters.room.is_some()
+}
+
+/// Vector candidates for one query (plus the optional content-word variant),
+/// as drawer ids in rank order.
+///
+/// Unscoped searches take the top `overfetch` of the whole index and drop
+/// superseded rows, exactly as they always have. A wing/room-scoped search
+/// instead filters to the scope and widens the vector search until it holds
+/// `overfetch` in-scope candidates or has covered the index; the old
+/// scope-agnostic top-k could hold none of the scope's drawers, which left a
+/// scoped search empty although matching drawers existed.
+fn hnsw_candidates(
+    app: &App,
+    primary: &[f32],
+    content: Option<&[f32]>,
+    overfetch: usize,
+    filters: &SearchFilters,
+) -> Result<Vec<String>, MemoryError> {
+    if !is_scoped(filters) {
+        let (ids, _) = search_index_ids(app, primary, content, overfetch)?;
+        return filter_superseded_candidate_ids(app, ids, filters.include_superseded);
+    }
+    widen_until_in_scope(
+        overfetch,
+        |k| search_index_ids(app, primary, content, k),
+        |ids| keep_in_scope(app, ids, filters),
+    )
+}
+
+/// Search the index for the top `k` of the primary vector (unioned with the
+/// content-word variant when present). Holds the `index_state` read lock only
+/// for the search and the id mapping. Also returns the index size.
+fn search_index_ids(
+    app: &App,
+    primary: &[f32],
+    content: Option<&[f32]>,
+    k: usize,
+) -> Result<(Vec<String>, usize), MemoryError> {
+    let state = app
+        .index_state
+        .read()
+        .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
+
+    let primary_hnsw = state.index.search(primary, k);
+    let hnsw_results = match content {
+        Some(cv) => union_hnsw(primary_hnsw, state.index.search(cv, k), k),
+        None => primary_hnsw,
+    };
+    let ids = hnsw_results
+        .iter()
+        .filter_map(|(idx, _)| state.id_map.get(*idx).cloned())
+        .collect();
+    Ok((ids, state.index.len()))
+}
+
+/// Keep the candidates the final filter would keep, in rank order. One query
+/// fetches the rows for all of `ids`; the rule itself is `drawer_matches_filters`.
+fn keep_in_scope(
+    app: &App,
+    ids: Vec<String>,
+    filters: &SearchFilters,
+) -> Result<Vec<String>, MemoryError> {
+    if ids.is_empty() {
+        return Ok(ids);
+    }
+    let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+    let drawers = app.db.get_drawers_by_ids_filtered(
+        &refs,
+        filters.wing.as_deref(),
+        filters.room.as_deref(),
+        filters.include_superseded,
+    )?;
+    Ok(ids
+        .into_iter()
+        .filter(|id| {
+            drawers
+                .get(id)
+                .is_some_and(|drawer| drawer_matches_filters(drawer, filters))
+        })
+        .collect())
+}
+
+/// Search with `k = overfetch`, then with `k` doubled, until `in_scope` keeps
+/// `overfetch` candidates or `k` has reached the index size. `search(k)`
+/// returns the top-`k` ids and the index size; `in_scope` filters them.
+///
+/// The cap is the index size seen on the first search, so `k` strictly
+/// increases toward a fixed bound and the loop ends even if another writer
+/// grows the index meanwhile. A scope that holds nothing ends with one search
+/// over the whole index. At most `overfetch` ids are returned.
+fn widen_until_in_scope<S, F>(
+    overfetch: usize,
+    mut search: S,
+    mut in_scope: F,
+) -> Result<Vec<String>, MemoryError>
+where
+    S: FnMut(usize) -> Result<(Vec<String>, usize), MemoryError>,
+    F: FnMut(Vec<String>) -> Result<Vec<String>, MemoryError>,
+{
+    let mut k = overfetch.max(1);
+    let mut cap: Option<usize> = None;
+    loop {
+        let (ids, index_len) = search(k)?;
+        let cap = *cap.get_or_insert(index_len);
+        let mut kept = in_scope(ids)?;
+        if kept.len() >= overfetch || k >= cap {
+            kept.truncate(overfetch);
+            return Ok(kept);
+        }
+        k = k.saturating_mul(2).min(cap);
+    }
 }
 
 fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
@@ -996,5 +1084,202 @@ mod tests {
             result.is_err(),
             "kg_boost must propagate the DB error from query_entity_current, got {result:?}"
         );
+    }
+
+    const DIM: usize = ironrace_embed::EMBED_DIM;
+
+    /// The query vector: the first axis.
+    fn query_vec() -> Vec<f32> {
+        let mut v = vec![0.0; DIM];
+        v[0] = 1.0;
+        v
+    }
+
+    /// A unit vector near the query axis. `spread` sets how far it leans off
+    /// that axis along a deterministic pseudo-random direction (seeded by
+    /// `seed`), so a larger `spread` ranks further from the query.
+    fn near_query(seed: u64, spread: f32) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        let mut v = vec![0.0; DIM];
+        v[0] = 1.0;
+        for slot in v.iter_mut().skip(1).take(16) {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            *slot = spread * ((state >> 33) as f32 / (1u64 << 31) as f32 - 0.5);
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        v.iter().map(|x| x / norm).collect()
+    }
+
+    fn add(app: &App, id: &str, wing: &str, room: &str, embedding: &[f32]) {
+        app.db
+            .insert_drawer(
+                id,
+                &format!("content {id}"),
+                embedding,
+                wing,
+                room,
+                "",
+                "test",
+            )
+            .unwrap();
+    }
+
+    fn scope(wing: Option<&str>, room: Option<&str>) -> SearchFilters {
+        SearchFilters {
+            wing: wing.map(str::to_string),
+            room: room.map(str::to_string),
+            limit: 10,
+            include_superseded: false,
+        }
+    }
+
+    /// 70 drawers in wing "a" all nearer the query than the one in wing "b",
+    /// so "b" is outside the global top 30 (the overfetch floor).
+    fn app_with_scope_outside_top_k() -> App {
+        let app = App::open_for_test().unwrap();
+        for i in 0..70 {
+            add(&app, &format!("a{i:02}"), "a", "r", &near_query(i, 0.3));
+        }
+        add(&app, "b00", "b", "rb", &near_query(99, 0.5));
+        // Build the index the way a search does after writes, not by single
+        // inserts: that graph is the one real searches run against.
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+        app
+    }
+
+    #[test]
+    fn scoped_candidates_include_a_drawer_outside_the_global_top_k() {
+        let app = app_with_scope_outside_top_k();
+        let q = query_vec();
+
+        // Premise: "b00" is not among the global top 30.
+        let (global_top_k, _) = search_index_ids(&app, &q, None, 30).unwrap();
+        assert!(!global_top_k.contains(&"b00".to_string()));
+
+        let by_wing = hnsw_candidates(&app, &q, None, 30, &scope(Some("b"), None)).unwrap();
+        assert_eq!(by_wing, vec!["b00".to_string()]);
+
+        let by_room = hnsw_candidates(&app, &q, None, 30, &scope(None, Some("rb"))).unwrap();
+        assert_eq!(by_room, vec!["b00".to_string()]);
+
+        // The content-word variant is widened the same way.
+        let cv = near_query(7, 0.3);
+        let with_variant =
+            hnsw_candidates(&app, &q, Some(&cv), 30, &scope(Some("b"), None)).unwrap();
+        assert_eq!(with_variant, vec!["b00".to_string()]);
+    }
+
+    #[test]
+    fn scoped_candidates_hold_only_in_scope_ids_capped_at_overfetch() {
+        let app = app_with_scope_outside_top_k();
+        let q = query_vec();
+
+        let in_a = hnsw_candidates(&app, &q, None, 30, &scope(Some("a"), None)).unwrap();
+        assert_eq!(in_a.len(), 30);
+        assert!(in_a.iter().all(|id| id.starts_with('a')));
+    }
+
+    #[test]
+    fn unscoped_candidates_are_the_plain_global_top_k() {
+        let app = app_with_scope_outside_top_k();
+        let q = query_vec();
+
+        let unscoped = hnsw_candidates(&app, &q, None, 30, &scope(None, None)).unwrap();
+        let (plain_top_k, _) = search_index_ids(&app, &q, None, 30).unwrap();
+        assert_eq!(unscoped, plain_top_k);
+        assert_eq!(unscoped.len(), 30);
+        assert!(!unscoped.contains(&"b00".to_string()));
+
+        // Same with the content-word variant: one union capped at overfetch.
+        let cv = near_query(7, 0.3);
+        let with_variant = hnsw_candidates(&app, &q, Some(&cv), 30, &scope(None, None)).unwrap();
+        let (variant_top_k, _) = search_index_ids(&app, &q, Some(&cv), 30).unwrap();
+        assert_eq!(with_variant, variant_top_k);
+        assert_eq!(with_variant.len(), 30);
+    }
+
+    /// A fake index of `len` ids named `id0..`, nearest first, that records
+    /// each `k` it is searched with. `in_scope` keeps ids numbered >= `from`.
+    fn run_widen(overfetch: usize, len: usize, from: usize) -> (Vec<String>, Vec<usize>) {
+        let mut ks = Vec::new();
+        let kept = widen_until_in_scope(
+            overfetch,
+            |k| {
+                ks.push(k);
+                Ok(((0..k.min(len)).map(|i| format!("id{i}")).collect(), len))
+            },
+            |ids| {
+                Ok(ids
+                    .into_iter()
+                    .filter(|id| id[2..].parse::<usize>().unwrap() >= from)
+                    .collect())
+            },
+        )
+        .unwrap();
+        (kept, ks)
+    }
+
+    #[test]
+    fn widen_stops_after_one_search_when_the_first_pass_is_enough() {
+        let (kept, ks) = run_widen(30, 1000, 0);
+        assert_eq!(ks, vec![30]);
+        assert_eq!(kept.len(), 30);
+    }
+
+    #[test]
+    fn widen_doubles_k_and_stops_at_the_index_size() {
+        // Only ids 90..100 are in scope: k = 30, 60, then the cap of 100.
+        let (kept, ks) = run_widen(30, 100, 90);
+        assert_eq!(ks, vec![30, 60, 100]);
+        assert_eq!(kept.len(), 10);
+        assert_eq!(kept[0], "id90");
+    }
+
+    #[test]
+    fn widen_stops_as_soon_as_enough_in_scope_candidates_are_found() {
+        // 40 in-scope ids from 60 up: k = 30 finds none, k = 60 none, k = 120
+        // finds 40 >= 30 and stops before the cap of 1000.
+        let (kept, ks) = run_widen(30, 1000, 60);
+        assert_eq!(ks, vec![30, 60, 120]);
+        assert_eq!(kept.len(), 30);
+    }
+
+    #[test]
+    fn widen_over_an_empty_scope_searches_the_whole_index_once_and_stops() {
+        let (kept, ks) = run_widen(30, 100, 1000);
+        assert_eq!(ks, vec![30, 60, 100]);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn widen_handles_an_empty_index_and_an_overfetch_larger_than_the_index() {
+        let (kept, ks) = run_widen(30, 0, 0);
+        assert_eq!(ks, vec![30]);
+        assert!(kept.is_empty());
+
+        let (kept, ks) = run_widen(30, 10, 5);
+        assert_eq!(ks, vec![30]);
+        assert_eq!(kept.len(), 5);
+    }
+
+    #[test]
+    fn widen_terminates_when_the_index_grows_between_searches() {
+        // The index reports a bigger size on every search; the cap is the
+        // size seen first, so k still reaches it and the loop ends.
+        let mut calls = 0usize;
+        let kept = widen_until_in_scope(
+            30,
+            |_k| {
+                calls += 1;
+                Ok((Vec::new(), 100 * calls))
+            },
+            Ok,
+        )
+        .unwrap();
+        assert!(kept.is_empty());
+        assert_eq!(calls, 3);
     }
 }
