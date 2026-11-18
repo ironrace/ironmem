@@ -906,7 +906,8 @@ impl Database {
     }
 
     /// Every drawer in `wing` and/or `room`, ordered by id, with the columns
-    /// the search filters read and the decoded embedding, in one `SELECT`.
+    /// the search filters read and the decoded embedding. One `SELECT`, after
+    /// the `PRAGMA table_info` column probe the other drawer reads also make.
     /// It narrows by scope only; the caller applies the filter rules.
     pub(crate) fn scope_vectors(
         &self,

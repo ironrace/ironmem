@@ -196,9 +196,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Drawers stored without a real embedding are no longer in the vector index.**
   Autopilot backlog-lineage and collab session rows are stored with an all-zero
   vector, which matched every query perfectly and pushed real results out of
-  the vector leg. They are left out of the index and are still found by keyword
-  search. Everything the noop embedder (`IRONMEM_EMBED_MODE=noop`) writes is an
-  all-zero vector too, so search over a store it wrote is keyword-only.
+  the vector leg. They are left out of the index. Autopilot backlog-lineage rows
+  and collab plans and task lists are still found by keyword search; collab
+  messages were never keyword-indexed and are read by id. Everything the noop
+  embedder (`IRONMEM_EMBED_MODE=noop`) writes is an all-zero vector too, so
+  search over a store it wrote is keyword-only.
 
 ## [0.7.0] - 2026-11-09
 

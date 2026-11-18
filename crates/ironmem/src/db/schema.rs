@@ -804,10 +804,12 @@ impl Database {
     ///
     /// A drawer whose embedding has no usable norm (all zeros: Autopilot and
     /// collab rows, or anything written by the noop embedder; also a
-    /// non-finite norm) is left out. The
-    /// index's cosine distance is 0 against a zero vector, so such a row would
-    /// match every query perfectly. Those drawers stay in the table and are
-    /// still found by keyword search and by id.
+    /// non-finite norm) is left out. The index's cosine distance is 0 against
+    /// a zero vector, so such a row would match every query perfectly. Those
+    /// drawers stay in the table and can still be read by id. Autopilot
+    /// backlog-lineage rows and collab plans and task lists are still found by
+    /// keyword search; collab messages never were, since `insert_drawer` keeps
+    /// them out of the keyword index.
     pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
         let mut stmt = self.conn.prepare("SELECT id, embedding FROM drawers")?;
 

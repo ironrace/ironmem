@@ -444,7 +444,8 @@ fn search_index_ids(
 
 /// Vector candidates for a wing/room-scoped search, scored exactly.
 ///
-/// One `SELECT` fetches the scope's drawers in id order. A drawer is kept
+/// One `SELECT` (after the column probe `scope_vectors` makes, as the other
+/// drawer reads do) fetches the scope's drawers in id order. A drawer is kept
 /// when `row_matches_filters` keeps it (the same rules as the final filter)
 /// and its embedding is usable: decodable, as long as the query, and with a
 /// non-zero, finite norm. Each is scored by cosine similarity with the query;
@@ -1370,6 +1371,8 @@ mod tests {
         assert_eq!(ids, ["good"]);
     }
 
+    /// One `SELECT` statement; the `PRAGMA table_info` column probe that
+    /// precedes it is not a `SELECT` and is not counted.
     #[test]
     fn an_empty_scope_returns_no_candidates_from_one_select() {
         let mut app = App::open_for_test().unwrap();
