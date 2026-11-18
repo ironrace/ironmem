@@ -604,20 +604,27 @@ the first `[FAIL]`:
   harness config is reported **unreadable** or **malformed** (also a `[WARN]`),
   fix the file by hand (permissions/encoding, or the JSON/TOML syntax) before
   re-registering.
-- **`hooks` missing** (a `[WARN]`) → a non-plugin install is missing some of
-  the plugin's four hooks (SessionStart, UserPromptSubmit, Stop, PreCompact);
-  the line names each one and what is off without it, e.g. "prompt recall is
-  off". Re-run `scripts/install-ironmem.sh`, which appends only the missing
-  ones and leaves your other hooks alone, or install the plugin.
-- **`hook_mining` cannot mine** (a `[WARN]`) → usually the Stop/PreCompact hooks
-  run read-only, so new transcripts are not mined. The warning also fires when no
-  Stop or PreCompact hook is wired, or when a hook's `IRONMEM_MCP_MODE` is invalid
-  or cannot be judged statically. This is the expected state for
-  a script install: MCP writes and prompt recall still work. The line says
-  where each hook's mode came from. Prefixing those two commands with
-  `IRONMEM_MCP_MODE=trusted` turns mining on, at the cost of loading the
-  embedding model and rebuilding the vector index on each run; a cheaper path
-  is tracked in #418.
+- **`hooks` warning** (a `[WARN]`) → one of: `settings.json` does not exist
+  (doctor says "none wired"), `settings.json` cannot be read, some of the
+  plugin's four hooks (SessionStart, UserPromptSubmit, Stop, PreCompact) are
+  missing, a hook fails or may fail to start, or the plugin and `settings.json`
+  both wire the same hooks, so they run twice. For a missing hook the line names
+  each one and what is off without it, e.g. "prompt recall is off". Re-run
+  `scripts/install-ironmem.sh`, which appends only the missing ones and leaves
+  your other hooks alone, or install the plugin. If it says the hooks run twice,
+  remove the hand-wired copies; if it cannot read `settings.json`, fix the file
+  by hand first.
+- **`hook_mining` not mining** (a `[WARN]`) → a Stop or PreCompact hook does not
+  mine, or neither is wired. A wired hook does not mine when its
+  `IRONMEM_MCP_MODE` is `read-only` or `restricted`, or is invalid (the hook
+  fails to start); when the mode cannot be judged statically, the line says
+  the hook may not be mined. A plugin hook whose default is overridden to a
+  non-trusted mode by `settings.json` `env` or the shell also warns. The line
+  also says where each hook's mode came from. Read-only is the expected state
+  for a script install: MCP writes and prompt recall still work. Prefixing the
+  Stop and PreCompact commands with `IRONMEM_MCP_MODE=trusted` turns mining on,
+  at the cost of loading the embedding model and rebuilding the vector index on
+  each run; a cheaper path is tracked in #418.
 - **`mined_rows` older than 7 days** (a `[WARN]`) → nothing has been mined
   recently. MCP writes don't count. Check the `hook_mining` line.
 

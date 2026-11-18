@@ -14,19 +14,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `~/.claude/settings.json` (or reports that the enabled plugin supplies them);
   `hook_mining` says whether Stop/PreCompact can mine, with each hook's
   effective `IRONMEM_MCP_MODE` and where it came from; `mined_rows` shows how
-  old the newest mined row is and warns past 7 days. When one of them finds a
-  problem it is a warning and never fails `doctor` (exit 0). `scripts/install-ironmem.sh` now appends the four hooks to
-  `$CLAUDE_HOME/settings.json` (override with `CLAUDE_SETTINGS_JSON`) unless the
-  ironmem plugin is enabled. `--skip-wiring` skips hook wiring, and without `jq`
-  the installer prints the four hook entries to add by hand instead. A hook that
-  is already wired is left alone, and the
-  installer leaves every other hook and key alone. If settings.json cannot be
-  read or written, it prints a warning, wires nothing, and the rest of the
+  old the newest mined row is and warns past 7 days. Problems are warnings and
+  never fail `doctor` (exit 0). `scripts/install-ironmem.sh` now appends the
+  four hooks to `$CLAUDE_HOME/settings.json` (override with
+  `CLAUDE_SETTINGS_JSON`) unless the ironmem plugin is enabled. Hooks already
+  wired and all other hooks and keys are left alone; `--skip-wiring` skips
+  this, and without `jq` it prints the four entries to add by hand. If
+  settings.json cannot be read or written it warns, wires nothing, and the
   install continues (a write that fails partway can leave the file incomplete,
-  and the warning says so). A hand-wired command whose hook name does not come
-  directly after `hook` (for example `ironmem hook --harness claude-code stop`)
-  is not recognized and gets a second copy. The hooks it wires run read-only, so
-  they don't mine; a cheaper way to mine outside the plugin is #418.
+  and the warning says so). A hand-wired command with a flag before the hook
+  name (`ironmem hook --harness claude-code stop`) is not recognized and gets
+  a second copy. The wired hooks run read-only, so they don't mine; a cheaper
+  way to mine outside the plugin is #418.
 
 ### Changed
 
