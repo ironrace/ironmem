@@ -4,9 +4,14 @@
 //! accidentally calls a write path only fails at runtime (the underlying SQLite
 //! connection is `SQLITE_OPEN_READ_ONLY`, so the write would error — but only
 //! once a request hit it). [`ReadOnlyDb`] is a thin newtype that wraps a
-//! read-only [`Database`] and re-exposes ONLY the read/query methods the
-//! dashboard data layer needs. Because the inner [`Database`] is private, a
-//! write call from dashboard code is a *compile* error, not a runtime one.
+//! read-only [`Database`] and re-exposes only read/query methods, for the
+//! dashboard data layer and for `ironmem autopilot status`. Because the inner
+//! [`Database`] is private, a call to one of its write methods from either is
+//! a *compile* error, not a runtime one.
+//!
+//! [`ReadOnlyDb::with_connection`] lends the raw connection, which the type
+//! cannot keep from running a write statement. There the
+//! `SQLITE_OPEN_READ_ONLY` open is what refuses the write.
 //!
 //! This wrapper holds no logic of its own: every method delegates verbatim to
 //! the corresponding [`Database`] read method.
@@ -23,6 +28,24 @@ use crate::report::{run_report, Report, ReportOptions};
 ///
 /// Exposes only read/query methods. Write and migrate methods on [`Database`]
 /// are unreachable through this type, so misuse is caught at compile time.
+/// A read compiles:
+///
+/// ```
+/// # use ironmem::db::read_only::ReadOnlyDb;
+/// fn reads(ro: &ReadOnlyDb) {
+///     ro.schema_version().unwrap();
+/// }
+/// ```
+///
+/// The same function calling a write method does not. The two examples
+/// differ only in the method, so the method is why this one is refused:
+///
+/// ```compile_fail
+/// # use ironmem::db::read_only::ReadOnlyDb;
+/// fn writes(ro: &ReadOnlyDb) {
+///     ro.migrate().unwrap();
+/// }
+/// ```
 pub struct ReadOnlyDb {
     pub(super) inner: Database,
 }
@@ -75,6 +98,19 @@ impl ReadOnlyDb {
         self.inner.get_drawers(wing, room, limit)
     }
 
+    /// Drawers in `wing`/`room` whose source file starts with `prefix`, newest
+    /// first (see [`Database::get_drawers_by_source_prefix`]).
+    pub fn get_drawers_by_source_prefix(
+        &self,
+        wing: &str,
+        room: &str,
+        prefix: &str,
+        limit: usize,
+    ) -> Result<Vec<Drawer>, MemoryError> {
+        self.inner
+            .get_drawers_by_source_prefix(wing, room, prefix, limit)
+    }
+
     /// Exact-id drawer lookup.
     pub fn get_drawer(&self, id: &str) -> Result<Option<Drawer>, MemoryError> {
         self.inner.get_drawer(id)
@@ -115,20 +151,35 @@ mod tests {
         include_str!("../../migrations/016_collab_message_drawers.sql"),
     ];
 
-    /// Documents that `ReadOnlyDb` exposes the read methods the dashboard needs
-    /// and that they return the same data as the underlying `Database`.
-    ///
-    /// The compile-time guarantee is the real contract: a write method (e.g.
-    /// `ro.insert_drawer(..)` or `ro.migrate()`) does not exist on `ReadOnlyDb`,
-    /// so it cannot be called from dashboard code. The commented line below would
-    /// fail to compile if uncommented:
-    ///
-    /// ```compile_fail
-    /// # use ironmem::db::read_only::ReadOnlyDb;
-    /// fn writes(ro: &ReadOnlyDb) {
-    ///     ro.migrate().unwrap();
-    /// }
-    /// ```
+    #[test]
+    fn get_drawers_by_source_prefix_is_delegated_through_the_read_only_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefix.sqlite3");
+        {
+            let db = Database::open(&path).unwrap();
+            db.migrate().unwrap();
+            let emb = vec![0.0f32; ironrace_embed::embedder::EMBED_DIM];
+            for (content, source) in [("wanted", "logical:a:1"), ("other", "logical:b:1")] {
+                let id = crate::db::drawers::generate_id(content, "w", "r");
+                db.insert_drawer(&id, content, &emb, "w", "r", source, "test")
+                    .unwrap();
+            }
+        }
+
+        let ro = Database::open_read_only(&path).unwrap();
+        let found = ro
+            .get_drawers_by_source_prefix("w", "r", "logical:a:", 10)
+            .unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].content, "wanted");
+    }
+
+    /// `ReadOnlyDb` exposes the read methods its callers (the dashboard and
+    /// `ironmem autopilot status`) need, and they return the same data as the
+    /// underlying `Database`. That a write method cannot be called through
+    /// one is a compile-time property, checked by the `compile_fail` example
+    /// in the rustdoc of [`ReadOnlyDb`].
     #[test]
     fn read_only_db_exposes_reads_only() {
         // Build a populated DB, then re-open it read-only.

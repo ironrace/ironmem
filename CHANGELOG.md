@@ -7,8 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ironmem autopilot status <owner/repo>` (#420).** A report of a repo's
+  gate config (state, gate commands, `manifest_warnings`, `proposed_at`,
+  `approved_at`) and of which `agent:*` and `risk:*` labels it has, as text
+  or `--json`, naming the database that answered. It never creates, migrates
+  or writes the database file (SQLite may leave its `-wal`/`-shm` side files)
+  and only asks `gh` to list labels. It exits 0 whenever it prints a report,
+  including for a repo that is not onboarded, and 1, with no report, when the
+  gate config could not be read or the report could not be written to
+  stdout. Exit 1 covers a malformed repo name (a part made only of `.` is
+  refused; a name over 200 characters is refused with its length and without
+  being repeated), an unreadable database (a `--db` that names a directory,
+  and an empty `--db` or `IRONMEM_DB_PATH`, each have a message of their
+  own), and a config stored under the name asked about that does not parse.
+  When no config is stored under the exact name, exit 1 also covers a stored
+  config that does not parse and could be this repo's under another spelling
+  of the name, a database holding 1000 or more gate configs (#426), and a
+  stored gate config filed under an id that is not its key's (an edited or
+  imported row, which has to be repaired or removed by hand). Two repo names
+  that differ only in `/` versus `-` share one stored config: a config that
+  belongs to the other name, whether or not it parses, is an error that
+  names that repo and gives no `onboard` command for the name asked about,
+  because running one would replace the other repo's config (#421). A name
+  with no config of its own that differs from an onboarded repo's only in
+  letter case, or in whether it names a host, is an error, not "not
+  onboarded"; the error names the stored name unless one of the last two
+  causes above is reported first. A `gh` failure is reported as a failed
+  label read, not as missing labels.
+
 ### Changed
 
+- **`/evaluate-issue` reads the gate config with `ironmem autopilot status`
+  (#420).** It needs an `ironmem` on `PATH` that has `status`, and reports a
+  failed read without one. Its `onboard` and `approve` fix lines carry
+  `--db '<db>'`, the database the report named; a pending config has a fix
+  line of its own; a failed read gets neither command; and the check before
+  a phase-2 GOAL is `ironmem autopilot status <owner>/<repo> --db '<db>'`,
+  which the user runs. When a phase-2 remainder is lost to a missing
+  prerequisite or a failed read, the router says so under *Why*.
 - **Autopilot retries a review follow-up that was never posted (#408).** A
   successful follow-up comment is now recorded against its review, and every
   `advance` pass that reaches an open PR first posts each follow-up the PR is

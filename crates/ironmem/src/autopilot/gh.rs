@@ -697,6 +697,123 @@ pub fn issue_labels(gh: &mut dyn GhRunner, issue: &IssueRef) -> Result<Vec<Strin
     )?)
 }
 
+/// How many labels one [`repo_labels`] read asks `gh` for.
+///
+/// `gh label list` fetches 30 by default. A list that comes back with this
+/// many rows may have been cut off, and a cut-off list cannot prove a label
+/// is absent, so [`repo_labels`] refuses it rather than report the labels it
+/// did not see as missing. Reading past it is #426.
+const LABEL_LIST_LIMIT: usize = 1000;
+
+/// `gh label list --repo R --limit N --json name` (#420).
+///
+/// Deliberately no `--search`: that flag matches names *and descriptions*,
+/// fuzzily (on one repo `--search "risk:"` returned `sev:critical`), so the
+/// caller matches the returned names itself. Measured against
+/// `gh label list --help` (gh 2.96.0): `-R/--repo`, `-L/--limit int`
+/// (default 30) and `--json fields`, with `name` among the fields.
+pub(super) fn label_list_argv(repo: &str) -> Vec<String> {
+    vec![
+        "label".into(),
+        "list".into(),
+        "--repo".into(),
+        repo.into(),
+        "--limit".into(),
+        LABEL_LIST_LIMIT.to_string(),
+        "--json".into(),
+        "name".into(),
+    ]
+}
+
+/// Parse `gh label list --json name` into bare label names, in `gh`'s order.
+///
+/// A row with no name (or a blank one) is an error: GitHub label names cannot
+/// be empty, so a blank name means output this parser does not understand.
+fn parse_label_list(stdout: &str) -> Result<Vec<String>, MemoryError> {
+    let raw: Vec<LabelJson> = serde_json::from_str(stdout.trim()).map_err(|e| {
+        MemoryError::Validation(format!("could not parse `gh label list --json name`: {e}"))
+    })?;
+    let names: Vec<String> = raw.into_iter().map(|label| label.name).collect();
+    // `LabelJson` defaults a missing `name` to "".
+    if names.iter().any(|name| name.trim().is_empty()) {
+        return Err(MemoryError::Validation(
+            "`gh label list --json name` returned a label with no name — the output is not \
+             the expected shape, so no label can be reported missing from it"
+                .into(),
+        ));
+    }
+    Ok(names)
+}
+
+/// What a `gh label list` on `repo` that did not succeed is reported as.
+///
+/// Its own wording, not [`GhOutput::require_success`]'s: the exit code is
+/// printed as a number, a `gh` that a signal killed (no exit code) is called
+/// that, and a failure that printed nothing says so instead of ending in a
+/// bare colon. The `gh auth status` pointer goes on every non-zero exit and
+/// not on a signal kill: an expired or missing token is a common cause of
+/// the first, and the pointer is worded as a condition ("if the cause is
+/// authentication") because the exit code does not say which cause it was.
+fn label_list_failure(repo: &str, out: &GhOutput) -> String {
+    let said = out.stderr.trim();
+    let what = format!("gh label list on {repo}");
+    let auth = "if the cause is authentication, check `gh auth status`";
+    match (out.code, said.is_empty()) {
+        (Some(code), false) => format!("{what} failed (exit {code}): {said} — {auth}"),
+        (Some(code), true) => {
+            format!("{what} failed (exit {code}) and printed no error output — {auth}")
+        }
+        (None, false) => format!("{what} was killed by a signal: {said}"),
+        (None, true) => format!("{what} was killed by a signal and printed no error output"),
+    }
+}
+
+/// Read every label name defined in `repo`. A read, never a write.
+///
+/// Every way this can fail is an `Err`, and none of them is an empty list: a
+/// `gh` that could not start, a non-zero exit (auth, rate limit, unknown
+/// repo), output that is not the expected JSON (nothing at all included),
+/// and a list long enough to have been truncated. The caller reports each as
+/// a *failed read*; an empty `Ok` means `gh` printed an empty list (`[]`).
+///
+/// A `gh` that did not succeed is [`MemoryError::NotFound`], the variant
+/// every refused read in this module is carried in, whatever the cause was.
+pub fn repo_labels(gh: &mut dyn GhRunner, repo: &str) -> Result<Vec<String>, MemoryError> {
+    let out = gh.run(&label_list_argv(repo))?;
+    if !out.success {
+        return Err(MemoryError::NotFound(label_list_failure(repo, &out)));
+    }
+    // A `gh` that exited 0 and printed something else: the error names the
+    // repo and keeps what `gh` said on stderr, which is the only clue left.
+    let unreadable = |reason: &str| {
+        let said = match out.stderr.trim() {
+            "" => String::new(),
+            said => format!(" (gh also printed: {said})"),
+        };
+        MemoryError::Validation(format!(
+            "gh label list on {repo} exited 0, but its output could not be read as a label list \
+             — {reason}{said}"
+        ))
+    };
+    if out.stdout.trim().is_empty() {
+        return Err(unreadable("it printed nothing on stdout"));
+    }
+    let names = parse_label_list(&out.stdout).map_err(|err| match err {
+        MemoryError::Validation(reason) => unreadable(&reason),
+        other => other,
+    })?;
+    if names.len() >= LABEL_LIST_LIMIT {
+        return Err(MemoryError::Validation(format!(
+            "gh label list on {repo} returned {} labels, at least the limit it was asked for — \
+             the list may be truncated, so `status` cannot report the labels of {repo}. To check \
+             one label, run `gh label list --repo {repo} --search <label> --json name` and \
+             look for its exact name in the result",
+            names.len()
+        )));
+    }
+    Ok(names)
+}
+
 /// Post a comment on an issue.
 pub fn comment_on_issue(
     gh: &mut dyn GhRunner,
@@ -2742,5 +2859,233 @@ mod tests {
     fn unparseable_pr_list_output_is_a_validation_error() {
         let err = parse_pr_list_head("not json").unwrap_err();
         assert!(matches!(err, MemoryError::Validation(_)), "got {err:?}");
+    }
+
+    // ── #420: listing a repo's labels ───────────────────────────────────
+
+    #[test]
+    fn the_label_list_argv_names_the_repo_and_never_searches() {
+        let argv = label_list_argv("owner/repo");
+        assert_eq!(
+            argv,
+            vec![
+                "label",
+                "list",
+                "--repo",
+                "owner/repo",
+                "--limit",
+                "1000",
+                "--json",
+                "name"
+            ]
+        );
+        // See `label_list_argv`: `--search` is fuzzy.
+        assert!(!argv.iter().any(|arg| arg == "--search" || arg == "-S"));
+    }
+
+    #[test]
+    fn a_label_list_parses_to_bare_names() {
+        // The shape gh 2.96.0 prints for `gh label list --json name`.
+        let names =
+            parse_label_list(r#"[{"name":"bug"},{"name":"agent:ready"},{"name":"risk:logic"}]"#)
+                .unwrap();
+        assert_eq!(names, vec!["bug", "agent:ready", "risk:logic"]);
+    }
+
+    #[test]
+    fn a_refused_label_list_is_an_error_not_an_empty_list() {
+        // An empty list would report every label as missing. A `gh` that
+        // exited non-zero has not said that.
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::failed(
+            "",
+            "GraphQL: Could not resolve to a Repository with the name 'owner/repo'. (repository)",
+        ))]);
+
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+
+        match &err {
+            MemoryError::NotFound(message) => assert_eq!(
+                message,
+                "gh label list on owner/repo failed (exit 1): GraphQL: Could not resolve to a \
+                 Repository with the name 'owner/repo'. (repository) — if the cause is \
+                 authentication, check `gh auth status`"
+            ),
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        assert_eq!(gh.seen, vec![label_list_argv("owner/repo")]);
+    }
+
+    /// The error a `gh label list` gets when it ends with `code` and `stderr`.
+    fn label_list_failure_of(code: Option<i32>, stderr: &str) -> String {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput {
+            stdout: String::new(),
+            stderr: stderr.to_string(),
+            success: false,
+            code,
+        })]);
+        match repo_labels(&mut gh, "owner/repo").unwrap_err() {
+            MemoryError::NotFound(message) => message,
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_label_list_killed_by_a_signal_says_so_instead_of_printing_no_exit_code() {
+        assert_eq!(
+            label_list_failure_of(None, ""),
+            "gh label list on owner/repo was killed by a signal and printed no error output"
+        );
+        assert_eq!(
+            label_list_failure_of(None, "  context canceled\n"),
+            "gh label list on owner/repo was killed by a signal: context canceled"
+        );
+    }
+
+    #[test]
+    fn a_label_list_that_fails_silently_says_it_printed_nothing() {
+        assert_eq!(
+            label_list_failure_of(Some(4), " \n"),
+            "gh label list on owner/repo failed (exit 4) and printed no error output — if the \
+             cause is authentication, check `gh auth status`"
+        );
+    }
+
+    #[test]
+    fn a_label_list_that_is_not_json_is_an_error() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("not json"))]);
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn a_label_list_that_cannot_be_read_names_the_repo_and_keeps_what_gh_said() {
+        let exited_zero = |stdout: &str, stderr: &str| {
+            let mut gh = ScriptedGh::new(vec![Ok(GhOutput {
+                stdout: stdout.to_string(),
+                stderr: stderr.to_string(),
+                success: true,
+                code: Some(0),
+            })]);
+            match repo_labels(&mut gh, "owner/repo").unwrap_err() {
+                MemoryError::Validation(message) => message,
+                other => panic!("expected Validation, got {other:?}"),
+            }
+        };
+        let head = "gh label list on owner/repo exited 0, but its output could not be read as a \
+                    label list — ";
+
+        // Nothing on stdout is said in words, not as a JSON parser's "EOF".
+        assert_eq!(
+            exited_zero(" \n", ""),
+            format!("{head}it printed nothing on stdout")
+        );
+        // What `gh` printed on stderr is the only clue there is, so it stays.
+        assert_eq!(
+            exited_zero("", "  warning: something changed\n"),
+            format!(
+                "{head}it printed nothing on stdout (gh also printed: warning: something changed)"
+            )
+        );
+        let not_json = exited_zero("not json", "a notice");
+        assert!(
+            not_json.starts_with(&format!(
+                "{head}could not parse `gh label list --json name`: "
+            )),
+            "{not_json}"
+        );
+        assert!(
+            not_json.ends_with(" (gh also printed: a notice)"),
+            "{not_json}"
+        );
+        let no_name = exited_zero(r#"[{"name":"bug"},{}]"#, "");
+        assert!(
+            no_name.starts_with(&format!(
+                "{head}`gh label list --json name` returned a label with no name"
+            )),
+            "{no_name}"
+        );
+    }
+
+    #[test]
+    fn a_label_list_that_fills_the_limit_is_refused_as_possibly_truncated() {
+        // A list cut off at the limit cannot prove a label is absent.
+        let rows: Vec<String> = (0..LABEL_LIST_LIMIT)
+            .map(|i| format!(r#"{{"name":"label-{i}"}}"#))
+            .collect();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(&format!("[{}]", rows.join(","))))]);
+
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("may be truncated"), "{message}");
+        // What the reader can do: no label of this repo is reported, and one
+        // can be checked by hand.
+        assert!(
+            message.contains("`status` cannot report the labels of owner/repo"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`gh label list --repo owner/repo --search <label> --json name`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_label_row_with_no_name_is_an_error_not_a_blank_label() {
+        // GitHub label names cannot be empty, so a row without one is output
+        // this parser does not understand. Returning it as "" (or dropping
+        // it) would report real labels as missing.
+        let err = parse_label_list(r#"[{"name":"bug"},{}]"#).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+        assert!(err.to_string().contains("no name"), "{err}");
+
+        let err = parse_label_list(r#"[{"name":""}]"#).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+
+        let err = parse_label_list(r#"[{"name":"  "}]"#).unwrap_err();
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+    }
+
+    #[test]
+    fn a_label_list_one_short_of_the_limit_is_returned_whole() {
+        // With the at-limit test above, this pins the boundary exactly: a
+        // smaller hardcoded threshold would refuse this list.
+        let rows: Vec<String> = (0..LABEL_LIST_LIMIT - 1)
+            .map(|i| format!(r#"{{"name":"label-{i}"}}"#))
+            .collect();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(&format!("[{}]", rows.join(","))))]);
+
+        let names = repo_labels(&mut gh, "owner/repo").unwrap();
+
+        assert_eq!(names.len(), LABEL_LIST_LIMIT - 1);
+        // Returned in order, with each name exactly as listed.
+        assert_eq!(names.first().map(String::as_str), Some("label-0"));
+        assert_eq!(
+            names.last().cloned(),
+            Some(format!("label-{}", LABEL_LIST_LIMIT - 2))
+        );
+    }
+
+    #[test]
+    fn a_repo_with_no_labels_reads_as_an_empty_list_not_a_failure() {
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok("[]\n"))]);
+        assert_eq!(
+            repo_labels(&mut gh, "owner/repo").unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn a_label_list_over_the_limit_is_refused_too() {
+        let rows: Vec<String> = (0..LABEL_LIST_LIMIT + 1)
+            .map(|i| format!(r#"{{"name":"label-{i}"}}"#))
+            .collect();
+        let mut gh = ScriptedGh::new(vec![Ok(GhOutput::ok(&format!("[{}]", rows.join(","))))]);
+
+        let err = repo_labels(&mut gh, "owner/repo").unwrap_err();
+
+        assert!(matches!(err, MemoryError::Validation(_)), "{err}");
+        assert!(err.to_string().contains("at least the limit"), "{err}");
     }
 }

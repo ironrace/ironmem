@@ -696,6 +696,19 @@ fn sort_candidates(candidates: &mut [QueuedIssue]) {
     });
 }
 
+/// The class named by one `risk:<class>` label, lowercased, or `None` when
+/// `label` is not a risk label. Trimmed and case-insensitive; a bare
+/// `risk:` with no class is not one. The single definition of the rule:
+/// [`risk_label`] and [`super::status`] both call it.
+pub(super) fn risk_class_of(label: &str) -> Option<String> {
+    let normalized = label.trim().to_ascii_lowercase();
+    let rest = normalized.strip_prefix(super::lead::RISK_LABEL_PREFIX)?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some(rest.to_string())
+}
+
 /// The value of an issue's `risk:<class>` label, lowercased, if it has one.
 ///
 /// Case-insensitive for the reason [`Priority::of`] is: GitHub label names
@@ -722,14 +735,13 @@ fn sort_candidates(candidates: &mut [QueuedIssue]) {
 pub(super) fn risk_label(labels: &[String]) -> Option<String> {
     let mut found: Vec<String> = Vec::new();
     for label in labels {
-        let normalized = label.trim().to_ascii_lowercase();
-        let Some(rest) = normalized.strip_prefix(super::lead::RISK_LABEL_PREFIX) else {
+        let Some(rest) = risk_class_of(label) else {
             continue;
         };
-        if rest.is_empty() || found.iter().any(|f| f == rest) {
+        if found.contains(&rest) {
             continue;
         }
-        found.push(rest.to_string());
+        found.push(rest);
     }
     found.sort();
     match found.len() {
@@ -1200,6 +1212,17 @@ mod tests {
         // an exact-match parse made a stop sign invisible.
         assert_eq!(Priority::of(&["Priority:High".into()]), Priority::High);
         assert_eq!(Priority::of(&[" priority:HIGH ".into()]), Priority::High);
+    }
+
+    #[test]
+    fn risk_class_of_reads_one_label_trimmed_and_case_insensitively() {
+        assert_eq!(risk_class_of("Risk:Logic"), Some("logic".to_string()));
+        assert_eq!(risk_class_of("risk:"), None);
+        assert_eq!(
+            risk_class_of(" risk:documentation "),
+            Some("documentation".to_string())
+        );
+        assert_eq!(risk_class_of("xrisk:logic"), None);
     }
 
     #[test]

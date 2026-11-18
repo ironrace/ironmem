@@ -115,15 +115,16 @@ impl Database {
 
     /// Open an EXISTING database **read-only** and **without migration**.
     ///
-    /// Designed for the dashboard server, which must never create, modify, or
-    /// migrate the database file. Uses `SQLITE_OPEN_READ_ONLY | NO_MUTEX` so a
+    /// Designed for the dashboard server and `ironmem autopilot status`, which
+    /// must never create, modify, or migrate the database file. Uses
+    /// `SQLITE_OPEN_READ_ONLY | NO_MUTEX` so a
     /// missing file fails fast instead of being silently created. No WAL pragma,
     /// no `create_dir_all`, no `migrate`. `PRAGMA foreign_keys=ON` is the only
     /// pragma executed — it is safe in read-only mode.
     ///
     /// Returns [`ReadOnlyDb`], a thin newtype exposing only read/query methods,
-    /// so a dashboard handler that tries to write fails to compile rather than at
-    /// runtime.
+    /// so a caller that tries one of [`Database`]'s write methods fails to
+    /// compile rather than at runtime.
     ///
     /// A missing file is handled by SQLite itself: opening with
     /// `SQLITE_OPEN_READ_ONLY` (and no `SQLITE_OPEN_CREATE`) errors with
