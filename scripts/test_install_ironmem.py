@@ -938,5 +938,44 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertFalse((home / ".claude" / "settings.json").exists())
 
 
+    def stop_commands_after_install(self, existing: str, *, event: str = "Stop") -> list[str]:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            settings_path = home / ".claude" / "settings.json"
+            settings_path.parent.mkdir(parents=True)
+            settings_path.write_text(
+                json.dumps({"hooks": {event: [{"hooks": [{"type": "command", "command": existing}]}]}}),
+                encoding="utf-8",
+            )
+            self.run_installer(home, home / ".claude.json")
+            return self.ironmem_hook_commands(self.claude_settings(home), event)
+
+    def test_quoted_program_path_counts_as_wired(self) -> None:
+        for command in (
+            '"$HOME/.ironrace/bin/ironmem" hook stop --harness claude-code',
+            "'/opt/ironmem' hook stop --harness claude-code",
+        ):
+            with self.subTest(command=command):
+                self.assertEqual(self.stop_commands_after_install(command), [command])
+
+    def test_shell_terminator_after_the_hook_name_counts_as_wired(self) -> None:
+        for tail in ("; true", " && true", " || true", " | cat", " &", ")", '"', "'"):
+            command = f"~/.ironrace/bin/ironmem hook stop{tail}"
+            with self.subTest(command=command):
+                self.assertEqual(self.stop_commands_after_install(command), [command])
+        wrapper = "bash /p/hooks/ironmem-hook.sh stop; true"
+        self.assertEqual(self.stop_commands_after_install(wrapper), [wrapper])
+
+    def test_a_longer_hook_name_does_not_count_as_wired(self) -> None:
+        for command in (
+            "~/.ironrace/bin/ironmem hook stopx --harness claude-code",
+            "~/.ironrace/bin/ironmem hook stop-foo --harness claude-code",
+        ):
+            with self.subTest(command=command):
+                commands = self.stop_commands_after_install(command)
+                self.assertEqual(len(commands), 2, commands)
+                self.assertEqual(commands[0], command)
+
+
 if __name__ == "__main__":
     unittest.main()
