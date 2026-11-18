@@ -976,15 +976,27 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   config and which name to ask with afterwards. For a config whose `repo` is
   a repo name stored under that key, it is `ironmem autopilot onboard <that
   name> --path . --db <db>`, run from that repo's checkout, then `status`
-  with that name. For any other, it is `onboard` with the name the repo was
-  onboarded under, which the key gives only as `gate-config:` followed by
-  that name with each `/` written as `-`, then `status` with that name. The
-  name first asked about would be refused again, as another spelling of the
-  stored one.
+  with that name: the name first asked about would be refused again, as
+  another spelling of the stored one. For a config whose `repo` is stored
+  under that key and is a name `onboard` takes and `status` refuses
+  (`Owner-Repo`, asked about as `owner/repo`; #422), the error prints no
+  command line: it says to run `onboard` with that name and `--db <db>` from
+  that repo's checkout, then to ask with the name first asked about again,
+  because `status` cannot be asked about the other. For any other, it is
+  `onboard` with the name the repo was onboarded under, which the key gives
+  only as `gate-config:` followed by that name with each `/` written as `-`,
+  then `status` with that name.
 - **A config is stored under another spelling of the name**: one that differs
-  only in letter case, or in whether it names a host. The error names the
-  stored name. When a config that parses and one that does not both match,
-  this is the error reported.
+  only in letter case, or in whether it names a host. Like the error above,
+  this is one only when no config is stored under the asked name's own key.
+  The error names the stored name and says to ask with it. A config that is
+  not under the key of the `repo` it holds (a row edited by hand: `onboard`
+  stores each config under the key of its own `repo`) is not found by asking
+  with that name, so for one the error names the config's `repo` and its key
+  instead, gives no command, and says to find out where the row came from
+  and repair or remove it by hand. A stored name is shown with any control
+  character in it escaped. When a config that parses and one that does not
+  both match, the config that parses is the one reported.
 - **The stored config belongs to another repo name.** The config under the
   asked name's key parses, and its `repo` is not the name asked about. When
   that `repo` is a name stored under the key, the two names share it. The
@@ -994,12 +1006,16 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   (`--db`) for one of the two. When the `repo` is not a name stored under
   the key, no `onboard` wrote the config as it stands: the error says so and
   says to check where the config came from before anything replaces it.
-  Neither error gives a command. A config under that key that does not parse
-  and names another repo is refused the same way, as described above.
+  Neither error gives a command, and both show the `repo` with any control
+  character in it escaped. A config under that key that does not parse and
+  names another repo is refused the same way, as described above.
 - **1000 or more gate configs are stored and none is under the exact name.**
   `status` compares fewer than that with the name, so it cannot rule out a
   config stored under another spelling (#426). A repo asked about by the exact
-  name it was onboarded under is still answered.
+  name it was onboarded under is still answered. This error and the next are
+  raised before any stored config is compared with the name, so each is
+  reported in place of the two "another spelling" errors above, whatever
+  those would have named.
 - **A stored gate config is filed under an id that is not its key's, and none
   is under the exact name.** A config is found by an id made from its key,
   and its row also records the key. A row whose id is not the id of the key
@@ -1007,7 +1023,10 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   say). Which repo name reads such a row cannot be told from the row, so `status`
   cannot rule it out as a config of the repo asked about, whatever that
   name is. The error gives the row's id and the key it records
-  (`source_file`). A repo asked about by the exact name it was onboarded
+  (`source_file`). It gives no command, because none is known to repair
+  such a row: it says to find out where the row came from, then repair or
+  remove it by hand, and that it is the row with that id in the database's
+  `drawers` table. A repo asked about by the exact name it was onboarded
   under is still answered.
 - **The ironmem config cannot be loaded**, as for every command that loads
   it: `IRONMEM_MCP_MODE` or `IRONMEM_EMBED_MODE` holds a value it does not
@@ -1045,14 +1064,15 @@ Exit 1 has these causes. Every one but the last prints nothing on stdout.
   nothing about approval, which is `gate_config.state`, or about labels. A
   repo that was never onboarded has `"onboarded": false` and
   `"gate_config": null`.
-- The name must be the one the repo was onboarded under. A name that differs
-  from an onboarded one only in letter case, or in that only one of the two
-  names a host (`github.com/owner/repo` and `owner/repo`), exits 1 and names
-  the stored one, because `gh` can read those as the same repository: it
-  reads a name without a host against its default host, which `GH_HOST`
-  changes. A stored name and an asked name with different hosts are
-  different repositories and never match, so a same-named repo on another
-  host is asked about with its host. That holds for stored names: a config
+- The name must be the one the repo was onboarded under. A name with no
+  config of its own that differs from an onboarded one only in letter case,
+  or in that only one of the two names a host (`github.com/owner/repo` and
+  `owner/repo`), exits 1, because `gh` can read those as the same
+  repository: it reads a name without a host against its default host, which
+  `GH_HOST` changes. The error names the stored one, except where the exit 1
+  causes above say another error is reported first. A stored name and an
+  asked name with different hosts are different repositories and never
+  match, so a same-named repo on another host is asked about with its host. That holds for stored names: a config
   that does not parse and holds no name is matched by its storage key, which
   can match a name on another host (see exit 1 above). When the error is
   about a host on one side only and the repo asked about is on another host,

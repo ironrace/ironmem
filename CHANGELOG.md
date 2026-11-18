@@ -21,17 +21,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   refused; a name over 200 characters is refused with its length and without
   being repeated), an unreadable database (a `--db` that names a directory,
   and an empty `--db` or `IRONMEM_DB_PATH`, each have a message of their
-  own), a stored config that does not parse, whether it is stored under the
-  name asked about or under another spelling of it, and a database holding
-  1000 or more gate configs when none is under the exact name (#426). Two
-  repo names that differ only in `/` versus `-` share one stored config: a
-  config that belongs to the other name, whether or not it parses, is an
-  error that names that repo and gives no `onboard` command for the name
-  asked about, because running one would replace the other repo's config
-  (#421). A name that differs from an onboarded repo's only in letter case,
-  or in whether it names a host, is an error naming the stored name, not
-  "not onboarded". A `gh` failure is reported as a failed label read, not as
-  missing labels.
+  own), and a config stored under the name asked about that does not parse.
+  When no config is stored under the exact name, exit 1 also covers a stored
+  config that does not parse and could be this repo's under another spelling
+  of the name, a database holding 1000 or more gate configs (#426), and a
+  stored gate config filed under an id that is not its key's (an edited or
+  imported row, which has to be repaired or removed by hand). Two repo names
+  that differ only in `/` versus `-` share one stored config: a config that
+  belongs to the other name, whether or not it parses, is an error that
+  names that repo and gives no `onboard` command for the name asked about,
+  because running one would replace the other repo's config (#421). A name
+  with no config of its own that differs from an onboarded repo's only in
+  letter case, or in whether it names a host, is an error, not "not
+  onboarded"; the error names the stored name unless one of the last two
+  causes above is reported first. A `gh` failure is reported as a failed
+  label read, not as missing labels.
 
 ### Changed
 

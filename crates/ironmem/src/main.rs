@@ -1006,14 +1006,17 @@ enum AutopilotCmd {
     /// The config stored under this name's storage key does not parse, or
     /// belongs to another repo name (two names that differ only in `/`
     /// versus `-` share a key; the error names the other repo and gives no
-    /// command for this one). A config is stored under a name that differs
-    /// only in letter case or in whether it names a host (the error names
-    /// it; a stored name never matches a name on another host). A config
-    /// that does not parse could be this repo's under another spelling (one
-    /// that holds no name is matched by its storage key, which can match a
-    /// name on another host). Or none is stored under this exact name and
-    /// the others cannot all be compared with it: 1000 or more are stored,
-    /// or one is filed under an id that is not its key's.
+    /// command for this one).
+    ///
+    /// No config is stored under this exact name, and one of these holds. A
+    /// config is stored under a name that differs only in letter case or in
+    /// whether it names a host (the error names it; a stored name never
+    /// matches a name on another host). A config that does not parse could
+    /// be this repo's under another spelling (one that holds no name is
+    /// matched by its storage key, which can match a name on another host).
+    /// Or the stored configs cannot all be compared with this name, which
+    /// is reported before either of those: 1000 or more are stored, or one
+    /// is filed under an id that is not its key's.
     ///
     /// The ironmem config cannot be loaded, as for every command that loads
     /// it (`IRONMEM_MCP_MODE` or `IRONMEM_EMBED_MODE` holds a value it does
