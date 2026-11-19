@@ -5,13 +5,17 @@
 //! install gets whatever `~/.claude/settings.json` holds, and hook commands
 //! there default to read-only, which skips mining. Neither gap errors at run
 //! time, so doctor is where it has to show up. Diagnose-only: never writes.
+//! Besides reading settings.json it looks at the file system in one place:
+//! [`program_problem`] checks that a wired hook's literal program path (an
+//! absolute path or `~/...`) is an executable file.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
 use super::hook_command::{
-    best_result, hook_modes, runs_hook, source_label, ModeEnv, ModeError, ModeSource, RunMode,
+    best_result, hook_modes, runs_hook, source_label, ModeEnv, ModeError, ModeSource,
+    ProgramProblem, RunMode,
 };
 use super::{Check, CheckStatus};
 
@@ -120,10 +124,22 @@ refuses the file until then";
 
 const DISABLE_ALL_HOOKS_HINT: &str = "remove disableAllHooks from settings.json or set it to false";
 
+const MISSING_PROGRAM_HINT: &str = "correct the program path in that settings.json entry, or \
+remove the entry and re-run scripts/install-ironmem.sh to wire it again (the installer leaves an \
+entry that is already wired as it is)";
+
 const HOME_UNKNOWN: &str = "hook mining: skipped (home directory unknown)";
 
 /// The command shape of a plugin hook, used to work out the mode it runs in.
 const PLUGIN_HOOK_COMMAND: &str = "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh";
+
+/// What the hook checks read besides settings.json's commands.
+#[derive(Debug, Clone, Copy)]
+struct Context<'a> {
+    env: ModeEnv<'a>,
+    /// The home directory a `~/` program path expands to.
+    home: &'a Path,
+}
 
 /// Plugin hooks that settings.json wires, with every command matching each.
 type WiredHooks = Vec<(&'static PluginHook, Vec<String>)>;
@@ -256,9 +272,12 @@ pub(super) fn claude_hook_checks(
                 .iter()
                 .map(|hook| (hook, vec![format!("{PLUGIN_HOOK_COMMAND} {}", hook.name)]))
                 .collect();
-            let env = ModeEnv {
-                settings: settings_env_mode.as_deref(),
-                process: process_env_mode,
+            let ctx = Context {
+                env: ModeEnv {
+                    settings: settings_env_mode.as_deref(),
+                    process: process_env_mode,
+                },
+                home,
             };
             // A hand-wired copy runs as well as the plugin's, so it can start,
             // recall and mine in the plugin copy's place.
@@ -270,12 +289,12 @@ pub(super) fn claude_hook_checks(
                     (*hook, all.collect())
                 })
                 .collect();
-            let split = split_hand_wired(&wired, &hand_wired, env);
+            let split = split_hand_wired(&wired, &hand_wired, ctx);
             // A `Maybe` here needs a dynamic hand-wired copy (the plugin's copy
             // never has one), which `split_hand_wired` already reports.
-            let (failures, _) = startup_failures(&candidates, env);
-            let mut mining = mining_check(&candidates, env, true);
-            if mined_only_by_hand_wired(&wired, &candidates, env) {
+            let (failures, _) = startup_failures(&candidates, ctx);
+            let mut mining = mining_check(&candidates, ctx, true);
+            if mined_only_by_hand_wired(&wired, &candidates, ctx) {
                 add_hint(&mut mining, PLUGIN_OVERRIDE_HINT);
             }
             [plugin_hooks_check(&split, &failures), mining]
@@ -285,14 +304,17 @@ pub(super) fn claude_hook_checks(
             missing,
             settings_env_mode,
         } => {
-            let env = ModeEnv {
-                settings: settings_env_mode.as_deref(),
-                process: process_env_mode,
+            let ctx = Context {
+                env: ModeEnv {
+                    settings: settings_env_mode.as_deref(),
+                    process: process_env_mode,
+                },
+                home,
             };
-            let (failures, may_fail) = startup_failures(&wired, env);
+            let (failures, may_fail) = startup_failures(&wired, ctx);
             [
                 hooks_check(&path, &missing, &failures, &may_fail),
-                mining_check(&wired, env, false),
+                mining_check(&wired, ctx, false),
             ]
         }
     }
@@ -307,12 +329,12 @@ fn can_mine(run: &RunMode) -> bool {
 /// plugin's own command can't mine (an override wins over the wrapper's
 /// default), so removing the copies, as the `hooks` hint says, would stop
 /// mining.
-fn mined_only_by_hand_wired(wired: &WiredHooks, candidates: &WiredHooks, env: ModeEnv<'_>) -> bool {
+fn mined_only_by_hand_wired(wired: &WiredHooks, candidates: &WiredHooks, ctx: Context<'_>) -> bool {
     let mines = |hooks: &WiredHooks, event: &str| {
         hooks
             .iter()
             .filter(|(h, _)| h.event == event)
-            .any(|(h, commands)| can_mine(&event_mode(h, commands, env)))
+            .any(|(h, commands)| can_mine(&event_mode(h, commands, ctx)))
     };
     PLUGIN_HOOKS
         .iter()
@@ -442,17 +464,53 @@ fn commands_for(doc: &Value, event: &str) -> Vec<String> {
         .collect()
 }
 
+/// Every run of `hook` in `commands`, in order, with a run whose literal
+/// program path is not a runnable file marked [`ModeError::NoProgram`].
+fn runs(hook: &PluginHook, commands: &[String], ctx: Context<'_>) -> Vec<RunMode> {
+    commands
+        .iter()
+        .flat_map(|c| hook_modes(c, hook.name, ctx.env))
+        .map(|mut run| {
+            if let Some(program) = run.program.clone() {
+                if let Some(problem) = program_problem(&program, ctx.home) {
+                    run.mode = Err(ModeError::NoProgram(program, problem));
+                }
+            }
+            run
+        })
+        .collect()
+}
+
+/// What is wrong with `program`, a literal path as the command has it (`~/`
+/// expands to `home`), or `None` when it is an executable file or doctor
+/// cannot tell (an error other than not-found, such as a permission error).
+/// On unix any execute bit counts; elsewhere any file does.
+fn program_problem(program: &str, home: &Path) -> Option<ProgramProblem> {
+    let path = match program.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(program),
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(ProgramProblem::Missing),
+        Err(_) => return None,
+    };
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = true;
+    (!(meta.is_file() && executable)).then_some(ProgramProblem::NotExecutable)
+}
+
 /// The one mode result reported for `hook`, with its raw value: every run of
 /// it in its matching commands, reduced by [`best_result`] (can mine without
 /// doctor's shell, then via the shell, then unknown, then cannot mine, then
-/// invalid; settings order breaks ties).
-fn event_mode(hook: &PluginHook, commands: &[String], env: ModeEnv<'_>) -> RunMode {
-    best_result(
-        commands
-            .iter()
-            .flat_map(|c| hook_modes(c, hook.name, env))
-            .collect(),
-    )
+/// does not start; settings order breaks ties).
+fn event_mode(hook: &PluginHook, commands: &[String], ctx: Context<'_>) -> RunMode {
+    best_result(runs(hook, commands, ctx))
 }
 
 /// Why `Config::load` rejects the raw mode value `raw`, with it quoted.
@@ -460,15 +518,43 @@ fn invalid_reason(raw: &str) -> String {
     format!("IRONMEM_MCP_MODE={raw:?} is not trusted, read-only or restricted")
 }
 
-/// `hook` exits at startup because `Config::load` rejects its raw mode `raw`.
-fn startup_failure(hook: &PluginHook, raw: &str, source: ModeSource) -> String {
-    format!(
-        "{} fails to start: {} ({}), so {}",
-        hook.event,
-        invalid_reason(raw),
-        source_label(source),
-        hook.lost
-    )
+/// Why every run of a hook fails to start.
+#[derive(Debug, PartialEq, Eq)]
+enum Failure {
+    /// `Config::load` rejects this raw mode, from this source.
+    Invalid(String, ModeSource),
+    /// The program is this literal path, which is not a runnable file.
+    NoProgram(String, ProgramProblem),
+}
+
+impl Failure {
+    /// The clause after a hook's name, e.g. "fails to start: ... (set in the
+    /// hook command)" or "is wired to /old/bin/ironmem, which does not exist".
+    fn clause(&self) -> String {
+        match self {
+            Self::Invalid(raw, source) => format!(
+                "fails to start: {} ({})",
+                invalid_reason(raw),
+                source_label(*source)
+            ),
+            Self::NoProgram(path, problem) => {
+                format!("is wired to {path}, which {}", problem.describe())
+            }
+        }
+    }
+
+    /// The hint that fixes it.
+    fn hint(&self) -> &'static str {
+        match self {
+            Self::Invalid(..) => INVALID_MODE_HINT,
+            Self::NoProgram(..) => MISSING_PROGRAM_HINT,
+        }
+    }
+}
+
+/// `hook` does not start, for `failure`, so its [`PluginHook::lost`].
+fn startup_failure(hook: &PluginHook, failure: &Failure) -> String {
+    format!("{} {}, so {}", hook.event, failure.clause(), hook.lost)
 }
 
 /// `hook` may exit at startup: its mode `raw` is built by the shell.
@@ -484,19 +570,22 @@ fn possible_startup_failure(hook: &PluginHook, raw: &str, source: ModeSource) ->
 
 /// The startup outcome of the hooks that do not mine (SessionStart,
 /// UserPromptSubmit), by [`starts`]: entries for those that surely fail
-/// (`No`: `Config::load` rejects every run's mode, so they exit at startup),
-/// then entries for those that may fail (`Maybe`: no run is surely valid and
-/// one's mode is built by the shell). Each entry ends with its hook's
-/// [`PluginHook::lost`]. Miners are left to `hook_mining`, which reports
-/// both outcomes for them.
-fn startup_failures(wired: &WiredHooks, env: ModeEnv<'_>) -> (Vec<String>, Vec<String>) {
+/// (`No`: no run starts, for an invalid mode or a missing program), each with
+/// the hint that fixes it, then entries for those that may fail (`Maybe`: no
+/// run surely starts and one's mode is built by the shell). Each entry ends
+/// with its hook's [`PluginHook::lost`]. Miners are left to `hook_mining`,
+/// which reports both outcomes for them.
+fn startup_failures(
+    wired: &WiredHooks,
+    ctx: Context<'_>,
+) -> (Vec<(String, &'static str)>, Vec<String>) {
     let (mut fail, mut may_fail) = (Vec::new(), Vec::new());
     for (hook, commands) in wired {
         if hook.mines {
             continue;
         }
-        match starts(hook, commands, env) {
-            Starts::No(raw, source) => fail.push(startup_failure(hook, &raw, source)),
+        match starts(hook, commands, ctx) {
+            Starts::No(failure) => fail.push((startup_failure(hook, &failure), failure.hint())),
             Starts::Maybe(raw, source) => {
                 may_fail.push(possible_startup_failure(hook, &raw, source))
             }
@@ -506,26 +595,31 @@ fn startup_failures(wired: &WiredHooks, env: ModeEnv<'_>) -> (Vec<String>, Vec<S
     (fail, may_fail)
 }
 
+/// Push `hint` unless `hints` has it already.
+fn push_unique(hints: &mut Vec<&'static str>, hint: &'static str) {
+    if !hints.contains(&hint) {
+        hints.push(hint);
+    }
+}
+
 /// Whether any of an event's copies starts at all.
 #[derive(Debug, PartialEq, Eq)]
 enum Starts {
-    /// Some run of the hook has a valid mode.
+    /// Some run of the hook has a valid mode and a program that exists.
     Yes,
     /// No run surely starts, but one's mode is built by the shell: this raw
     /// value, from this source.
     Maybe(String, ModeSource),
-    /// Every run's mode is invalid; the first one's raw value and source.
-    No(String, ModeSource),
+    /// No run starts; why the first one does not.
+    No(Failure),
 }
 
 /// Whether `commands`, the copies of `hook`, start: [`Starts::Yes`] when
-/// any run of the hook has a valid mode, across commands and within one, so a
-/// dynamic or invalid run never hides a working one.
-fn starts(hook: &PluginHook, commands: &[String], env: ModeEnv<'_>) -> Starts {
-    let runs: Vec<RunMode> = commands
-        .iter()
-        .flat_map(|c| hook_modes(c, hook.name, env))
-        .collect();
+/// any run of the hook has a valid mode and a program that exists, across
+/// commands and within one, so a dynamic or failing run never hides a working
+/// one.
+fn starts(hook: &PluginHook, commands: &[String], ctx: Context<'_>) -> Starts {
+    let runs = runs(hook, commands, ctx);
     // No runs at all reads as the unset default, which starts.
     if runs.is_empty() || runs.iter().any(|r| r.mode.is_ok()) {
         return Starts::Yes;
@@ -534,11 +628,14 @@ fn starts(hook: &PluginHook, commands: &[String], env: ModeEnv<'_>) -> Starts {
         Err(ModeError::Unknown(raw)) => Some(Starts::Maybe(raw.clone(), r.source)),
         _ => None,
     });
-    let invalid = runs.iter().find_map(|r| match &r.mode {
-        Err(ModeError::Invalid(raw)) => Some(Starts::No(raw.clone(), r.source)),
+    let failed = runs.iter().find_map(|r| match &r.mode {
+        Err(ModeError::Invalid(raw)) => Some(Starts::No(Failure::Invalid(raw.clone(), r.source))),
+        Err(ModeError::NoProgram(path, problem)) => {
+            Some(Starts::No(Failure::NoProgram(path.clone(), *problem)))
+        }
         _ => None,
     });
-    unknown.or(invalid).unwrap_or(Starts::Yes)
+    unknown.or(failed).unwrap_or(Starts::Yes)
 }
 
 /// How settings.json's hand-wired copies of plugin hooks sit beside the
@@ -563,7 +660,7 @@ struct HandWired {
 /// a failing plugin copy never gets that hint, because removing it would turn
 /// the hook off. When every copy fails, `startup_failures` (or `hook_mining`,
 /// for a miner) names the effect.
-fn split_hand_wired(wired: &WiredHooks, hand_wired: &WiredHooks, env: ModeEnv<'_>) -> HandWired {
+fn split_hand_wired(wired: &WiredHooks, hand_wired: &WiredHooks, ctx: Context<'_>) -> HandWired {
     let mut out = HandWired {
         duplicated: Vec::new(),
         entries: Vec::new(),
@@ -574,40 +671,33 @@ fn split_hand_wired(wired: &WiredHooks, hand_wired: &WiredHooks, env: ModeEnv<'_
         let plugin_copy = wired.iter().find(|(h, _)| h.event == event).map(|(_, c)| c);
         // Never `None`: `wired` holds all of PLUGIN_HOOKS and `hand_wired`
         // only hooks from it. Doctor stays total, so no `expect`.
-        let plugin = plugin_copy.map_or(Starts::Yes, |c| starts(hook, c, env));
+        let plugin = plugin_copy.map_or(Starts::Yes, |c| starts(hook, c, ctx));
         // `plugin` is never `Starts::Maybe` (pinned by
         // `a_plugin_copy_never_has_a_dynamic_mode`), so the `_` arms below
         // stand for `Starts::Yes`.
-        let copy = starts(hook, commands, env);
-        let (entry, hints): (String, &[&'static str]) = match (plugin, copy) {
-            (Starts::No(raw, source), Starts::Yes) => (
+        let copy = starts(hook, commands, ctx);
+        let (entry, hints): (String, Vec<&'static str>) = match (plugin, copy) {
+            (Starts::No(failure), Starts::Yes) => (
                 format!(
-                    "the plugin's {event} fails to start: {} ({}), so only the hand-wired copy \
-                     runs",
-                    invalid_reason(&raw),
-                    source_label(source)
+                    "the plugin's {event} {}, so only the hand-wired copy runs",
+                    failure.clause()
                 ),
-                &[INVALID_MODE_HINT],
+                vec![failure.hint()],
             ),
-            (Starts::No(raw, source), Starts::Maybe(copy_raw, copy_source)) => (
+            (Starts::No(failure), Starts::Maybe(copy_raw, copy_source)) => (
                 format!(
-                    "the plugin's {event} fails to start: {} ({}), so only the hand-wired copy \
-                     may run: its mode cannot be determined statically \
-                     (IRONMEM_MCP_MODE={copy_raw}, {}), and if it fails too, {}",
-                    invalid_reason(&raw),
-                    source_label(source),
+                    "the plugin's {event} {}, so only the hand-wired copy may run: its mode \
+                     cannot be determined statically (IRONMEM_MCP_MODE={copy_raw}, {}), and if \
+                     it fails too, {}",
+                    failure.clause(),
                     source_label(copy_source),
                     hook.lost
                 ),
-                &[INVALID_MODE_HINT, DYNAMIC_MODE_HINT],
+                vec![failure.hint(), DYNAMIC_MODE_HINT],
             ),
-            (Starts::No(..), Starts::No(raw, source)) => (
-                format!(
-                    "the hand-wired {event} fails to start: {} ({})",
-                    invalid_reason(&raw),
-                    source_label(source)
-                ),
-                &[INVALID_MODE_HINT],
+            (Starts::No(..), Starts::No(failure)) => (
+                format!("the hand-wired {event} {}", failure.clause()),
+                vec![failure.hint()],
             ),
             (_, Starts::Yes) => {
                 out.duplicated.push(event);
@@ -620,20 +710,18 @@ fn split_hand_wired(wired: &WiredHooks, hand_wired: &WiredHooks, env: ModeEnv<'_
                      hand-wired copy may run too",
                     source_label(source)
                 ),
-                &[DUPLICATE_HINT],
+                vec![DUPLICATE_HINT],
             ),
-            (_, Starts::No(raw, source)) => (
+            (_, Starts::No(failure)) => (
                 format!(
-                    "the hand-wired {event} fails to start: {} ({}), so only the plugin's copy \
-                     runs",
-                    invalid_reason(&raw),
-                    source_label(source)
+                    "the hand-wired {event} {}, so only the plugin's copy runs",
+                    failure.clause()
                 ),
-                &[DUPLICATE_HINT],
+                vec![DUPLICATE_HINT],
             ),
         };
         out.entries.push(entry);
-        out.hints.extend_from_slice(hints);
+        out.hints.extend(hints);
     }
     out
 }
@@ -641,7 +729,7 @@ fn split_hand_wired(wired: &WiredHooks, hand_wired: &WiredHooks, env: ModeEnv<'_
 /// The plugin path's `hooks` check: the run-twice events from `hand_wired`,
 /// then its other entries, then `failures` (the startup failures). Hints
 /// follow that order, each given once.
-fn plugin_hooks_check(hand_wired: &HandWired, failures: &[String]) -> Check {
+fn plugin_hooks_check(hand_wired: &HandWired, failures: &[(String, &'static str)]) -> Check {
     let HandWired {
         duplicated,
         entries,
@@ -667,14 +755,13 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[String]) -> Check {
     problems.extend(entries.iter().cloned());
     hints.extend(entry_hints.iter().copied());
     if !failures.is_empty() {
-        problems.push(failures.join("; "));
-        hints.push(INVALID_MODE_HINT);
+        let texts: Vec<&str> = failures.iter().map(|(text, _)| text.as_str()).collect();
+        problems.push(texts.join("; "));
+        hints.extend(failures.iter().map(|(_, hint)| *hint));
     }
-    let mut unique: Vec<&str> = Vec::new();
+    let mut unique: Vec<&'static str> = Vec::new();
     for hint in hints {
-        if !unique.contains(&hint) {
-            unique.push(hint);
-        }
+        push_unique(&mut unique, hint);
     }
     Check::new(
         HOOKS_KEY,
@@ -689,7 +776,7 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[String]) -> Check {
 fn hooks_check(
     path: &Path,
     missing: &[&PluginHook],
-    failures: &[String],
+    failures: &[(String, &'static str)],
     may_fail: &[String],
 ) -> Check {
     if missing.is_empty() && failures.is_empty() && may_fail.is_empty() {
@@ -714,16 +801,19 @@ fn hooks_check(
             path.display(),
             effects.join("; ")
         ));
-        hints.push(INSTALL_HINT);
+        push_unique(&mut hints, INSTALL_HINT);
     }
     if !failures.is_empty() {
-        problems.push(failures.join("; "));
-        hints.push(INVALID_MODE_HINT);
+        let texts: Vec<&str> = failures.iter().map(|(text, _)| text.as_str()).collect();
+        problems.push(texts.join("; "));
+        for (_, hint) in failures {
+            push_unique(&mut hints, hint);
+        }
     }
     // Warn, as hook_mining does for a mode it cannot determine.
     if !may_fail.is_empty() {
         problems.push(may_fail.join("; "));
-        hints.push(DYNAMIC_MODE_HINT);
+        push_unique(&mut hints, DYNAMIC_MODE_HINT);
     }
     Check::new(
         HOOKS_KEY,
@@ -751,6 +841,8 @@ fn no_miner_check() -> Check {
 enum NoMineCause {
     /// The mode is invalid, so the hook exits at startup.
     Invalid,
+    /// The program path is not a runnable file, so the hook does not start.
+    NoProgram,
     /// The mode is built by the shell, so doctor can't judge it.
     Dynamic,
     /// A plugin hook whose wrapper default is overridden by settings.json
@@ -787,6 +879,7 @@ impl NoMineCause {
     fn hint(&self, events: &[&str]) -> String {
         match self {
             Self::Invalid => INVALID_MODE_HINT.to_owned(),
+            Self::NoProgram => MISSING_PROGRAM_HINT.to_owned(),
             Self::Dynamic => DYNAMIC_MODE_HINT.to_owned(),
             Self::PluginOverride => PLUGIN_OVERRIDE_HINT.to_owned(),
             Self::Inline(raw) => {
@@ -868,7 +961,7 @@ fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> Stri
 /// entry per distinct [`NoMineCause`], in the order of the entries, joined
 /// with [`HINT_JOINER`]. `plugin` says the miners run on the plugin path (the
 /// plugin's hooks plus any hand-wired copies).
-fn mining_check(wired: &WiredHooks, env: ModeEnv<'_>, plugin: bool) -> Check {
+fn mining_check(wired: &WiredHooks, ctx: Context<'_>, plugin: bool) -> Check {
     let miners: Vec<&(&'static PluginHook, Vec<String>)> =
         wired.iter().filter(|(hook, _)| hook.mines).collect();
     if miners.is_empty() {
@@ -879,7 +972,7 @@ fn mining_check(wired: &WiredHooks, env: ModeEnv<'_>, plugin: bool) -> Check {
     let mut causes: Vec<CauseGroup> = Vec::new();
     for (hook, commands) in miners {
         let event = hook.event;
-        let run = event_mode(hook, commands, env);
+        let run = event_mode(hook, commands, ctx);
         let label = source_label(run.source);
         let mines = can_mine(&run);
         lines.push(match run.mode {
@@ -912,6 +1005,14 @@ fn mining_check(wired: &WiredHooks, env: ModeEnv<'_>, plugin: bool) -> Check {
                     invalid_reason(&raw)
                 )
             }
+            Err(ModeError::NoProgram(path, problem)) => {
+                not_mined.push(event);
+                add_cause(&mut causes, NoMineCause::NoProgram, event);
+                format!(
+                    "{event}: wired to {path}, which {} -> does not run",
+                    problem.describe()
+                )
+            }
             Err(ModeError::Unknown(raw)) => {
                 unknown.push(event);
                 add_cause(&mut causes, NoMineCause::Dynamic, event);
@@ -941,8 +1042,23 @@ fn mining_check(wired: &WiredHooks, env: ModeEnv<'_>, plugin: bool) -> Check {
 mod tests {
     use super::*;
 
+    /// Create an executable file at `path`, with its parent directories.
+    fn make_executable(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+
+    /// A home whose `~/.claude/settings.json` holds `settings` and whose
+    /// `~/.ironrace/bin/ironmem` is an executable file, so the `~/` commands
+    /// below name a program that exists.
     fn home_with_settings(settings: &str) -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
+        make_executable(&dir.path().join(".ironrace/bin/ironmem"));
         std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
         std::fs::write(dir.path().join(".claude").join("settings.json"), settings).unwrap();
         dir
@@ -1133,9 +1249,13 @@ mod tests {
     /// shell would split: the path single-quoted, an embedded `'` as `'\''`.
     #[test]
     fn single_quoted_install_paths_are_wired_and_their_mode_is_read() {
+        let bins = tempfile::tempdir().unwrap();
+        let root = bins.path().display();
+        make_executable(&bins.path().join("Jo Smith/.ironrace/bin/ironmem"));
+        make_executable(&bins.path().join("Jo Smith/it's here/bin/ironmem"));
         for program in [
-            "'/Users/Jo Smith/.ironrace/bin/ironmem'",
-            r"'/Users/Jo Smith/it'\''s here/bin/ironmem'",
+            format!("'{root}/Jo Smith/.ironrace/bin/ironmem'"),
+            format!(r"'{root}/Jo Smith/it'\''s here/bin/ironmem'"),
         ] {
             let cmds: Vec<(&str, String)> = PLUGIN_HOOKS
                 .iter()
@@ -1410,6 +1530,141 @@ mod tests {
         let home = home_with_settings(r#"{"disableAllHooks": true,"#);
         let c = claude_hook_checks(Some(home.path()), None);
         assert!(c[0].summary.contains("not valid JSON"), "{}", c[0].summary);
+    }
+
+    /// `program` as a hook command's first word for `hook`, with `prefix`.
+    fn wired_to(prefix: &str, program: &str, hook: &str) -> String {
+        format!("{prefix}{program} hook {hook} --harness claude-code")
+    }
+
+    #[test]
+    fn a_miner_wired_to_a_program_that_does_not_exist_is_not_mined() {
+        let gone = tempfile::tempdir().unwrap().path().join("old/bin/ironmem");
+        let gone = gone.display().to_string();
+        let stop = wired_to("IRONMEM_MCP_MODE=trusted ", &gone, "stop");
+        let home = home_with_settings(&all_four_with_command("Stop", &stop));
+        let c = claude_hook_checks(Some(home.path()), None);
+        // Stop's startup belongs to hook_mining, as for an invalid mode.
+        assert_eq!(c[0].summary, all_four_wired(home.path()));
+        assert_eq!(c[1].status, CheckStatus::Warn, "{}", c[1].summary);
+        assert_eq!(
+            c[1].summary,
+            format!(
+                "no wired hook mines — Stop: wired to {gone}, which does not exist -> does not \
+                 run; PreCompact: read-only (IRONMEM_MCP_MODE unset, so the default) -> not mined"
+            )
+        );
+        assert_eq!(
+            c[1].hint.as_deref(),
+            Some(
+                format!(
+                    "{MISSING_PROGRAM_HINT} | {}",
+                    read_only_text("PreCompact command")
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn a_tilde_program_is_looked_up_under_home() {
+        let stop = wired_to("IRONMEM_MCP_MODE=trusted ", "~/gone/ironmem", "stop");
+        let c = mining_of(&settings_with(&[("Stop", stop.as_str())]), None);
+        assert_eq!(
+            c.summary,
+            "no wired hook mines — Stop: wired to ~/gone/ironmem, which does not exist -> does \
+             not run"
+        );
+        assert_eq!(c.hint.as_deref(), Some(MISSING_PROGRAM_HINT));
+        // ~/.ironrace/bin/ironmem exists under the test home, so it mines.
+        let stop = wired_to(
+            "IRONMEM_MCP_MODE=trusted ",
+            "~/.ironrace/bin/ironmem",
+            "stop",
+        );
+        let c = mining_of(&settings_with(&[("Stop", stop.as_str())]), None);
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+    }
+
+    #[test]
+    fn a_non_miner_wired_to_a_missing_program_fails_to_start_on_hooks() {
+        let gone = tempfile::tempdir().unwrap().path().join("old/bin/ironmem");
+        let gone = gone.display().to_string();
+        let cmd = wired_to("", &gone, "session-start");
+        let home = home_with_settings(&all_four_with_command("SessionStart", &cmd));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Warn, "{}", c[0].summary);
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: SessionStart is wired to {gone}, which does not exist, so no \
+                 memory context is loaded at session start"
+            )
+        );
+        assert_eq!(c[0].hint.as_deref(), Some(MISSING_PROGRAM_HINT));
+    }
+
+    #[test]
+    fn a_program_that_is_not_an_executable_file_does_not_run() {
+        let bins = tempfile::tempdir().unwrap();
+        // A directory named ironmem.
+        let dir = bins.path().join("dir/ironmem");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cases = vec![dir];
+        #[cfg(unix)]
+        {
+            // A file with no execute bit.
+            let plain = bins.path().join("plain/ironmem");
+            std::fs::create_dir_all(plain.parent().unwrap()).unwrap();
+            std::fs::write(&plain, "").unwrap();
+            cases.push(plain);
+        }
+        for program in cases {
+            let program = program.display().to_string();
+            let stop = wired_to("IRONMEM_MCP_MODE=trusted ", &program, "stop");
+            let c = mining_of(&settings_with(&[("Stop", stop.as_str())]), None);
+            assert_eq!(
+                c.summary,
+                format!(
+                    "no wired hook mines — Stop: wired to {program}, which is not an executable \
+                     file -> does not run"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn a_program_found_on_path_or_built_by_the_shell_is_not_checked() {
+        for program in [
+            "ironmem",
+            "$HOME/gone/ironmem",
+            "/gone*/ironmem",
+            // Quoted, `~` is not expanded: a relative path, not checked.
+            "'~/gone/ironmem'",
+            "~\"/gone/ironmem\"",
+        ] {
+            let stop = wired_to("IRONMEM_MCP_MODE=trusted ", program, "stop");
+            let c = mining_of(&settings_with(&[("Stop", stop.as_str())]), None);
+            assert_eq!(c.status, CheckStatus::Ok, "{program}: {}", c.summary);
+            assert!(!c.summary.contains("does not"), "{program}: {}", c.summary);
+        }
+    }
+
+    #[test]
+    fn a_hand_wired_copy_with_a_missing_program_leaves_only_the_plugin_copy() {
+        let gone = tempfile::tempdir().unwrap().path().join("old/bin/ironmem");
+        let gone = gone.display().to_string();
+        let cmd = wired_to("", &gone, "user-prompt-submit");
+        let home = home_with_settings(&plugin_and_ups(&cmd));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(
+            c[0].summary,
+            format!(
+                "Claude Code hooks: the hand-wired UserPromptSubmit is wired to {gone}, which \
+                 does not exist, so only the plugin's copy runs"
+            )
+        );
+        assert_eq!(c[0].hint.as_deref(), Some(DUPLICATE_HINT));
     }
 
     const PLUGIN_ON: &str = r#"{"enabledPlugins": {"ironmem@ironrace": true}"#;
@@ -1733,6 +1988,15 @@ mod tests {
             "no wired hook mines — PreCompact: read-only (IRONMEM_MCP_MODE unset, so the \
              default) -> not mined"
         );
+    }
+
+    /// All four bare hooks, with `event`'s command replaced by `command`.
+    fn all_four_with_command(event: &str, command: &str) -> String {
+        let cmds: Vec<(&str, &str)> = ALL_FOUR_BARE
+            .iter()
+            .map(|(e, c)| (*e, if *e == event { command } else { *c }))
+            .collect();
+        settings_with(&cmds)
     }
 
     #[test]
@@ -2465,30 +2729,40 @@ mod tests {
         for hook in &PLUGIN_HOOKS {
             let (event, name) = (hook.event, hook.name);
             let plugin = [format!("{PLUGIN_HOOK_COMMAND} {name}")];
-            let settings = ModeEnv {
-                settings: Some("$M"),
-                process: None,
+            let home = tempfile::tempdir().unwrap();
+            let settings = Context {
+                env: ModeEnv {
+                    settings: Some("$M"),
+                    process: None,
+                },
+                home: home.path(),
             };
             assert_eq!(
                 starts(hook, &plugin, settings),
-                Starts::No("$M".to_owned(), ModeSource::SettingsEnv),
+                Starts::No(Failure::Invalid("$M".to_owned(), ModeSource::SettingsEnv)),
                 "{event}"
             );
             // A defensive case: the CLI's `Config::load` rejects this value
             // in doctor's own environment before doctor runs.
-            let shell = ModeEnv {
-                settings: None,
-                process: Some("$(cat /m)"),
+            let shell = Context {
+                env: ModeEnv {
+                    settings: None,
+                    process: Some("$(cat /m)"),
+                },
+                home: home.path(),
             };
             assert_eq!(
                 starts(hook, &plugin, shell),
-                Starts::No("$(cat /m)".to_owned(), ModeSource::Environment),
+                Starts::No(Failure::Invalid(
+                    "$(cat /m)".to_owned(),
+                    ModeSource::Environment
+                )),
                 "{event}"
             );
         }
     }
 
-    const UPS: &str = "/x/ironmem hook user-prompt-submit";
+    const UPS: &str = "~/.ironrace/bin/ironmem hook user-prompt-submit";
 
     /// One command that runs UserPromptSubmit twice, as `first; second`
     /// and as `second; first`.
@@ -2779,11 +3053,11 @@ mod tests {
             &[
                 (
                     "SessionStart",
-                    "IRONMEM_MCP_MODE=trusted /x/ironmem hook session-start",
+                    "IRONMEM_MCP_MODE=trusted ~/.ironrace/bin/ironmem hook session-start",
                 ),
                 (
                     "UserPromptSubmit",
-                    "IRONMEM_MCP_MODE=trusted /x/ironmem hook user-prompt-submit",
+                    "IRONMEM_MCP_MODE=trusted ~/.ironrace/bin/ironmem hook user-prompt-submit",
                 ),
             ],
         ));

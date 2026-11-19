@@ -4,7 +4,8 @@
 //! `ironmem hook <name>`, and in which `IRONMEM_MCP_MODE` does it run. It is
 //! a simple-command reader, not a shell; the limits are documented on
 //! [`runs_hook`] and [`hook_modes`]. Diagnose-only: it parses strings and never
-//! runs anything or touches the filesystem.
+//! runs anything or touches the filesystem; it names the literal program path
+//! a run starts ([`RunMode::program`]) for `hooks.rs` to check.
 
 use crate::config::McpAccessMode;
 
@@ -42,13 +43,36 @@ pub(super) enum ModeSource {
     Default,
 }
 
-/// Why a hook's mode could not be turned into a [`McpAccessMode`].
+/// Why a run of a hook has no usable [`McpAccessMode`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum ModeError {
     /// `Config::load` rejects this raw value, so the hook exits at startup.
     Invalid(String),
     /// The value is built by the shell (`$VAR`, `$(..)`), so doctor can't know it.
     Unknown(String),
+    /// The run's program is this literal path, which is not a runnable file,
+    /// so the shell cannot start it at all. Set by `hooks.rs`, which checks
+    /// [`RunMode::program`] on the file system.
+    NoProgram(String, ProgramProblem),
+}
+
+/// What is wrong with a hook's literal program path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ProgramProblem {
+    /// Nothing exists at the path.
+    Missing,
+    /// Something exists there, but it is not a file with an execute bit.
+    NotExecutable,
+}
+
+impl ProgramProblem {
+    /// The clause after "which", e.g. "which does not exist".
+    pub(super) fn describe(self) -> &'static str {
+        match self {
+            Self::Missing => "does not exist",
+            Self::NotExecutable => "is not an executable file",
+        }
+    }
 }
 
 /// The mode one run of a hook gets, where that came from, and the raw
@@ -59,6 +83,11 @@ pub(super) struct RunMode {
     pub(super) mode: Result<McpAccessMode, ModeError>,
     pub(super) source: ModeSource,
     pub(super) raw: Option<String>,
+    /// The program word as written, when it is a literal absolute path or
+    /// begins with an unquoted `~/` and nothing in it is built by the shell
+    /// (no `$`, backtick, glob or brace). `None` for a PATH lookup (`ironmem`)
+    /// and for anything doctor cannot know; those are not checked.
+    pub(super) program: Option<String>,
 }
 
 impl RunMode {
@@ -68,6 +97,7 @@ impl RunMode {
             mode: Ok(mode),
             source,
             raw: None,
+            program: None,
         }
     }
 }
@@ -346,6 +376,20 @@ struct Invocation {
     wrapper: bool,
     /// The mode set for this run by an assignment word or an earlier `export`.
     mode: Option<ModeValue>,
+    /// See [`RunMode::program`].
+    program: Option<String>,
+}
+
+/// The program word's literal path, if doctor can check it: see
+/// [`RunMode::program`].
+fn literal_path(word: &Word) -> Option<String> {
+    let text = word.text.as_str();
+    if word.dynamic || text.contains(['*', '?', '[', '{']) {
+        return None;
+    }
+    // The shell expands `~/` only when neither character is quoted.
+    let tilde = text.starts_with("~/") && !matches!(word.first_quoted, Some(0 | 1));
+    (text.starts_with('/') || tilde).then(|| text.to_owned())
 }
 
 /// The hook name after `hook`, skipping `--harness <v>` / `--harness=<v>`.
@@ -400,10 +444,10 @@ fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
                 take_assignments(&mut rest, &mut inline, true);
             }
         }
-        let Some((program, args)) = rest.split_first() else {
+        let Some((program_word, args)) = rest.split_first() else {
             continue;
         };
-        let program = basename(&program.text);
+        let program = basename(&program_word.text);
         if program == "export" {
             if let Some(value) = args.iter().find_map(|w| mode_assignment(w, false)) {
                 exported = Some(value);
@@ -416,6 +460,7 @@ fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
                 hook: hook.to_owned(),
                 wrapper,
                 mode: mode.clone(),
+                program: literal_path(program_word),
             });
         };
         match program {
@@ -468,10 +513,13 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
             _ => None,
         };
         if let Some(hook) = hook {
+            // The program is the shell, found on PATH; the script it runs
+            // is not checked.
             found.push(Invocation {
                 hook: hook.to_owned(),
                 wrapper: true,
                 mode,
+                program: None,
             });
         }
         return;
@@ -535,21 +583,24 @@ pub(super) fn hook_modes(command: &str, hook: &str, env: ModeEnv<'_>) -> Vec<Run
     invocations(command, None)
         .iter()
         .filter(|i| i.hook == hook)
-        .map(|i| invocation_mode(i, env))
+        .map(|i| RunMode {
+            program: i.program.clone(),
+            ..invocation_mode(i, env)
+        })
         .collect()
 }
 
 /// How good a run is for mining, lowest first: can mine (its mode
 /// [`McpAccessMode::allows_writes`], the hook's own gate) without doctor's
 /// shell, can mine via the shell, unknown (it may mine), cannot mine, then
-/// invalid (the hook exits at startup).
+/// does not start (an invalid mode, or a program that is not there).
 fn rank(run: &RunMode) -> u8 {
     match (&run.mode, run.source) {
         (Ok(mode), source) if mode.allows_writes() && source != ModeSource::Environment => 0,
         (Ok(mode), _) if mode.allows_writes() => 1,
         (Err(ModeError::Unknown(_)), _) => 2,
         (Ok(_), _) => 3,
-        (Err(ModeError::Invalid(_)), _) => 4,
+        (Err(ModeError::Invalid(_) | ModeError::NoProgram(..)), _) => 4,
     }
 }
 
@@ -579,6 +630,7 @@ fn invocation_mode(run: &Invocation, env: ModeEnv<'_>) -> RunMode {
         mode,
         source,
         raw: Some(raw.to_owned()),
+        program: None,
     };
     if dynamic {
         return read(Err(ModeError::Unknown(raw.to_owned())));

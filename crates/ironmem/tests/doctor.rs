@@ -251,21 +251,45 @@ fn hooks_doc(commands: &[(&str, &str)]) -> serde_json::Value {
     serde_json::json!({ "hooks": hooks })
 }
 
-const BARE_HOOKS: [(&str, &str); 4] = [
-    (
-        "SessionStart",
-        "/x/ironmem hook session-start --harness claude-code",
-    ),
-    (
-        "UserPromptSubmit",
-        "/x/ironmem hook user-prompt-submit --harness claude-code",
-    ),
-    ("Stop", "/x/ironmem hook stop --harness claude-code"),
-    (
-        "PreCompact",
-        "/x/ironmem hook precompact --harness claude-code",
-    ),
+/// The Claude Code event and `ironmem hook` name of each plugin hook.
+const HOOK_EVENTS: [(&str, &str); 4] = [
+    ("SessionStart", "session-start"),
+    ("UserPromptSubmit", "user-prompt-submit"),
+    ("Stop", "stop"),
+    ("PreCompact", "precompact"),
 ];
+
+/// Create an executable stand-in for the installed binary under `dir`, so
+/// doctor finds the program the hook commands name; return its path.
+fn fake_program(dir: &Path) -> String {
+    let path = dir.join("bin").join("ironmem");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "#!/bin/sh\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    path.display().to_string()
+}
+
+/// The four bare hook commands an install writes, each running `program`.
+fn bare_hooks(program: &str) -> Vec<(&'static str, String)> {
+    HOOK_EVENTS
+        .iter()
+        .map(|(event, name)| {
+            (
+                *event,
+                format!("{program} hook {name} --harness claude-code"),
+            )
+        })
+        .collect()
+}
+
+/// `hooks` as the `(event, command)` pairs [`hooks_doc`] takes.
+fn refs<'a>(hooks: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    hooks.iter().map(|(e, c)| (*e, c.as_str())).collect()
+}
 
 /// Insert one mined drawer filed at `filed_at` (UTC) into an initialized store.
 /// `'mine'` copies `crate::db::drawers::MINED_ADDED_BY`, which is `pub(crate)`.
@@ -287,7 +311,8 @@ fn non_plugin_read_only_hooks_say_plainly_that_nothing_is_mined() {
     std::fs::create_dir_all(&home).unwrap();
     init_db(&home, &db_path);
     insert_mined_row(&db_path, "2026-01-01 00:00:00");
-    write_claude_settings(&home, hooks_doc(&BARE_HOOKS));
+    let hooks = bare_hooks(&fake_program(temp.path()));
+    write_claude_settings(&home, hooks_doc(&refs(&hooks)));
 
     let out = doctor_command(&home, &db_path)
         .env("IRONMEM_EMBED_MODE", "noop")
@@ -322,10 +347,10 @@ fn missing_prompt_hook_is_named() {
     let db_path = temp.path().join("memory.sqlite3");
     std::fs::create_dir_all(&home).unwrap();
     init_db(&home, &db_path);
-    write_claude_settings(
-        &home,
-        hooks_doc(&[BARE_HOOKS[0], BARE_HOOKS[2], BARE_HOOKS[3]]),
-    );
+    let hooks = bare_hooks(&fake_program(temp.path()));
+    let mut wired = refs(&hooks);
+    wired.remove(1);
+    write_claude_settings(&home, hooks_doc(&wired));
 
     let out = doctor_command(&home, &db_path)
         .env("IRONMEM_EMBED_MODE", "noop")
@@ -369,12 +394,11 @@ fn plugin_install_and_trusted_hooks_report_mining_on() {
         "{stdout}"
     );
 
-    let trusted: Vec<(&str, String)> = BARE_HOOKS
-        .iter()
-        .map(|(e, c)| (*e, format!("IRONMEM_MCP_MODE=trusted {c}")))
+    let trusted: Vec<(&str, String)> = bare_hooks(&fake_program(temp.path()))
+        .into_iter()
+        .map(|(e, c)| (e, format!("IRONMEM_MCP_MODE=trusted {c}")))
         .collect();
-    let refs: Vec<(&str, &str)> = trusted.iter().map(|(e, c)| (*e, c.as_str())).collect();
-    write_claude_settings(&home, hooks_doc(&refs));
+    write_claude_settings(&home, hooks_doc(&refs(&trusted)));
     let out = doctor_command(&home, &db_path)
         .env("IRONMEM_EMBED_MODE", "noop")
         .env_remove("IRONMEM_MCP_MODE")
@@ -420,4 +444,44 @@ fn an_invalid_mcp_mode_in_the_environment_is_a_config_error_with_no_report() {
             "{value:?}"
         );
     }
+}
+
+#[test]
+fn a_hook_wired_to_a_program_that_does_not_exist_is_named_and_not_mined() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    init_db(&home, &db_path);
+    // Every hook runs trusted; Stop points at a binary that was removed.
+    let gone = temp.path().join("old").join("bin").join("ironmem");
+    let gone = gone.display().to_string();
+    let mut hooks: Vec<(&str, String)> = bare_hooks(&fake_program(temp.path()))
+        .into_iter()
+        .map(|(e, c)| (e, format!("IRONMEM_MCP_MODE=trusted {c}")))
+        .collect();
+    hooks[2].1 = format!("IRONMEM_MCP_MODE=trusted {gone} hook stop --harness claude-code");
+    write_claude_settings(&home, hooks_doc(&refs(&hooks)));
+
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env_remove("IRONMEM_MCP_MODE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "warnings must not fail doctor: {out:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(&format!(
+            "PreCompact is mined; Stop is not — Stop: wired to {gone}, which does not exist -> \
+             does not run; PreCompact: trusted (set in the hook command) -> mined"
+        )),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("correct the program path in that settings.json entry"),
+        "{stdout}"
+    );
 }
