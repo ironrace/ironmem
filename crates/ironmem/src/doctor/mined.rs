@@ -1,9 +1,13 @@
 //! The `mined_rows` doctor check (#377): how old the newest mined drawer is.
 //!
 //! MCP writes keep a store looking alive while hook mining has stopped, so the
-//! age of the newest `added_by = 'mine'` row (a chunk of a workspace file,
-//! written by a trusted hook, the launcher's warm-up or `ironmem mine`) is the
-//! direct evidence of whether files are still being mined. Mining stores only
+//! age of the newest `added_by = 'mine'` row (a chunk of a workspace file) is
+//! the direct evidence of whether files are still being mined. Those rows are
+//! written by a trusted Stop or PreCompact hook (every run), by a workspace's
+//! first mine (a trusted SessionStart hook, or a trusted MCP server or daemon
+//! start with `IRONMEM_WORKSPACE_ROOT` set, as the plugin wrapper sets both;
+//! see `bootstrap::ensure_bootstrapped`), by the `ironmem claude` / `codex`
+//! launchers' warm-up, and by `ironmem mine`. Mining stores only
 //! files whose content changed, so an old row means either that mining stopped
 //! or that no mined workspace changed; this check cannot tell which. It is also
 //! the backstop for the `hook_mining` check, which infers a hook's mode from
@@ -72,7 +76,10 @@ fn mined_rows_check(newest: Result<Option<String>, MemoryError>, now: NaiveDateT
                 "no mined rows yet: no workspace file has been mined into this store",
             )
             .with_hint(format!(
-                "mining runs in the {} hooks; see the hook_mining line",
+                "trusted {} hooks mine changed workspace files on every run (see the \
+                 hook_mining line); ironmem mine <dir> and the ironmem claude and ironmem codex \
+                 launchers mine too, and a trusted SessionStart hook or a trusted MCP server \
+                 start with IRONMEM_WORKSPACE_ROOT set mines a workspace the first time",
                 miner_events(" and ")
             ))
         }
@@ -185,6 +192,49 @@ mod tests {
         assert_eq!(
             c.summary,
             "no mined rows yet: no workspace file has been mined into this store"
+        );
+    }
+
+    #[test]
+    fn no_mined_rows_hint_names_every_writer() {
+        let c = mined_rows_check(Ok(None), at("2026-11-14 12:00:00"));
+        assert_eq!(
+            c.hint.as_deref(),
+            Some(
+                "trusted Stop and PreCompact hooks mine changed workspace files on every run \
+                 (see the hook_mining line); ironmem mine <dir> and the ironmem claude and \
+                 ironmem codex launchers mine too, and a trusted SessionStart hook or a trusted \
+                 MCP server start with IRONMEM_WORKSPACE_ROOT set mines a workspace the first \
+                 time"
+            )
+        );
+    }
+
+    #[test]
+    fn a_row_written_by_the_real_insert_path_reads_as_fresh() {
+        // Pins FILED_AT_FORMAT to the schema's own `filed_at` default.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("memory.sqlite3");
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        db.insert_drawer(
+            &"a".repeat(32),
+            "mined chunk",
+            &vec![0.1; ironrace_embed::embedder::EMBED_DIM],
+            "w",
+            "r",
+            "src/lib.rs",
+            crate::db::drawers::MINED_ADDED_BY,
+        )
+        .unwrap();
+        drop(db);
+        let c = check_mined_rows(&path, true, chrono::Utc::now().naive_utc());
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+        assert!(
+            c.summary
+                .starts_with("newest mined row is under an hour old ("),
+            "{}",
+            c.summary
         );
     }
 

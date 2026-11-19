@@ -31,8 +31,10 @@ pub(super) struct ModeEnv<'a> {
 pub(super) enum ModeSource {
     /// `IRONMEM_MCP_MODE=...` in the hook command itself.
     Inline,
-    /// `env.IRONMEM_MCP_MODE` in settings.json. UNVERIFIED that Claude Code
-    /// passes this block to hook processes; `mined_rows` is the backstop.
+    /// `env.IRONMEM_MCP_MODE` in settings.json. Claude Code's docs say it
+    /// writes each `env` entry into its process environment, replacing the
+    /// value inherited from the shell, and that a hook process inherits that
+    /// environment; so this beats [`Self::Environment`].
     SettingsEnv,
     /// `IRONMEM_MCP_MODE` in doctor's own environment, used as a stand-in
     /// for the environment Claude Code passes to its hooks.
@@ -545,7 +547,12 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
 /// `$(..)` bodies are not read; aliases and functions are unknown; other
 /// options that take an argument (`env -S`, `bash --rcfile F`) are not
 /// modelled; `env -i` or `env -u IRONMEM_MCP_MODE` clearing an inherited mode
-/// is not modelled.
+/// is not modelled. The other way round, a hook that does run reads as
+/// missing when it sits behind `if ...; then`, `{ ...; }`, `timeout 5`,
+/// `time`, `nice`, `command -p` or any wrapper other than `env`, `exec`,
+/// `command` and `nohup`: the first word is then not a program doctor knows.
+/// scripts/install-ironmem.sh matches such commands as already wired, so
+/// doctor's missing-hook hint says what to do then.
 pub(super) fn runs_hook(command: &str, hook: &str) -> bool {
     invocations(command, None).iter().any(|i| i.hook == hook)
 }
@@ -1004,6 +1011,20 @@ mod tests {
                 (Ok(McpAccessMode::Trusted), ModeSource::Inline),
                 "{cmd}"
             );
+        }
+    }
+
+    #[test]
+    fn a_hook_behind_control_flow_or_another_wrapper_is_not_recognised() {
+        // Documented limit (see `runs_hook`): these run the hook, but the
+        // first word is not a program doctor knows, so they read as missing.
+        for cmd in [
+            "if true; then ironmem hook stop; fi",
+            "{ ironmem hook stop; }",
+            "timeout 5 ironmem hook stop",
+            "command -p ironmem hook stop",
+        ] {
+            assert!(!runs_hook(cmd, "stop"), "{cmd}");
         }
     }
 

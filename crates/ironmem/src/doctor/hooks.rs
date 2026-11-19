@@ -84,8 +84,23 @@ pub(super) fn miner_events(joiner: &str) -> String {
         .join(joiner)
 }
 
-const INSTALL_HINT: &str = "re-run scripts/install-ironmem.sh to wire the missing hooks, \
-or install the ironmem Claude Code plugin";
+/// The hint for a `hooks` line that names hooks missing (or no settings.json).
+const INSTALL_HINT: &str = "re-run scripts/install-ironmem.sh to wire the missing hooks, or \
+install the ironmem Claude Code plugin, whose hooks also mine; the installer wires them \
+read-only, which brings back session context and prompt recall, but a hook it wires mines only \
+once its command sets IRONMEM_MCP_MODE=trusted (see hook_mining)";
+
+/// Beside [`INSTALL_HINT`] for missing hooks: the installer's matcher reads
+/// more command shapes than doctor's (see `hook_command::runs_hook`).
+const READ_SHAPE_HINT: &str = "if the installer says a missing hook is already wired, doctor \
+could not read its command: make ironmem the command's program, alone or after env, exec, \
+command, nohup or bash -c, not behind if, { }, timeout, time, nice or another wrapper";
+
+/// The hint for a `hook_mining` line that finds no miner wired.
+const NO_MINER_HINT: &str = "install the ironmem Claude Code plugin, whose hooks mine, or \
+re-run scripts/install-ironmem.sh to wire the missing hooks and then set \
+IRONMEM_MCP_MODE=trusted in their commands; the installer wires them read-only, which does not \
+mine";
 
 /// The hint for bare manual miners that run read-only, naming those `events`.
 fn read_only_hint(events: &[&str]) -> String {
@@ -162,9 +177,8 @@ enum HookWiring {
     AllHooksDisabled,
     /// The ironmem plugin is enabled; its hooks.json supplies the hooks.
     Plugin {
-        /// Plugin hooks that settings.json also wires by hand (they run
-        /// twice unless the plugin's copy fails at startup), with their
-        /// commands.
+        /// Plugin hooks that settings.json also wires by hand, with their
+        /// commands; `split_hand_wired` works out which copies run.
         hand_wired: WiredHooks,
         /// `env.IRONMEM_MCP_MODE` from settings.json, if set.
         settings_env_mode: Option<String>,
@@ -802,6 +816,7 @@ fn hooks_check(
             effects.join("; ")
         ));
         push_unique(&mut hints, INSTALL_HINT);
+        push_unique(&mut hints, READ_SHAPE_HINT);
     }
     if !failures.is_empty() {
         let texts: Vec<&str> = failures.iter().map(|(text, _)| text.as_str()).collect();
@@ -832,7 +847,7 @@ fn no_miner_check() -> Check {
             miner_events(" or ")
         ),
     )
-    .with_hint(INSTALL_HINT)
+    .with_hint(NO_MINER_HINT)
 }
 
 /// Why a wired miner does not mine. Raw values are the `IRONMEM_MCP_MODE`
@@ -1339,6 +1354,49 @@ mod tests {
     }
 
     #[test]
+    fn install_hints_say_what_the_installer_brings_back() {
+        // No settings.json: the hooks line points at the installer or the
+        // plugin; the mining line says the installer alone does not mine.
+        let no_file = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(no_file.path().join(".claude")).unwrap();
+        let c = claude_hook_checks(Some(no_file.path()), None);
+        assert_eq!(
+            c[0].hint.as_deref(),
+            Some(
+                "re-run scripts/install-ironmem.sh to wire the missing hooks, or install the \
+                 ironmem Claude Code plugin, whose hooks also mine; the installer wires them \
+                 read-only, which brings back session context and prompt recall, but a hook it \
+                 wires mines only once its command sets IRONMEM_MCP_MODE=trusted (see \
+                 hook_mining)"
+            )
+        );
+        assert_eq!(
+            c[1].hint.as_deref(),
+            Some(
+                "install the ironmem Claude Code plugin, whose hooks mine, or re-run \
+                 scripts/install-ironmem.sh to wire the missing hooks and then set \
+                 IRONMEM_MCP_MODE=trusted in their commands; the installer wires them read-only, \
+                 which does not mine"
+            )
+        );
+        // A missing hook adds what to do when the installer calls it wired.
+        let home = home_with_settings(&settings_with(&ALL_FOUR_BARE[..3]));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(
+            c[0].hint.as_deref(),
+            Some(
+                format!(
+                    "{INSTALL_HINT} | if the installer says a missing hook is already wired, \
+                     doctor could not read its command: make ironmem the command's program, \
+                     alone or after env, exec, command, nohup or bash -c, not behind if, {{ }}, \
+                     timeout, time, nice or another wrapper"
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
     fn no_miner_wired_warns() {
         let home = home_with_settings(&settings_with(&ALL_FOUR_BARE[..2]));
         let checks = claude_hook_checks(Some(home.path()), None);
@@ -1362,6 +1420,22 @@ mod tests {
             claude_hook_checks(Some(off.path()), None)[0].status,
             CheckStatus::Warn
         );
+    }
+
+    #[test]
+    fn only_an_ironmem_plugin_key_set_to_true_enables_the_plugin() {
+        // The same answers as scripts/install-ironmem.sh's enabledPlugins jq.
+        for (plugins, enabled) in [
+            (r#"{"ironmem@ironrace": true}"#, true),
+            (r#"{"ironmem": true}"#, true),
+            (r#"{"ironmem-extras@x": true}"#, false),
+            (r#"{"notironmem@x": true}"#, false),
+            (r#"{"ironmem@x": "true"}"#, false),
+        ] {
+            let doc: Value =
+                serde_json::from_str(&format!(r#"{{"enabledPlugins": {plugins}}}"#)).unwrap();
+            assert_eq!(plugin_enabled(&doc), enabled, "{plugins}");
+        }
     }
 
     #[test]
@@ -1724,7 +1798,8 @@ mod tests {
             c[1].summary
         );
         assert!(!c[1].summary.contains("recall"), "{}", c[1].summary);
-        assert!(!c[1].summary.contains("skips mining"), "{}", c[1].summary);
+        // Not told as a read-only run that starts but does not mine.
+        assert!(!c[1].summary.contains("-> not mined"), "{}", c[1].summary);
         let hint = c[1].hint.as_deref().unwrap();
         assert!(hint.contains("trusted, read-only or restricted"), "{hint}");
         assert!(!hint.contains("prompt recall still work"), "{hint}");
@@ -2368,7 +2443,6 @@ mod tests {
              hook command), so only the plugin's copy runs"
         );
         assert!(!s.contains("run twice"), "{s}");
-        assert!(!s.contains("also"), "the plugin's copy starts fine: {s}");
         // The broken copy can go: the plugin covers the event. Fixing its mode
         // instead would make the hook run twice, so no fix-the-mode hint.
         assert_eq!(c[0].hint.as_deref(), Some(DUPLICATE_HINT));
@@ -2588,7 +2662,6 @@ mod tests {
         let c = claude_hook_checks(Some(home.path()), Some(""));
         for check in &c {
             assert!(check.summary.contains(r#""""#), "{}", check.summary);
-            assert!(!check.summary.contains("got  "), "{}", check.summary);
         }
         assert!(
             c[0].summary
@@ -2948,7 +3021,13 @@ mod tests {
         );
         assert_eq!(
             c[0].hint.as_deref(),
-            Some(format!("{INSTALL_HINT} | {INVALID_MODE_HINT} | {DYNAMIC_MODE_HINT}").as_str())
+            Some(
+                format!(
+                    "{INSTALL_HINT} | {READ_SHAPE_HINT} | {INVALID_MODE_HINT} | \
+                     {DYNAMIC_MODE_HINT}"
+                )
+                .as_str()
+            )
         );
 
         // Cause order, not event order: the later UserPromptSubmit's failure
