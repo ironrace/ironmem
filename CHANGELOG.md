@@ -50,7 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   array of strings, which Claude Code runs with no shell) as that argument
   vector: `env`, `command` and `nohup` apply to it (`exec`, a shell builtin
   with no program, does not, so such an entry never starts and reads as
-  missing), `bash -c` reads its string as a shell command, a `${...}`
+  missing; a shell-form `env exec`, `nohup exec` or `exec exec` reads as
+  missing too), `bash -c` reads its string as a shell command, a `${...}`
   placeholder counts as unknown, any other `$` is literal, a `~/` program is
   read as not expanded (exec form runs no shell, and the hooks docs list no
   `~` expansion), and an entry whose `args` is anything else is skipped. The
@@ -70,7 +71,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hook names a program by a full path (or `~/...`) that is not the same file
   as the installed one, and none of its commands names the installed one, a
   WARN names what it runs; a bare `ironmem` on `PATH`, a `$HOME/...` path and
-  the plugin's wrapper scripts get none.
+  the plugin's wrapper scripts get none. An exec-form `~/` program gets a
+  WARN (doctor reads it as not expanded), and is left wired.
   `--skip-wiring` skips this, and without `jq` it prints the four entries to
   add by hand, with a note to skip them when the plugin is enabled. If
   settings.json cannot be read or written it warns, wires nothing, and the
@@ -81,7 +83,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   file other than `~/.claude/settings.json` it says `ironmem doctor` does not
   read that file. The wired hooks set no `IRONMEM_MCP_MODE`, so they run
   read-only and don't mine unless trusted reaches them (the line printed after
-  wiring says they mine when the file's `env` sets it); a cheaper way to mine
+  wiring says they mine when the file's `env` sets it, that they do not when it
+  sets another value, and otherwise that the environment Claude Code is
+  launched with decides); a cheaper way to mine
   outside the plugin is #418. The installer's jq programs use only jq 1.5
   builtins.
 

@@ -1278,6 +1278,34 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 self.assertNotIn("WARN", result.stderr)
                 self.assertIn("already wired, left as they are: Stop PreCompact", result.stdout)
 
+    def test_an_exec_form_tilde_program_gets_a_warning_even_for_this_install(self) -> None:
+        # Doctor reads an exec-form ~/ program as not expanded, so the hook
+        # does not run, even when ~/ would expand to this install's program.
+        for command, args in (
+            ("~/.ironrace/bin/ironmem", ["hook", "stop"]),
+            ("env", ["IRONMEM_MCP_MODE=trusted", "~/.ironrace/bin/ironmem", "hook", "stop"]),
+        ):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                entry = {"type": "command", "command": command, "args": args}
+                path = self.settings_with_stop(home, [{"hooks": [entry]}])
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                shown = f"{command} with args {json.dumps(args, separators=(',', ':'))}"
+                self.assertIn(
+                    f"    WARN: Stop in {path} is already wired, so this install left it as it is, but "
+                    "its exec-form entry (args set) starts its program with ~/, which doctor reads as "
+                    "not expanded, as no shell reads an exec-form command. It runs:\n"
+                    f"            {shown}\n"
+                    "          Write the program's full path in that entry, or remove the entry and "
+                    "re-run this script. If no other command for Stop starts, `ironmem doctor` "
+                    "reports it as not running on its hook_mining line.\n",
+                    result.stderr,
+                )
+                self.assertEqual(self.claude_settings(home)["hooks"]["Stop"], [{"hooks": [entry]}])
+                self.assertIn("Claude hooks already wired, left as they are: Stop", result.stdout)
+
     def test_a_literal_path_to_another_file_gets_a_program_warning(self) -> None:
         # Another executable file under a path that looks like this install's.
         for quote in ("", '"', "'"):
@@ -1312,7 +1340,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 result.stderr,
             )
             self.assertNotIn("warns on its", result.stderr)
-            self.assertIn("\n    PreCompact run read-only and skip mining; prompt recall still works.\n", result.stdout)
+            self.assertIn("\n    PreCompact run read-only and skip mining (prompt recall still works) unless the environment Claude Code is launched with sets IRONMEM_MCP_MODE; trusted there makes them mine.\n", result.stdout)
             self.assertNotIn("see `ironmem doctor`", result.stdout)
 
     def test_a_trailing_slash_in_claude_home_is_still_the_file_doctor_reads(self) -> None:
@@ -1323,7 +1351,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
             fresh = self.run_installer(home, home / ".claude.json", extra_env=env)
 
             self.assertIn(
-                "\n    Stop PreCompact run read-only and skip mining (see `ironmem doctor`); prompt recall still works.\n",
+                "\n    Stop PreCompact run read-only and skip mining (prompt recall still works) unless the environment Claude Code is launched with sets IRONMEM_MCP_MODE; trusted there makes them mine (see `ironmem doctor`).\n",
                 fresh.stdout,
             )
             path = home / ".claude" / "settings.json"
@@ -1357,17 +1385,28 @@ class InstallIronmemSelfTest(unittest.TestCase):
                     "(see `ironmem doctor`).",
                 )
 
-    def test_a_settings_env_that_does_not_write_keeps_the_read_only_line(self) -> None:
-        read_only = "    Stop PreCompact run read-only and skip mining (see `ironmem doctor`); prompt recall still works."
+    def test_without_a_settings_env_mode_the_line_names_the_launch_environment(self) -> None:
+        # The installer cannot see the environment Claude Code is launched
+        # with, which reaches the hooks when settings.json's env sets no mode.
+        unset = "    Stop PreCompact run read-only and skip mining (prompt recall still works) unless the environment Claude Code is launched with sets IRONMEM_MCP_MODE; trusted there makes them mine (see `ironmem doctor`)."
         for settings in (
-            {"env": {"IRONMEM_MCP_MODE": "read-only"}},
-            {"env": {"IRONMEM_MCP_MODE": "trusted-ish"}},
+            {},
+            {"env": {"OTHER": "trusted"}},
             {"env": {"IRONMEM_MCP_MODE": True}},
             {"env": "IRONMEM_MCP_MODE=trusted"},
-            {"env": {"OTHER": "trusted"}},
         ):
             with self.subTest(settings=settings):
-                self.assertEqual(self.mining_line_after_install(settings), read_only)
+                self.assertEqual(self.mining_line_after_install(settings), unset)
+
+    def test_a_settings_env_mode_that_does_not_write_says_they_do_not_mine(self) -> None:
+        # settings.json's env beats the launch environment, so this is known.
+        other = (
+            "    Stop PreCompact do not mine: env in <path> sets IRONMEM_MCP_MODE to a value "
+            "other than trusted (see `ironmem doctor`)."
+        )
+        for mode in ("read-only", "restricted", "trusted-ish", ""):
+            with self.subTest(mode=mode):
+                self.assertEqual(self.mining_line_after_install({"env": {"IRONMEM_MCP_MODE": mode}}), other)
 
     def settings_with_stop(self, home: pathlib.Path, stop: object) -> pathlib.Path:
         path = home / ".claude" / "settings.json"

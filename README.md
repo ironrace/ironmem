@@ -653,7 +653,8 @@ the first `[FAIL]`:
   "ironmem hook stop", "args": []}` names a program called `ironmem hook stop`,
   so it is not the hook. `exec` is a shell builtin with no program behind it,
   so an entry whose program is `exec` (or `env` running `exec`) never starts
-  and reads as missing. An element holding a `${...}` placeholder counts as
+  and reads as missing; in shell form too, `env`, `nohup` or `exec` followed
+  by `exec` reads as missing, while `command exec` runs the builtin. An element holding a `${...}` placeholder counts as
   unknown until run time, and any other `$` is literal. Doctor reads a `~/`
   program as not expanded (exec form runs no shell, and the hooks docs list
   no `~` expansion), so it reports that hook as not running; writing the full
@@ -669,12 +670,17 @@ the first `[FAIL]`:
   once `IRONMEM_MCP_MODE=trusted` reaches them: from their commands, from
   `settings.json`'s `env`, or from the environment Claude Code is launched
   with (see `hook_mining`). After wiring it prints whether the Stop and
-  PreCompact hooks it added mine, judged from that file's `env` alone. When a
+  PreCompact hooks it added mine, judged from that file's `env`; when that
+  sets no `IRONMEM_MCP_MODE`, the line says the environment Claude Code is
+  launched with decides. When a
   hook it leaves alone names a program by a full path (or `~/...`) that is not
   the same file as the one it installed, and no command of that hook names
   the installed program, it prints a WARN naming what that hook runs; a bare
   `ironmem` found on `PATH`, a path built with `$HOME` and the plugin's
-  wrapper scripts get no WARN.
+  wrapper scripts get no WARN. An exec-form entry whose program starts with
+  `~/` gets a WARN too, even when it would expand to the installed program,
+  since doctor reports it as not running; the installer still counts it as
+  wired and leaves it.
 - **`hook_mining` not mining** (a `[WARN]`) → a Stop or PreCompact hook does not
   mine, or neither is wired. A wired hook does not mine when its
   `IRONMEM_MCP_MODE` is `read-only` or `restricted`, or is invalid (the hook

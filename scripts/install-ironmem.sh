@@ -693,16 +693,19 @@ register_json_mcpservers() {
 # read-only: SessionStart context and UserPromptSubmit recall work, and Stop
 # and PreCompact skip mining (a cheaper way to mine outside the plugin is
 # #418). `ironmem doctor` reports that on its hook_mining line. The line
-# printed after wiring says which: read-only, unless the file's
-# env.IRONMEM_MCP_MODE reads as trusted (trimmed, any case, as
-# McpAccessMode::parse reads it).
+# printed after wiring reads the file's env.IRONMEM_MCP_MODE: trusted (trimmed,
+# any case, as McpAccessMode::parse reads it) mines, any other string does
+# not, and with none there it names the environment Claude Code is launched
+# with, which decides and which this script cannot see.
 #
 # The merge only appends. An event that already runs `ironmem hook <name>`
 # (from any path, or through the plugin's ironmem-hook.sh) is left alone, and
 # so is every other hook and key. If a run of it names a program by a literal
 # path (absolute or ~/) that is not the same file as this install's program,
 # and no run names that program, a WARN names what it runs. A PATH lookup, a
-# path the shell builds and the wrapper scripts get no WARN. The result is
+# path the shell builds and the wrapper scripts get no WARN. An exec-form
+# entry whose program starts with ~/ gets a WARN too, even when ~/ would
+# expand to this install's program: doctor reads it as not expanded. The result is
 # built in temp files and written to settings.json once, after every event is
 # decided. A failure before that write (unreadable, unparseable or read-only
 # file, dangling symlink, a jq error, a temp-file step) prints a WARN, leaves
@@ -817,7 +820,9 @@ _wire_claude_hooks_warn() {
 # shell starts a program, as doctor's `HookCommand::runs_hook` does: at the
 # start, or after `;` `&` `|` `(` `)` or a line break (not after `$(`), then
 # after any unquoted NAME=value words and any env (with its own options and
-# assignments), exec, command or nohup, or at the start of a quoted `bash -c`
+# assignments), exec, command or nohup (but not an exec right after env, nohup
+# or exec, which run it as a program and find none; `command exec` runs the
+# builtin), or at the start of a quoted `bash -c`
 # or `sh -c` string. So `echo ironmem hook stop`, `# ironmem hook stop` and
 # `"IRONMEM_MCP_MODE=trusted" ironmem hook stop` do not count, and `hook
 # --harness <v> <name>`, `hook --harness=<v> <name>` and a quoted name do.
@@ -840,9 +845,10 @@ def re_env_arg:
   "(?:(?:-u|--unset|-C|--chdir)\\s+" + re_word
   + "|-(?!(?:u|-unset|C|-chdir)\\s)" + re_seg + "*"
   + "|" + re_q + "[A-Za-z_][A-Za-z0-9_]*=" + re_seg + "*" + re_q + ")";
+def re_exec: re_named("exec") + "\\s+";
 def re_wrappers:
-  "(?:(?:" + re_named("(?:exec|command|nohup)")
-  + "|" + re_named("env") + "(?:\\s+" + re_env_arg + ")*)\\s+)*";
+  "(?:" + re_exec + ")?(?:(?:" + re_named("nohup")
+  + "|" + re_named("env") + "(?:\\s+" + re_env_arg + ")*)\\s+|" + re_named("command") + "\\s+(?:" + re_exec + ")?)*";
 def re_head: "(?:" + re_assign + "\\s+)*" + re_wrappers;
 def re_shell:
   re_named("(?:bash|sh)")
@@ -923,7 +929,8 @@ def exec_programs($name):
   peel
   | ((.[0] // "") | base) as $b
   | if $b == "ironmem" and (.[1:] | after_hook($name)) then
-      [{text: .[0], dynamic: (.[0] | contains("${")), tilde: (.[0] | startswith("~/"))}]
+      [{text: .[0], dynamic: (.[0] | contains("${")), tilde: (.[0] | startswith("~/")),
+        exec_tilde: (.[0] | startswith("~/"))}]
     elif $b == "bash" or $b == "sh" then [.[1:] | c_string | shell_programs($name)[]]
     else [] end;
 def literal_path($home):
@@ -933,7 +940,7 @@ def program_paths($name; $home):
   (if shell_form then .command | shell_programs($name)
    elif exec_form then [.command] + .args | exec_programs($name)
    else [] end)
-  | .[] | literal_path($home);
+  | .[] | if .exec_tilde then "~" else literal_path($home) end;
 def shown: if shell_form then .command else "\(.command) with args \(.args | tojson)" end;
 '
 
@@ -954,7 +961,10 @@ _claude_hook_is_wired() {
 # or double-quoted, and the run may sit in a bash/sh -c string of an exec-form
 # entry. A PATH lookup (a bare `ironmem`), a path the shell builds (`$HOME`,
 # `${HOME}`, a glob) and the plugin's wrapper scripts give no line, as
-# doctor's missing-program check skips them. A jq error exits non-zero.
+# doctor's missing-program check skips them. An exec-form program that starts
+# with ~/ gives the path `~` instead: doctor reads it as not expanded (no
+# shell reads an exec-form command), so it does not run whatever ~/ would
+# expand to. A jq error exits non-zero.
 _claude_hook_program_paths() {
   jq -r --arg ev "$2" --arg name "$3" --arg home "$HOME" "$_CLAUDE_HOOK_JQ_DEFS"'
       entries($ev) | select(runs_hook($name)) | shown as $shown
@@ -965,11 +975,15 @@ _claude_hook_program_paths() {
 # For an event ($3, hook $4) that is already wired in work file $1 (settings
 # file $2): WARN when a run of it names a program by a literal path that is not
 # the same file as $TARGET (bash -ef, so a symlink to it or another spelling of
-# its path counts as $TARGET), unless another run names $TARGET. Never changes
-# the entry; a jq error here is a WARN too.
+# its path counts as $TARGET), and WARN when an exec-form entry starts its
+# program with ~/ (doctor reads it as not running), unless another run names
+# $TARGET. Such an entry is still counted as wired, as doctor counts it (its
+# hooks line names it as wired to a program that does not run, not missing),
+# and appending a copy would run the hook twice if Claude Code did expand ~.
+# Never changes the entry; a jq error here is a WARN too.
 _warn_other_program() {
-  local work="$1" settings="$2" event="$3" name="$4" records epath eshown path shown line doctor_line i
-  local -a others=()
+  local work="$1" settings="$2" event="$3" name="$4" records epath eshown path shown doctor_line
+  local -a others=() tildes=()
   if ! records="$(_claude_hook_program_paths "$work" "$event" "$name" 2>&1)"; then
     echo "    WARN: jq failed checking which program the $event hook in $settings runs; left it as it is." >&2
     echo "          jq said: ${records%%$'\n'*}" >&2
@@ -978,47 +992,81 @@ _warn_other_program() {
   [[ -z "$records" ]] && return 0
   while IFS=$'\t' read -r epath eshown; do
     printf -v path '%b' "$epath"
+    printf -v shown '%b' "$eshown"
+    if [[ "$path" == "~" ]]; then
+      _in_list "$shown" "${tildes[@]+"${tildes[@]}"}" || tildes+=("$shown")
+      continue
+    fi
     if [[ "$path" == "$TARGET" || "$path" -ef "$TARGET" ]]; then
       return 0
     fi
-    printf -v shown '%b' "$eshown"
-    for ((i = 0; i < ${#others[@]}; i++)); do
-      [[ "${others[i]}" == "$shown" ]] && continue 2
-    done
-    others+=("$shown")
+    _in_list "$shown" "${others[@]+"${others[@]}"}" || others+=("$shown")
   done <<< "$records"
-  echo "    WARN: $event in $settings is already wired, so this install left it as it is, but the program it names by path is not $TARGET, the program this install put in place. It runs:" >&2
-  for shown in "${others[@]}"; do
+  case "$event" in Stop | PreCompact) doctor_line="hook_mining" ;; *) doctor_line="hooks" ;; esac
+  if (( ${#others[@]} > 0 )); then
+    echo "    WARN: $event in $settings is already wired, so this install left it as it is, but the program it names by path is not $TARGET, the program this install put in place. It runs:" >&2
+    _print_indented "${others[@]}"
+    if _doctor_reads "$settings"; then
+      echo "          If that program is not an executable file, \`ironmem doctor\` warns on its $doctor_line line." >&2
+    else
+      echo "          \`ironmem doctor\` reads only $_DOCTOR_SETTINGS, not this file." >&2
+    fi
+  fi
+  if (( ${#tildes[@]} > 0 )); then
+    echo "    WARN: $event in $settings is already wired, so this install left it as it is, but its exec-form entry (args set) starts its program with ~/, which doctor reads as not expanded, as no shell reads an exec-form command. It runs:" >&2
+    _print_indented "${tildes[@]}"
+    if _doctor_reads "$settings"; then
+      echo "          Write the program's full path in that entry, or remove the entry and re-run this script. If no other command for $event starts, \`ironmem doctor\` reports it as not running on its $doctor_line line." >&2
+    else
+      echo "          Write the program's full path in that entry, or remove the entry and re-run this script. \`ironmem doctor\` reads only $_DOCTOR_SETTINGS, not this file." >&2
+    fi
+  fi
+}
+
+# Is $1 one of the other arguments?
+_in_list() {
+  local value="$1" item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$value" ]] && return 0
+  done
+  return 1
+}
+
+# Prints each argument to stderr, every line of it indented under a WARN.
+_print_indented() {
+  local shown line
+  for shown in "$@"; do
     while IFS= read -r line; do
       echo "            $line" >&2
     done <<< "$shown"
   done
-  case "$event" in Stop | PreCompact) doctor_line="hook_mining" ;; *) doctor_line="hooks" ;; esac
-  if _doctor_reads "$settings"; then
-    echo "          If that program is not an executable file, \`ironmem doctor\` warns on its $doctor_line line." >&2
-  else
-    echo "          \`ironmem doctor\` reads only $_DOCTOR_SETTINGS, not this file." >&2
-  fi
 }
 
 # Says whether the mining hooks just added ($3, e.g. "Stop PreCompact") mine.
-# The commands carry no mode, so settings file $2 (work copy $1) decides: an
-# env.IRONMEM_MCP_MODE that reads as trusted (trimmed, any case, as
-# McpAccessMode::parse reads it) reaches them, and anything else leaves them
-# read-only. A jq error prints neither line, since neither would be known true.
+# The commands carry no mode. settings file $2 (work copy $1) is read first,
+# as doctor reads it: an env.IRONMEM_MCP_MODE that reads as trusted (trimmed,
+# any case, as McpAccessMode::parse reads it) reaches them, and any other
+# string there beats the environment, so they do not mine. With no string
+# there, the environment Claude Code is launched with decides, which this
+# script cannot see, so the line names it. A jq error prints no line, since
+# none would be known true.
 _print_mining_line() {
-  local work="$1" settings="$2" mining="$3" see="" rc
+  local work="$1" settings="$2" mining="$3" see="" mode
   if _doctor_reads "$settings"; then
     see=" (see \`ironmem doctor\`)"
   fi
-  jq -e '[.env | objects | .IRONMEM_MCP_MODE | strings
-          | sub("^\\s+"; "") | sub("\\s+$"; "") | ascii_downcase] | any(. == "trusted")' \
-    "$work" >/dev/null 2>&1 && rc=0 || rc=$?
-  if [[ "$rc" -eq 0 ]]; then
-    echo "    $mining get a trusted IRONMEM_MCP_MODE from env in $settings, so they mine$see."
-  elif [[ "$rc" -eq 1 ]]; then
-    echo "    $mining run read-only and skip mining$see; prompt recall still works."
+  if ! mode="$(jq -r '[.env | objects | .IRONMEM_MCP_MODE | strings]
+        | if length == 0 then "unset"
+          elif (.[0] | sub("^\\s+"; "") | sub("\\s+$"; "") | ascii_downcase) == "trusted" then "trusted"
+          else "other" end' "$work" 2>/dev/null)"; then
+    return 0
   fi
+  case "$mode" in
+    trusted) echo "    $mining get a trusted IRONMEM_MCP_MODE from env in $settings, so they mine$see." ;;
+    other) echo "    $mining do not mine: env in $settings sets IRONMEM_MCP_MODE to a value other than trusted$see." ;;
+    unset) echo "    $mining run read-only and skip mining (prompt recall still works) unless the environment Claude Code is launched with sets IRONMEM_MCP_MODE; trusted there makes them mine$see." ;;
+  esac
 }
 
 # Appends the plugin hooks missing from settings file $1, skipping entries it

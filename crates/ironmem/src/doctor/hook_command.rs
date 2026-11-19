@@ -164,7 +164,10 @@ impl HookCommand {
     /// Shell form: the model is a small simple-command reader, not a shell
     /// (see [`split_commands`] for the word and operator rules). In each
     /// simple command, leading `NAME=value` words are assignments; the
-    /// wrappers `env`, `exec`, `command` and `nohup` are peeled off. `env`
+    /// wrappers `env`, `exec`, `command` and `nohup` are peeled off, except an
+    /// `exec` right after `env`, `nohup` or `exec`, which run their argument
+    /// as a program and find none (`env exec ironmem hook stop` never
+    /// starts); `command exec` runs the builtin and is peeled. `env`
     /// takes its own assignments, `-u NAME`/`--unset NAME`, `-C DIR`/`--chdir
     /// DIR`, and flags without an argument (`-i`, `-`, `--unset=NAME`). The
     /// program's basename must then be `ironmem` or `ironmem-mcp.sh` followed
@@ -630,15 +633,20 @@ fn simple_command(
     found: &mut Vec<Invocation>,
 ) -> Option<ModeValue> {
     let mut rest = words;
+    // The last wrapper peeled runs its argument as a program (execvp), as
+    // `env`, `nohup` and the `exec` builtin do; `command` runs builtins too.
+    let mut after_execvp = false;
     while let Some(first) = rest.first() {
         let name = basename(&first.text);
         // `exec` is a shell builtin with no program behind it, so an
         // argument vector that names it as a program (directly or after
-        // `env`) never starts; it is left as the program, which is no hook.
-        let builtin_in_exec = name == "exec" && first.exec;
-        if !matches!(name, "env" | "exec" | "command" | "nohup") || builtin_in_exec {
+        // `env`), or a shell command that hands it to `env`, `nohup` or
+        // `exec`, never starts; it is left as the program, which is no hook.
+        let exec_cannot_start = name == "exec" && (first.exec || after_execvp);
+        if !matches!(name, "env" | "exec" | "command" | "nohup") || exec_cannot_start {
             break;
         }
+        after_execvp = name != "command";
         rest = &rest[1..];
         if name == "env" {
             take_assignments(&mut rest, &mut inline, true);

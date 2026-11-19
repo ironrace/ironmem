@@ -330,6 +330,36 @@
       "command": "env -u ironmem hook stop",
       "wired": false,
       "note": "env -u takes ironmem as the name to unset"
+    },
+    {
+      "command": "env exec ironmem hook stop",
+      "wired": false,
+      "note": "env runs its argument with execvp, and exec has no program"
+    },
+    {
+      "command": "env IRONMEM_MCP_MODE=trusted exec ironmem hook stop",
+      "wired": false,
+      "note": "env cannot run exec, with or without an assignment"
+    },
+    {
+      "command": "nohup exec ironmem hook stop",
+      "wired": false,
+      "note": "nohup runs its argument with execvp, and exec has no program"
+    },
+    {
+      "command": "exec exec ironmem hook stop",
+      "wired": false,
+      "note": "the exec builtin cannot run exec either"
+    },
+    {
+      "command": "exec nohup ironmem hook stop",
+      "wired": true,
+      "note": "the exec builtin runs nohup, which runs ironmem"
+    },
+    {
+      "command": "command exec ironmem hook stop",
+      "wired": true,
+      "note": "command runs the exec builtin, which runs ironmem"
     }
   ]
 }
