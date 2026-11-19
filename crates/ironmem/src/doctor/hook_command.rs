@@ -299,6 +299,16 @@ impl Word {
         }
     }
 
+    /// Where a run whose program is this word sits: exec form for an
+    /// exec-form element, else shell form.
+    fn form(&self) -> RunForm {
+        if self.exec {
+            RunForm::Exec
+        } else {
+            RunForm::Shell
+        }
+    }
+
     /// True when a quote or backslash came before the first `=` (or there is
     /// no `=`), so the shell does not read the word as an assignment.
     fn quoted_name(&self) -> bool {
@@ -667,11 +677,7 @@ fn simple_command(
             mode: mode.clone(),
             program: literal_path(program_word),
             unexpanded_tilde: unexpanded_tilde.clone(),
-            form: if program_word.exec {
-                RunForm::Exec
-            } else {
-                RunForm::Shell
-            },
+            form: program_word.form(),
         });
     };
     match program {
@@ -738,11 +744,7 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
                 mode,
                 program: None,
                 unexpanded_tilde: None,
-                form: if arg.exec {
-                    RunForm::Exec
-                } else {
-                    RunForm::Shell
-                },
+                form: arg.form(),
             });
         }
         return;

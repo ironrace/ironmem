@@ -209,6 +209,15 @@ struct Context<'a> {
     home: &'a Path,
 }
 
+impl<'a> Context<'a> {
+    fn new(settings: Option<&'a str>, process: Option<&'a str>, home: &'a Path) -> Self {
+        Self {
+            env: ModeEnv { settings, process },
+            home,
+        }
+    }
+}
+
 /// Plugin hooks that settings.json wires, with every command matching each.
 type WiredHooks = Vec<(&'static PluginHook, Vec<HookCommand>)>;
 
@@ -345,13 +354,7 @@ pub(super) fn claude_hook_checks(
                     (hook, vec![HookCommand::Shell(command)])
                 })
                 .collect();
-            let ctx = Context {
-                env: ModeEnv {
-                    settings: settings_env_mode.as_deref(),
-                    process: process_env_mode,
-                },
-                home,
-            };
+            let ctx = Context::new(settings_env_mode.as_deref(), process_env_mode, home);
             // A hand-wired copy runs as well as the plugin's, so it can start,
             // recall and mine in the plugin copy's place.
             let candidates: WiredHooks = wired
@@ -377,13 +380,7 @@ pub(super) fn claude_hook_checks(
             missing,
             settings_env_mode,
         } => {
-            let ctx = Context {
-                env: ModeEnv {
-                    settings: settings_env_mode.as_deref(),
-                    process: process_env_mode,
-                },
-                home,
-            };
+            let ctx = Context::new(settings_env_mode.as_deref(), process_env_mode, home);
             let (failures, may_fail) = startup_failures(&wired, ctx);
             let trusted_env = env_mode_writes(ctx.env.settings);
             [
@@ -846,25 +843,30 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[(String, &'static str)
              too, so those hooks run twice",
             duplicated.join(", ")
         ));
-        hints.push(DUPLICATE_HINT);
+        push_unique(&mut hints, DUPLICATE_HINT);
     }
     problems.extend(entries.iter().cloned());
-    hints.extend(entry_hints.iter().copied());
-    if !failures.is_empty() {
-        let texts: Vec<&str> = failures.iter().map(|(text, _)| text.as_str()).collect();
-        problems.push(texts.join("; "));
-        hints.extend(failures.iter().map(|(_, hint)| *hint));
+    for hint in entry_hints {
+        push_unique(&mut hints, hint);
     }
-    let mut unique: Vec<&'static str> = Vec::new();
-    for hint in hints {
-        push_unique(&mut unique, hint);
+    if !failures.is_empty() {
+        problems.push(failure_texts(failures));
+        for (_, hint) in failures {
+            push_unique(&mut hints, hint);
+        }
     }
     Check::new(
         HOOKS_KEY,
         CheckStatus::Warn,
         format!("Claude Code hooks: {}", problems.join("; ")),
     )
-    .with_hint(unique.join(HINT_JOINER))
+    .with_hint(hints.join(HINT_JOINER))
+}
+
+/// The startup-failure entries' texts, joined with "; ".
+fn failure_texts(failures: &[(String, &'static str)]) -> String {
+    let texts: Vec<&str> = failures.iter().map(|(text, _)| text.as_str()).collect();
+    texts.join("; ")
 }
 
 /// The manual install's `hooks` check: missing hooks (with the install hint
@@ -910,8 +912,7 @@ fn hooks_check(
         push_unique(&mut hints, READ_SHAPE_HINT);
     }
     if !failures.is_empty() {
-        let texts: Vec<&str> = failures.iter().map(|(text, _)| text.as_str()).collect();
-        problems.push(texts.join("; "));
+        problems.push(failure_texts(failures));
         for (_, hint) in failures {
             push_unique(&mut hints, hint);
         }
@@ -1075,8 +1076,7 @@ fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> Stri
 /// with [`HINT_JOINER`]. `plugin` says the miners run on the plugin path (the
 /// plugin's hooks plus any hand-wired copies).
 fn mining_check(wired: &WiredHooks, ctx: Context<'_>, plugin: bool) -> Check {
-    let miners: Vec<&(&'static PluginHook, Vec<HookCommand>)> =
-        wired.iter().filter(|(hook, _)| hook.mines).collect();
+    let miners: Vec<_> = wired.iter().filter(|(hook, _)| hook.mines).collect();
     if miners.is_empty() {
         return no_miner_check(env_mode_writes(ctx.env.settings));
     }
@@ -1133,22 +1133,16 @@ fn mining_check(wired: &WiredHooks, ctx: Context<'_>, plugin: bool) -> Check {
             }
         });
     }
-    let status = if causes.is_empty() {
-        CheckStatus::Ok
-    } else {
-        CheckStatus::Warn
-    };
     let summary = format!(
         "{} — {}",
         mining_headline(&mined, &not_mined, &unknown),
         lines.join("; ")
     );
-    let check = Check::new(HOOK_MINING_KEY, status, summary);
     if causes.is_empty() {
-        return check;
+        return Check::new(HOOK_MINING_KEY, CheckStatus::Ok, summary);
     }
     let hints: Vec<String> = causes.iter().map(|g| g.cause.hint(&g.events)).collect();
-    check.with_hint(hints.join(HINT_JOINER))
+    Check::new(HOOK_MINING_KEY, CheckStatus::Warn, summary).with_hint(hints.join(HINT_JOINER))
 }
 
 #[cfg(test)]

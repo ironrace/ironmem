@@ -761,12 +761,6 @@ _shell_word() {
 
 # $TARGET as the first word of a hook command.
 HOOK_PROGRAM="$(_shell_word "$TARGET")"
-# The same program as a shell-form command may write it under the home, with
-# ~/ (which the shell expands), or empty when $TARGET is not under $HOME.
-HOOK_PROGRAM_TILDE=""
-if [[ "$TARGET" == "$HOME"/* ]]; then
-  HOOK_PROGRAM_TILDE="~/$(_shell_word "${TARGET#"$HOME"/}")"
-fi
 
 # Prints $1 escaped for the inside of a JSON string: \ and " get a backslash,
 # and newline, carriage return and tab become \n, \r and \t. One pass over
