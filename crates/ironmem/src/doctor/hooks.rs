@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
+use crate::config::McpAccessMode;
+
 use super::hook_command::{
     best_result, source_label, HookCommand, ModeEnv, ModeError, ModeSource, ProgramProblem,
     RunForm, RunMode,
@@ -84,23 +86,52 @@ pub(super) fn miner_events(joiner: &str) -> String {
         .join(joiner)
 }
 
-/// The hint for a `hooks` line that names hooks missing (or no settings.json).
+/// The hint for a `hooks` line that names hooks missing (or no settings.json),
+/// when settings.json's env sets no mode that writes. The installer's hooks
+/// carry no mode, so where one comes from decides whether they mine.
 const INSTALL_HINT: &str = "re-run scripts/install-ironmem.sh to wire the missing hooks, or \
-install the ironmem Claude Code plugin, whose hooks also mine; the installer wires them \
-read-only, which brings back session context and prompt recall, but a hook it wires mines only \
-once its command sets IRONMEM_MCP_MODE=trusted (see hook_mining)";
+install the ironmem Claude Code plugin, whose hooks also mine; the hooks the installer wires \
+bring back session context and prompt recall; they set no IRONMEM_MCP_MODE, so they mine only \
+once IRONMEM_MCP_MODE=trusted reaches them from their commands, settings.json env or the \
+environment Claude Code is launched with (see hook_mining)";
 
-/// Beside [`INSTALL_HINT`] for missing hooks: the installer's matcher reads
-/// more command shapes than doctor's (see `hook_command::runs_hook`).
+/// [`INSTALL_HINT`] when settings.json's env sets a mode that writes, which
+/// reaches the installer's bare hooks ([`ModeSource::SettingsEnv`]).
+const INSTALL_HINT_TRUSTED_ENV: &str = "re-run scripts/install-ironmem.sh to wire the missing \
+hooks, or install the ironmem Claude Code plugin; the hooks the installer wires bring back \
+session context and prompt recall, and as settings.json's env sets IRONMEM_MCP_MODE to trusted, \
+the Stop and PreCompact hooks it wires mine (see hook_mining)";
+
+/// Beside the install hint for missing hooks. The installer's shell-form
+/// matcher is a regex that wants ironmem in program position, as doctor
+/// does, but it cannot tell an operator inside quotes or a comment from a
+/// real one, so it can count a command doctor reads as not running the hook
+/// (see `hook_command::HookCommand::runs_hook`).
 const READ_SHAPE_HINT: &str = "if the installer says a missing hook is already wired, doctor \
-could not read its command: make ironmem the command's program, alone or after env, exec, \
-command, nohup or bash -c, not behind if, { }, timeout, time, nice or another wrapper";
+does not count its command as running the hook (the installer reads a ;, &, |, (, ) or line \
+break inside quotes or a comment as the start of a command; doctor does not): make ironmem the \
+program of its own command, alone or after unquoted NAME=value words, env, exec, command, nohup \
+or bash -c";
 
-/// The hint for a `hook_mining` line that finds no miner wired.
+/// The hint for a `hook_mining` line that finds no miner wired, when
+/// settings.json's env sets no mode that writes.
 const NO_MINER_HINT: &str = "install the ironmem Claude Code plugin, whose hooks mine, or \
-re-run scripts/install-ironmem.sh to wire the missing hooks and then set \
-IRONMEM_MCP_MODE=trusted in their commands; the installer wires them read-only, which does not \
-mine";
+re-run scripts/install-ironmem.sh to wire the missing hooks; the hooks it wires set no \
+IRONMEM_MCP_MODE, so they mine only once IRONMEM_MCP_MODE=trusted reaches them from their \
+commands, settings.json env or the environment Claude Code is launched with";
+
+/// [`NO_MINER_HINT`] when settings.json's env sets a mode that writes.
+const NO_MINER_HINT_TRUSTED_ENV: &str = "install the ironmem Claude Code plugin, or re-run \
+scripts/install-ironmem.sh to wire the missing hooks; as settings.json's env sets \
+IRONMEM_MCP_MODE to trusted, the Stop and PreCompact hooks it wires mine";
+
+/// True when settings.json's `env.IRONMEM_MCP_MODE` (`raw`) parses, as
+/// `Config::load` reads it, to a mode that writes: the installer's bare hooks
+/// then mine.
+fn env_mode_writes(raw: Option<&str>) -> bool {
+    raw.and_then(|raw| McpAccessMode::parse(raw).ok())
+        .is_some_and(McpAccessMode::allows_writes)
+}
 
 /// The hint for bare manual miners that run read-only, naming those `events`.
 /// `form` says where their runs sit: an exec-form entry's command (`args`
@@ -253,7 +284,7 @@ pub(super) fn claude_hook_checks(
                 ),
             )
             .with_hint(INSTALL_HINT),
-            no_miner_check(),
+            no_miner_check(false),
         ],
         HookWiring::Unreadable(e) => [
             Check::new(
@@ -354,8 +385,9 @@ pub(super) fn claude_hook_checks(
                 home,
             };
             let (failures, may_fail) = startup_failures(&wired, ctx);
+            let trusted_env = env_mode_writes(ctx.env.settings);
             [
-                hooks_check(&path, &missing, &failures, &may_fail),
+                hooks_check(&path, &missing, &failures, &may_fail, trusted_env),
                 mining_check(&wired, ctx, false),
             ]
         }
@@ -420,7 +452,8 @@ fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
         return HookWiring::MisShaped(reason);
     }
     // Claude Code's documented switch: `"disableAllHooks": true` turns every
-    // hook off; any other value is ignored. Doctor reads only
+    // hook off except managed-policy ones. Doctor treats any other value as
+    // not set (the docs do not say what a non-boolean does). Doctor reads only
     // ~/.claude/settings.json, so a project or managed settings file that
     // sets it back to false (or sets it at all) is out of scope here.
     if doc.get("disableAllHooks") == Some(&Value::Bool(true)) {
@@ -834,13 +867,17 @@ fn plugin_hooks_check(hand_wired: &HandWired, failures: &[(String, &'static str)
     .with_hint(unique.join(HINT_JOINER))
 }
 
-/// The manual install's `hooks` check: missing hooks, then hooks that fail to
-/// start (`failures`), then hooks that may (`may_fail`), each with one hint.
+/// The manual install's `hooks` check: missing hooks (with the install hint
+/// and the read-shape hint; `trusted_env` says settings.json's env sets a mode
+/// that writes, which picks the install hint's variant), then hooks that fail
+/// to start (`failures`, each with the hint that fixes it), then hooks that
+/// may (`may_fail`, with the dynamic-mode hint); each hint is given once.
 fn hooks_check(
     path: &Path,
     missing: &[&PluginHook],
     failures: &[(String, &'static str)],
     may_fail: &[String],
+    trusted_env: bool,
 ) -> Check {
     if missing.is_empty() && failures.is_empty() && may_fail.is_empty() {
         return Check::new(
@@ -864,7 +901,12 @@ fn hooks_check(
             path.display(),
             effects.join("; ")
         ));
-        push_unique(&mut hints, INSTALL_HINT);
+        let install = if trusted_env {
+            INSTALL_HINT_TRUSTED_ENV
+        } else {
+            INSTALL_HINT
+        };
+        push_unique(&mut hints, install);
         push_unique(&mut hints, READ_SHAPE_HINT);
     }
     if !failures.is_empty() {
@@ -887,7 +929,9 @@ fn hooks_check(
     .with_hint(hints.join(HINT_JOINER))
 }
 
-fn no_miner_check() -> Check {
+/// The `hook_mining` check when no miner is wired; `trusted_env` as on
+/// [`hooks_check`].
+fn no_miner_check(trusted_env: bool) -> Check {
     Check::new(
         HOOK_MINING_KEY,
         CheckStatus::Warn,
@@ -896,7 +940,11 @@ fn no_miner_check() -> Check {
             miner_events(" or ")
         ),
     )
-    .with_hint(NO_MINER_HINT)
+    .with_hint(if trusted_env {
+        NO_MINER_HINT_TRUSTED_ENV
+    } else {
+        NO_MINER_HINT
+    })
 }
 
 /// Why a wired miner does not mine. Raw values are the `IRONMEM_MCP_MODE`
@@ -1030,7 +1078,7 @@ fn mining_check(wired: &WiredHooks, ctx: Context<'_>, plugin: bool) -> Check {
     let miners: Vec<&(&'static PluginHook, Vec<HookCommand>)> =
         wired.iter().filter(|(hook, _)| hook.mines).collect();
     if miners.is_empty() {
-        return no_miner_check();
+        return no_miner_check(env_mode_writes(ctx.env.settings));
     }
     let (mut mined, mut not_mined, mut unknown) = (Vec::new(), Vec::new(), Vec::new());
     let mut lines = Vec::new();
@@ -1403,47 +1451,80 @@ mod tests {
             .contains("install-ironmem.sh"));
     }
 
+    /// Doctor's hooks-line hint for missing hooks when settings.json's env
+    /// sets no writing mode, spelled out to pin it.
+    const INSTALL_TEXT: &str = "re-run scripts/install-ironmem.sh to wire the missing hooks, or \
+        install the ironmem Claude Code plugin, whose hooks also mine; the hooks the installer \
+        wires bring back session context and prompt recall; they set no IRONMEM_MCP_MODE, so \
+        they mine only once IRONMEM_MCP_MODE=trusted reaches them from their commands, \
+        settings.json env or the environment Claude Code is launched with (see hook_mining)";
+
+    const NO_MINER_TEXT: &str = "install the ironmem Claude Code plugin, whose hooks mine, or \
+        re-run scripts/install-ironmem.sh to wire the missing hooks; the hooks it wires set no \
+        IRONMEM_MCP_MODE, so they mine only once IRONMEM_MCP_MODE=trusted reaches them from \
+        their commands, settings.json env or the environment Claude Code is launched with";
+
+    const READ_SHAPE_TEXT: &str = "if the installer says a missing hook is already wired, \
+        doctor does not count its command as running the hook (the installer reads a ;, &, |, \
+        (, ) or line break inside quotes or a comment as the start of a command; doctor does \
+        not): make ironmem the program of its own command, alone or after unquoted NAME=value \
+        words, env, exec, command, nohup or bash -c";
+
     #[test]
     fn install_hints_say_what_the_installer_brings_back() {
         // No settings.json: the hooks line points at the installer or the
-        // plugin; the mining line says the installer alone does not mine.
+        // plugin; the mining line says what the installer's hooks need to mine.
         let no_file = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(no_file.path().join(".claude")).unwrap();
         let c = claude_hook_checks(Some(no_file.path()), None);
-        assert_eq!(
-            c[0].hint.as_deref(),
-            Some(
-                "re-run scripts/install-ironmem.sh to wire the missing hooks, or install the \
-                 ironmem Claude Code plugin, whose hooks also mine; the installer wires them \
-                 read-only, which brings back session context and prompt recall, but a hook it \
-                 wires mines only once its command sets IRONMEM_MCP_MODE=trusted (see \
-                 hook_mining)"
-            )
-        );
-        assert_eq!(
-            c[1].hint.as_deref(),
-            Some(
-                "install the ironmem Claude Code plugin, whose hooks mine, or re-run \
-                 scripts/install-ironmem.sh to wire the missing hooks and then set \
-                 IRONMEM_MCP_MODE=trusted in their commands; the installer wires them read-only, \
-                 which does not mine"
-            )
-        );
+        assert_eq!(c[0].hint.as_deref(), Some(INSTALL_TEXT));
+        assert_eq!(c[1].hint.as_deref(), Some(NO_MINER_TEXT));
         // A missing hook adds what to do when the installer calls it wired.
         let home = home_with_settings(&settings_with(&ALL_FOUR_BARE[..3]));
         let c = claude_hook_checks(Some(home.path()), None);
         assert_eq!(
             c[0].hint.as_deref(),
-            Some(
-                format!(
-                    "{INSTALL_HINT} | if the installer says a missing hook is already wired, \
-                     doctor could not read its command: make ironmem the command's program, \
-                     alone or after env, exec, command, nohup or bash -c, not behind if, {{ }}, \
-                     timeout, time, nice or another wrapper"
-                )
-                .as_str()
-            )
+            Some(format!("{INSTALL_TEXT} | {READ_SHAPE_TEXT}").as_str())
         );
+    }
+
+    #[test]
+    fn a_trusted_settings_env_says_the_installer_hooks_mine() {
+        // The installer writes no mode, so settings.json's env decides; parse
+        // trims and ignores case, as Config::load does.
+        let install = "re-run scripts/install-ironmem.sh to wire the missing hooks, or install \
+            the ironmem Claude Code plugin; the hooks the installer wires bring back session \
+            context and prompt recall, and as settings.json's env sets IRONMEM_MCP_MODE to \
+            trusted, the Stop and PreCompact hooks it wires mine (see hook_mining)";
+        let no_miner = "install the ironmem Claude Code plugin, or re-run \
+            scripts/install-ironmem.sh to wire the missing hooks; as settings.json's env sets \
+            IRONMEM_MCP_MODE to trusted, the Stop and PreCompact hooks it wires mine";
+        for mode in ["trusted", " Trusted "] {
+            let home =
+                home_with_settings(&format!(r#"{{"env": {{"IRONMEM_MCP_MODE": "{mode}"}}}}"#));
+            let c = claude_hook_checks(Some(home.path()), None);
+            assert_eq!(
+                c[0].hint.as_deref(),
+                Some(format!("{install} | {READ_SHAPE_TEXT}").as_str()),
+                "{mode:?}"
+            );
+            assert_eq!(c[1].hint.as_deref(), Some(no_miner), "{mode:?}");
+        }
+        // Any other value, or the shell alone, keeps the general hints.
+        for env in [
+            r#""env": {"IRONMEM_MCP_MODE": "read-only"}"#,
+            r#""env": {"IRONMEM_MCP_MODE": "bogus"}"#,
+            r#""env": {}"#,
+        ] {
+            let home = home_with_settings(&format!("{{{env}}}"));
+            let c = claude_hook_checks(Some(home.path()), Some("trusted"));
+            assert_eq!(
+                c[0].hint.as_deref(),
+                Some(format!("{INSTALL_TEXT} | {READ_SHAPE_TEXT}").as_str()),
+                "{env}"
+            );
+            assert_eq!(c[1].hint.as_deref(), Some(NO_MINER_TEXT), "{env}");
+        }
     }
 
     #[test]
@@ -3366,7 +3447,7 @@ mod tests {
         }
     }
 
-    /// The installer's exec-form miners hint, pinned word for word.
+    /// Doctor's read-only hint for exec-form miners, pinned word for word.
     fn exec_read_only_text(entries: &str) -> String {
         format!(
             "expected outside a plugin install: MCP writes and prompt recall still work. \
@@ -3450,9 +3531,9 @@ mod tests {
     }
 
     #[test]
-    fn an_exec_form_tilde_program_is_not_expanded() {
+    fn an_exec_form_tilde_program_is_read_as_not_expanded() {
         // ~/.ironrace/bin/ironmem exists under the test home, but no shell
-        // expands the ~ of an exec-form command.
+        // reads an exec-form command, and the docs list no ~ expansion.
         let args = [
             "IRONMEM_MCP_MODE=trusted",
             "~/.ironrace/bin/ironmem",
@@ -3468,8 +3549,9 @@ mod tests {
         ]);
         let home = home_with_settings(&settings);
         let c = claude_hook_checks(Some(home.path()), None);
-        let why = "which starts with a ~ that is not expanded, because with args set (exec form) \
-                   no shell reads the command";
+        let why = "which starts with a ~ that doctor reads as not expanded (in exec form, with \
+                   args set, no shell reads the command, and Claude Code's hooks docs do not say \
+                   that it expands ~)";
         assert!(
             c[0].summary.contains(&format!(
                 "SessionStart is wired to ~/.ironrace/bin/ironmem, {why}, so no memory context is \

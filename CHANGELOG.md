@@ -48,16 +48,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged workspace also triggers; with no mined row, its hint lists
   everything that mines. Doctor reads exec-form hook entries (`args` set to an
   array of strings, which Claude Code runs with no shell) as that argument
-  vector: `env` and the other wrappers apply to it, `bash -c` reads its string
-  as a shell command, a `${...}` placeholder counts as unknown, any other `$`
-  is literal, a `~/` program is not expanded, and an entry whose `args` is
-  anything else is skipped. Problems are warnings and never fail `doctor`
+  vector: `env`, `command` and `nohup` apply to it (`exec`, a shell builtin
+  with no program, does not, so such an entry never starts and reads as
+  missing), `bash -c` reads its string as a shell command, a `${...}`
+  placeholder counts as unknown, any other `$` is literal, a `~/` program is
+  read as not expanded (exec form runs no shell, and the hooks docs list no
+  `~` expansion), and an entry whose `args` is anything else is skipped. The
+  read-only hint for a run inside an exec-form `bash -c` string says to put
+  `IRONMEM_MCP_MODE=trusted` before the ironmem command inside that string.
+  When `settings.json`'s `env` sets a writing `IRONMEM_MCP_MODE`, the install
+  hints say the hooks the installer wires mine. Problems are warnings and never fail `doctor`
   (exit 0).
   `scripts/install-ironmem.sh` now appends the four hooks to
   `$CLAUDE_HOME/settings.json` (override with `CLAUDE_SETTINGS_JSON`) unless
   the ironmem plugin is enabled. Hooks already wired, in shell or exec form,
-  and all other hooks and keys are left alone; when no command of an
-  already-wired hook names the installed program, a WARN names what it runs.
+  and all other hooks and keys are left alone. A shell-form command counts as
+  wired when ironmem is in program position, as doctor reads it (so `echo
+  ironmem hook stop` and a comment do not, and `hook --harness <v> <name>`
+  and a quoted name do); unlike doctor, the installer reads an operator
+  inside quotes or a comment as the start of a command. When an already-wired
+  hook names a program by a full path (or `~/...`) that is not the same file
+  as the installed one, and none of its commands names the installed one, a
+  WARN names what it runs; a bare `ironmem` on `PATH`, a `$HOME/...` path and
+  the plugin's wrapper scripts get none.
   `--skip-wiring` skips this, and without `jq` it prints the four entries to
   add by hand, with a note to skip them when the plugin is enabled. If
   settings.json cannot be read or written it warns, wires nothing, and the
@@ -66,10 +79,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   jq's own error), an empty file, and a file that is not a JSON object with
   array-valued hooks (including `"hooks": false`) apart, and for a settings
   file other than `~/.claude/settings.json` it says `ironmem doctor` does not
-  read that file. A hand-wired shell-form command with a flag before the hook
-  name (`ironmem hook --harness claude-code stop`) is not recognized and gets
-  a second copy. The wired hooks run read-only, so they don't mine; a cheaper
-  way to mine outside the plugin is #418.
+  read that file. The wired hooks set no `IRONMEM_MCP_MODE`, so they run
+  read-only and don't mine unless trusted reaches them (the line printed after
+  wiring says they mine when the file's `env` sets it); a cheaper way to mine
+  outside the plugin is #418. The installer's jq programs use only jq 1.5
+  builtins.
 
 ### Changed
 
@@ -249,9 +263,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overflows or underflows) is now logged as a warning naming the drawer when
   the vector index is built or a drawer is added to it; an all-zero one is not
   warned about, by the index or by `add_drawer`'s near-duplicate check. A
-  scoped search's warning about unusable embeddings now also counts rows of
-  the wrong length or with an unscorable similarity, and names the wing and
-  room.
+  scoped search logs one warning, naming the wing and room, with the count of
+  in-scope rows it skips as malformed: an undecodable blob, a length other
+  than the query's, a NaN, infinite, overflowing or underflowing norm, or a
+  similarity that is not finite. An all-zero row is skipped silently.
 
 ## [0.7.0] - 2026-11-09
 

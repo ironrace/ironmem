@@ -71,10 +71,11 @@ pub(super) enum ProgramProblem {
     /// An exec-form program (or the program `env` and the like run from its
     /// arguments) starts with `~/`. Claude Code's hooks docs say exec form
     /// runs no shell, passes each element "exactly as written" and
-    /// substitutes only path placeholders such as `${CLAUDE_PLUGIN_ROOT}`; they
+    /// substitutes path placeholders such as `${CLAUDE_PLUGIN_ROOT}`; they
     /// never mention `~`, so doctor reads it as left literal, a path under a
-    /// directory named `~` that no install creates (inferred, not stated by
-    /// the docs).
+    /// directory named `~` that no install creates. That is inferred, not
+    /// stated by the docs, and the printed reason says so; its hint (correct
+    /// the program path) fixes the hook whichever way Claude Code reads it.
     TildeNotExpanded,
 }
 
@@ -85,8 +86,9 @@ impl ProgramProblem {
             Self::Missing => "does not exist",
             Self::NotExecutable => "is not an executable file",
             Self::TildeNotExpanded => {
-                "starts with a ~ that is not expanded, because with args set (exec form) no \
-                 shell reads the command"
+                "starts with a ~ that doctor reads as not expanded (in exec form, with args set, \
+                 no shell reads the command, and Claude Code's hooks docs do not say that it \
+                 expands ~)"
             }
         }
     }
@@ -175,8 +177,10 @@ impl HookCommand {
     /// Exec form: `program` and `args` are one simple command whose words are
     /// exactly the elements, with no quoting, operators or leading
     /// assignments (a `NAME=value` program is a program of that name). The
-    /// same wrappers, `env` options and programs apply to that vector, and a
-    /// `bash`/`sh -c <string>` element is read as shell form. An element
+    /// same wrappers, `env` options and programs apply to that vector, except
+    /// `exec`: it is a shell builtin with no program to spawn, so a vector
+    /// that names it (as `command`, or after `env`) never starts and is not
+    /// the hook. A `bash`/`sh -c <string>` element is read as shell form. An element
     /// containing `${` holds a path placeholder Claude Code may substitute,
     /// so doctor treats it as built at run time; any other `$` is literal.
     ///
@@ -189,9 +193,18 @@ impl HookCommand {
     /// run reads as missing when it sits behind `if ...; then`, `{ ...; }`,
     /// `timeout 5`, `time`, `nice`, `command -p` or any wrapper other than
     /// `env`, `exec`, `command` and `nohup`: the first word is then not a
-    /// program doctor knows. scripts/install-ironmem.sh matches such shell-form
-    /// commands as already wired, so doctor's missing-hook hint says what to do
-    /// then.
+    /// program doctor knows.
+    ///
+    /// scripts/install-ironmem.sh reads shell-form commands with a regex that
+    /// wants ironmem in the same program positions and reads these shapes the
+    /// same way; scripts/fixtures/hook_stop_fixtures.json pins both to one
+    /// answer per entry. It still differs in two ways: it reads a `;`, `&`,
+    /// `|`, `(`, `)` or line break inside quotes or a comment as the start of
+    /// a command (so `echo "x; ironmem hook stop"` is already wired to it and
+    /// missing to doctor, and doctor's missing-hook hint says what to do then),
+    /// and it does not skip a redirection before the program (`2>/dev/null
+    /// ironmem hook stop` is wired to doctor, and the installer appends a
+    /// second copy).
     pub(super) fn runs_hook(&self, hook: &str) -> bool {
         self.invocations().iter().any(|i| i.hook == hook)
     }

@@ -625,8 +625,11 @@ the first `[FAIL]`:
     `timeout`, `time`, `nice` or another wrapper reads as missing, and so does
     one with a quoted mode prefix such as `"IRONMEM_MCP_MODE=trusted" ironmem
     hook stop`: the shell does not read a quoted `NAME=value` as an assignment,
-    so it looks for a program with that name. The installer counts some of
-    these as already wired, and the hint says what to do then.
+    so it looks for a program with that name. The installer reads these
+    shapes the same way, with one difference: it reads a `;`, `&`, `|`, `(`,
+    `)` or line break inside quotes or a comment as the start of a command, so
+    it can call a hook already wired that doctor reports missing (`echo "x;
+    ironmem hook stop"`), and the hint says what to do then.
   - A SessionStart or UserPromptSubmit hook fails or may fail to start: its
     `IRONMEM_MCP_MODE` is invalid or cannot be judged statically, or its
     program is a full path (or `~/...`) that does not exist or is not an
@@ -648,21 +651,30 @@ the first `[FAIL]`:
   `{"command": "env", "args": ["IRONMEM_MCP_MODE=trusted",
   "/path/to/ironmem", "hook", "stop"]}` is a trusted Stop, and `{"command":
   "ironmem hook stop", "args": []}` names a program called `ironmem hook stop`,
-  so it is not the hook. An element holding a `${...}` placeholder counts as
-  unknown until run time, any other `$` is literal, and a `~/` program is not
-  expanded, so doctor reports that hook as not running. An entry whose `args`
-  is not an array of strings is skipped, and so is one whose `command` is not
-  a string.
+  so it is not the hook. `exec` is a shell builtin with no program behind it,
+  so an entry whose program is `exec` (or `env` running `exec`) never starts
+  and reads as missing. An element holding a `${...}` placeholder counts as
+  unknown until run time, and any other `$` is literal. Doctor reads a `~/`
+  program as not expanded (exec form runs no shell, and the hooks docs list
+  no `~` expansion), so it reports that hook as not running; writing the full
+  path fixes it either way. An entry whose `args` is not an array of strings
+  is skipped, and so is one whose `command` is not a string.
 
   Re-running `scripts/install-ironmem.sh` appends only the missing hooks and
   leaves every hook that is already wired alone, so it fixes a missing hook or
   a missing `settings.json`. It does not fix a hook that fails to start or runs
   twice, a mis-shaped `hooks` block, `disableAllHooks`, or an unreadable
-  `settings.json`, which you fix by hand. The hooks it adds run read-only, so
-  they bring back session context and prompt recall but do not mine until
-  their commands set `IRONMEM_MCP_MODE=trusted` (see `hook_mining`). When no
-  command of a hook it leaves alone names the program it installed, it prints
-  a WARN naming what that hook runs.
+  `settings.json`, which you fix by hand. The hooks it adds bring back session
+  context and prompt recall. They set no `IRONMEM_MCP_MODE`, so they mine only
+  once `IRONMEM_MCP_MODE=trusted` reaches them: from their commands, from
+  `settings.json`'s `env`, or from the environment Claude Code is launched
+  with (see `hook_mining`). After wiring it prints whether the Stop and
+  PreCompact hooks it added mine, judged from that file's `env` alone. When a
+  hook it leaves alone names a program by a full path (or `~/...`) that is not
+  the same file as the one it installed, and no command of that hook names
+  the installed program, it prints a WARN naming what that hook runs; a bare
+  `ironmem` found on `PATH`, a path built with `$HOME` and the plugin's
+  wrapper scripts get no WARN.
 - **`hook_mining` not mining** (a `[WARN]`) → a Stop or PreCompact hook does not
   mine, or neither is wired. A wired hook does not mine when its
   `IRONMEM_MCP_MODE` is `read-only` or `restricted`, or is invalid (the hook
@@ -677,7 +689,8 @@ the first `[FAIL]`:
   recall still work. Prefixing the Stop and PreCompact commands with
   `IRONMEM_MCP_MODE=trusted` turns mining on (for an exec-form entry, make
   `env` the command and put `IRONMEM_MCP_MODE=trusted`, then the program,
-  first in `args`), at the cost of loading the embedding model and rebuilding
+  first in `args`; for a run inside an exec-form entry's `bash -c` string, put
+  it before the ironmem command inside that string), at the cost of loading the embedding model and rebuilding
   the vector index on each run; a cheaper path is tracked in #418. The line is
   an `[INFO]` skip when the `hooks` block cannot be read (`hook mining:
   skipped (the hooks in settings.json cannot be read)`) or `disableAllHooks`
