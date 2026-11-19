@@ -10,26 +10,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`ironmem doctor` reports hooks that leave a store stale (#377).** Three
-  new lines: `hooks` names any of the plugin's four Claude Code hooks missing
+  new lines. `hooks` names any of the plugin's four Claude Code hooks missing
   from `~/.claude/settings.json` (or reports that the enabled plugin supplies
-  them) and warns when a hook fails or may fail to start, and when the enabled
-  ironmem plugin and hand-wired entries in `settings.json` both supply a hook
-  ("so those hooks run twice"; the hint says to "remove the hand-wired ironmem
-  entries from settings.json"); `hook_mining` says whether Stop/PreCompact can
-  mine, with each hook's effective `IRONMEM_MCP_MODE` and where it came from;
-  `mined_rows` shows how old the newest mined row (a chunk of a workspace
-  file) is and warns past 7 days, which an unchanged workspace also triggers.
-  Problems are warnings and never fail `doctor` (exit 0).
+  them). It warns when a SessionStart or UserPromptSubmit hook fails or may
+  fail to start (a Stop or PreCompact that fails to start is reported on
+  `hook_mining`), including a hook whose program is a full path or `~/...`
+  that does not exist or is not an executable file (`SessionStart is wired to
+  <path>, which does not exist, so no memory context is loaded at session
+  start`, hint `correct the program path in that settings.json entry, or
+  remove the entry and re-run scripts/install-ironmem.sh to wire it again (the
+  installer leaves an entry that is already wired as it is)`). It warns when
+  the enabled ironmem plugin and hand-wired entries in `settings.json` both
+  supply a hook ("so those hooks run twice"; the hint says to "remove the
+  hand-wired ironmem entries from settings.json"), or one copy does not start
+  (`the hand-wired <Event> is wired to <path>, which does not exist, so only
+  the plugin's copy runs`). It warns when the `hooks` block is mis-shaped
+  (`Claude Code hooks: cannot read the hooks in <path>: <reason>`, such as
+  `hooks.Stop is not an array` or `hooks is not an object`, hint `fix hooks in
+  settings.json by hand (it must be an object, and each hooks.<event> an array
+  of hook groups), then re-run scripts/install-ironmem.sh, which refuses the
+  file until then`), and when `settings.json` sets `disableAllHooks` to `true`
+  (`Claude Code hooks: <path> sets disableAllHooks to true, so Claude Code runs
+  no ironmem hook unless a project's settings set it back to false: no memory
+  context is loaded at session start, prompt recall is off and no hook mines
+  workspace files`, hint `remove disableAllHooks from settings.json or set it
+  to false`). A hook behind a quoted mode prefix (`"IRONMEM_MCP_MODE=trusted"
+  ironmem hook stop`) reads as missing, because the shell runs a program with
+  that name. `hook_mining` says whether Stop/PreCompact can mine, with each
+  hook's effective `IRONMEM_MCP_MODE` and where it came from (`Stop: wired to
+  <path>, which does not exist -> does not run` for a missing program); it is
+  skipped when the hooks cannot be read (`hook mining: skipped (the hooks in
+  settings.json cannot be read)`) or are all disabled (`hook mining: skipped
+  (disableAllHooks is true in settings.json; see the hooks line)`). A mode
+  doctor sees only in its own environment is reported as applying to a Claude
+  Code launched from that shell. `mined_rows` shows how old the newest mined
+  row (a chunk of a workspace file) is and warns past 7 days, which an
+  unchanged workspace also triggers; with no mined row, its hint lists
+  everything that mines. Doctor reads exec-form hook entries (`args` set to an
+  array of strings, which Claude Code runs with no shell) as that argument
+  vector: `env` and the other wrappers apply to it, `bash -c` reads its string
+  as a shell command, a `${...}` placeholder counts as unknown, any other `$`
+  is literal, a `~/` program is not expanded, and an entry whose `args` is
+  anything else is skipped. Problems are warnings and never fail `doctor`
+  (exit 0).
   `scripts/install-ironmem.sh` now appends the four hooks to
   `$CLAUDE_HOME/settings.json` (override with `CLAUDE_SETTINGS_JSON`) unless
-  the ironmem plugin is enabled. Hooks already wired and all other hooks and
-  keys are left alone; `--skip-wiring` skips this, and without `jq` it prints
-  the four entries to add by hand. If settings.json cannot be read or written
-  it warns, wires nothing, and the install continues (a write that fails
-  partway can leave the file incomplete, and the warning says so). A
-  hand-wired command with a flag before the hook name
-  (`ironmem hook --harness claude-code stop`) is not recognized and gets a
-  second copy. The wired hooks run read-only, so they don't mine; a cheaper
+  the ironmem plugin is enabled. Hooks already wired, in shell or exec form,
+  and all other hooks and keys are left alone; when no command of an
+  already-wired hook names the installed program, a WARN names what it runs.
+  `--skip-wiring` skips this, and without `jq` it prints the four entries to
+  add by hand, with a note to skip them when the plugin is enabled. If
+  settings.json cannot be read or written it warns, wires nothing, and the
+  install continues (a write that fails partway can leave the file
+  incomplete, and the warning says so). The warning tells invalid JSON (with
+  jq's own error), an empty file, and a file that is not a JSON object with
+  array-valued hooks (including `"hooks": false`) apart, and for a settings
+  file other than `~/.claude/settings.json` it says `ironmem doctor` does not
+  read that file. A hand-wired shell-form command with a flag before the hook
+  name (`ironmem hook --harness claude-code stop`) is not recognized and gets
+  a second copy. The wired hooks run read-only, so they don't mine; a cheaper
   way to mine outside the plugin is #418.
 
 ### Changed
@@ -141,7 +180,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   injected text grew from 1,700 to 2,398 bytes.
 - **Search's keyword leg ignores upper-case `AND`, `OR`, `NOT` and `NEAR`
   (#377).** Unless quoted on their own (`"NOT"`), they are dropped from the
-  query, so `a OR b` requires both words and `a NOT b` no longer excludes `b`;
+  query, so `a OR b` requires both words and `a NOT b` requires `b` too;
   lower-case forms stay ordinary words.
 
 ### Fixed
@@ -206,6 +245,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyword search; collab messages were never keyword-indexed and are read by
   id. Everything the noop embedder (`IRONMEM_EMBED_MODE=noop`) writes is an
   all-zero vector too, so search over a store it wrote is keyword-only.
+  A damaged stored embedding (a NaN or infinite value, or a norm that
+  overflows or underflows) is now logged as a warning naming the drawer when
+  the vector index is built or a drawer is added to it; an all-zero one is not
+  warned about, by the index or by `add_drawer`'s near-duplicate check. A
+  scoped search's warning about unusable embeddings now also counts rows of
+  the wrong length or with an unscorable similarity, and names the wing and
+  room.
 
 ## [0.7.0] - 2026-11-09
 
