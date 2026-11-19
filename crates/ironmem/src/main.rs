@@ -979,6 +979,62 @@ enum AutopilotCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Report a repo's gate config and its `agent:*` / `risk:*` labels,
+    /// changing nothing
+    ///
+    /// Read-only: the database file is never created, migrated or written,
+    /// though SQLite may create its `-wal`/`-shm` side files next to it; `gh`
+    /// is only asked to list labels.
+    ///
+    /// Exit status: 0 when a report was printed. That includes a repo that
+    /// is not onboarded (`"onboarded": false`, `"gate_config": null`) and
+    /// labels that could not be read (`"labels": {"read": "failed", ...}`).
+    /// 2 for a usage error, which includes an argument that is not UTF-8.
+    /// 1 when there is no report, for one of the reasons below;
+    /// docs/AUTOPILOT.md describes each.
+    ///
+    /// The repo is not an `owner/name` (or `host/owner/name`) of at most 200
+    /// characters, each part made of letters, digits, `.`, `_` and `-`, not
+    /// starting with `-` and not made only of `.`; or it ends in `.git`.
+    ///
+    /// The database is missing, is a directory, cannot be reached, opened
+    /// or read (a file that is not an ironmem database, a database another
+    /// process holds locked); its path is empty (an empty `--db`, or an
+    /// empty `IRONMEM_DB_PATH` with no `--db`); a relative path cannot be
+    /// made absolute; or its absolute path is not UTF-8.
+    ///
+    /// The config stored under this name's storage key does not parse, or
+    /// belongs to another repo name (two names that differ only in `/`
+    /// versus `-` share a key; the error names the other repo and gives no
+    /// command for this one).
+    ///
+    /// No config is stored under this exact name, and one of these holds. A
+    /// config is stored under a name that differs only in letter case or in
+    /// whether it names a host (the error names it; a stored name never
+    /// matches a name on another host). A config that does not parse could
+    /// be this repo's under another spelling (one that holds no name is
+    /// matched by its storage key, which can match a name on another host).
+    /// Or the stored configs cannot all be compared with this name, which
+    /// is reported before either of those: 1000 or more are stored, or one
+    /// is filed under an id that is not its key's.
+    ///
+    /// The ironmem config cannot be loaded, as for every command that loads
+    /// it (`IRONMEM_MCP_MODE` or `IRONMEM_EMBED_MODE` holds a value it does
+    /// not accept, or the home directory cannot be determined), or the
+    /// report could not be written to stdout.
+    Status {
+        /// Path to the database
+        #[arg(long)]
+        db: Option<String>,
+        /// Repo identity (e.g. "owner/repo")
+        repo: String,
+        /// Directory `gh` runs in
+        #[arg(long, default_value = ".")]
+        path: String,
+        /// Emit JSON instead of text
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Parse one `--repo owner/repo=/path/to/checkout` argument.
@@ -1592,12 +1648,10 @@ fn open_controller_db(db: Option<String>) -> Result<ironmem::db::schema::Databas
     open_migrated_db(db)
 }
 
-/// Load config, open, and migrate the database — the sequence every
-/// `Autopilot` subcommand handler needs before touching storage. Several
-/// other command handlers in this file repeat the same three-line sequence
-/// inline rather than through a shared helper; that pre-existing duplication
-/// is out of scope here, but the new `Autopilot` arms at least don't add
-/// to it.
+/// Load config, open, and migrate the database: what every `Autopilot`
+/// subcommand that touches storage needs first, except `status`, which
+/// reads through a read-only open and never migrates. Some command handlers
+/// outside `Autopilot` repeat the same three lines inline.
 fn open_migrated_db(db: Option<String>) -> Result<ironmem::db::schema::Database, MemoryError> {
     let cfg = config::Config::load(db)?;
     let database = ironmem::db::schema::Database::open(&cfg.db_path)?;
@@ -3543,6 +3597,53 @@ after {n} attempt(s)",
                 }
                 Ok(())
             }
+            AutopilotCmd::Status {
+                db,
+                repo,
+                path,
+                json,
+            } => {
+                use std::io::Write;
+
+                use ironmem::autopilot::status::{read_gate_config_status, render_text, RepoName};
+
+                let cfg = config::Config::load(db.clone())?;
+                // Parsed here and not by clap, whose own parse failure exits
+                // 2: a malformed repo name is exit 1.
+                let repo = RepoName::parse(&repo)?;
+                // `read_gate_config_status` opens the database read-only.
+                // Not `open_migrated_db`, which opens read-write and
+                // migrates: this command must not create a missing database
+                // or migrate an old one.
+                let read = read_gate_config_status(&cfg.db_path, &repo)?;
+                let status = read.with_labels_read_in(std::path::Path::new(&path));
+                let report = if json {
+                    format!("{}\n", serde_json::to_string_pretty(&status)?)
+                } else {
+                    // Hint `--db` only when one was given; the hint carries the
+                    // report's absolute path, so `--db` names the same file
+                    // from any directory.
+                    render_text(&status, db.is_some())
+                };
+                // Not `print!`, which panics (exit 101) when stdout is a
+                // closed pipe or a full disk: a write that fails is exit 1,
+                // like every other failure to report. A stdout that was
+                // closed before the program started (`>&-`) is not such a
+                // failure and is not detected: the Rust runtime reopens a
+                // closed standard descriptor on `/dev/null` and reads a bad
+                // descriptor on stdout as written, so the report is
+                // discarded and the exit is 0.
+                let mut stdout = std::io::stdout().lock();
+                write!(stdout, "{report}")
+                    .and_then(|()| stdout.flush())
+                    .map_err(|err| {
+                        MemoryError::Io(std::io::Error::new(
+                            err.kind(),
+                            format!("could not write the report to stdout: {err}"),
+                        ))
+                    })?;
+                Ok(())
+            }
         },
         Commands::Harnesses { format } => {
             match format.as_str() {
@@ -4107,6 +4208,275 @@ mod tests {
                 assert!(!json);
             }
             _ => panic!("expected Commands::Autopilot(Labels), got a different variant"),
+        }
+    }
+
+    #[test]
+    fn autopilot_status_takes_a_repo_and_defaults_to_text_in_the_current_directory() {
+        let cli = Cli::try_parse_from(["ironmem", "autopilot", "status", "owner/repo"])
+            .expect("expected argv to parse");
+        match cli.command {
+            Commands::Autopilot {
+                cmd:
+                    AutopilotCmd::Status {
+                        db,
+                        repo,
+                        path,
+                        json,
+                    },
+            } => {
+                assert_eq!(repo, "owner/repo");
+                assert_eq!(path, ".");
+                assert_eq!(db, None);
+                assert!(!json);
+            }
+            _ => panic!("expected Commands::Autopilot(Status), got a different variant"),
+        }
+    }
+
+    /// The three files that state the `/evaluate-issue` router.
+    const ROUTER_SURFACES: [&str; 3] = [
+        "docs/EVALUATE_ISSUE.md",
+        ".claude-plugin/commands/evaluate-issue.md",
+        ".codex-plugin/prompts/evaluate-issue.md",
+    ];
+
+    /// The `ironmem` commands the router runs or prints for the gate-config
+    /// read and its fix lines, spelled as its files spell them: the Step 2
+    /// read, the three fix-line commands, and the phase-2 GOAL recheck.
+    const ROUTER_COMMANDS: [&str; 5] = [
+        "ironmem autopilot status <owner>/<repo> --json",
+        "ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'",
+        "ironmem autopilot approve <owner>/<repo> --db '<db>'",
+        "ironmem autopilot labels <owner>/<repo>",
+        "ironmem autopilot status <owner>/<repo> --db '<db>'",
+    ];
+
+    /// Every other `ironmem` command line the router files hold, with the
+    /// subcommand each must parse as: the two AUTOPILOT commands, and the
+    /// spec's worked example of the recheck. clap is asked about these too.
+    const OTHER_ROUTER_COMMANDS: [(&str, &str); 3] = [
+        (
+            "ironmem autopilot lead --repo '<owner>/<repo>=<checkout>' --base 'origin/<default branch>'",
+            "lead",
+        ),
+        (
+            "ironmem autopilot advance --repo '<owner>/<repo>=<checkout>' --reviewer codex",
+            "advance",
+        ),
+        (
+            "ironmem autopilot status jeffreycrum/tenfourpro --db '<db>'",
+            "status",
+        ),
+    ];
+
+    /// A subcommand the router files name without its arguments, in a
+    /// heading. clap is asked only whether it exists.
+    const ROUTER_SUBCOMMAND_NAMES: [&str; 1] = ["ironmem autopilot lead"];
+
+    /// Every backticked span in `text` that starts an `ironmem` command line.
+    fn ironmem_spans(text: &str) -> Vec<&str> {
+        text.split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|span| span.starts_with("ironmem "))
+            .collect()
+    }
+
+    const ROUTER_CHECKOUT: &str = "/srv/check out";
+    const ROUTER_DB: &str = "/var/ironmem dbs/memory.sqlite3";
+
+    /// A router command as a shell would hand it to `ironmem`: its
+    /// placeholders filled in, then split at the spaces outside single
+    /// quotes. The checkout and database paths hold a space, so a
+    /// placeholder the router did not quote splits into two arguments.
+    fn router_argv(command: &str) -> Vec<String> {
+        let filled = command
+            .replace("<owner>/<repo>", "owner/repo")
+            .replace("<checkout>", ROUTER_CHECKOUT)
+            .replace("<default branch>", "main")
+            .replace("<db>", ROUTER_DB);
+        let mut argv = vec![String::new()];
+        let mut quoted = false;
+        for ch in filled.chars() {
+            match ch {
+                '\'' => quoted = !quoted,
+                ' ' if !quoted => argv.push(String::new()),
+                other => argv.last_mut().unwrap().push(other),
+            }
+        }
+        assert!(!quoted, "unbalanced quote in {command:?}");
+        argv
+    }
+
+    /// Every `ironmem` command the `/evaluate-issue` router names for the
+    /// gate-config read and its fix lines is in all three router files as
+    /// written here, and clap accepts it as written, with each flag's value
+    /// on the field it names.
+    #[test]
+    fn clap_accepts_the_commands_the_issue_router_names() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for rel in ROUTER_SURFACES {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
+            for command in ROUTER_COMMANDS {
+                assert!(
+                    text.contains(&format!("`{command}`")),
+                    "{rel} does not name `{command}`: if the router's command changed, \
+                     change ROUTER_COMMANDS with it so clap is asked about the new one"
+                );
+            }
+        }
+
+        let mut seen = Vec::new();
+        for command in ROUTER_COMMANDS {
+            let cli = Cli::try_parse_from(router_argv(command))
+                .unwrap_or_else(|e| panic!("clap refuses the router's `{command}`: {e}"));
+            let Commands::Autopilot { cmd } = cli.command else {
+                panic!("`{command}` is not an autopilot command");
+            };
+            let wants_db = command.contains("--db '<db>'");
+            let expected_db = wants_db.then(|| ROUTER_DB.to_string());
+            match cmd {
+                AutopilotCmd::Status {
+                    db,
+                    repo,
+                    path,
+                    json,
+                } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(db, expected_db, "{command}");
+                    assert_eq!(path, ".", "{command}");
+                    assert_eq!(json, command.ends_with("--json"), "{command}");
+                    seen.push("status");
+                }
+                AutopilotCmd::Onboard {
+                    db,
+                    repo,
+                    path,
+                    json,
+                } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(db, expected_db, "{command}");
+                    assert_eq!(path, ROUTER_CHECKOUT, "{command}");
+                    assert!(!json, "{command}");
+                    seen.push("onboard");
+                }
+                AutopilotCmd::Approve { db, repo, json } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(db, expected_db, "{command}");
+                    assert!(!json, "{command}");
+                    seen.push("approve");
+                }
+                AutopilotCmd::Labels { repo, path, json } => {
+                    assert_eq!(repo, "owner/repo", "{command}");
+                    assert_eq!(path, ".", "{command}");
+                    assert!(!json, "{command}");
+                    seen.push("labels");
+                }
+                _ => panic!("`{command}` parsed as an unexpected autopilot subcommand"),
+            }
+        }
+        assert_eq!(
+            seen,
+            ["status", "onboard", "approve", "labels", "status"],
+            "each router command must parse as the subcommand it names"
+        );
+
+        // `labels` takes no `--db`, which is why the router's `labels` fix
+        // line carries none. This is also the check that the parser above
+        // refuses a flag a subcommand does not have.
+        assert!(
+            Cli::try_parse_from(["ironmem", "autopilot", "labels", "owner/repo", "--db", "x"])
+                .is_err(),
+            "`autopilot labels` accepted --db"
+        );
+    }
+
+    /// The other direction: every `ironmem` command line in a router file is
+    /// one clap is asked about, here or in the test above. A command added
+    /// to a file and to neither list fails, so a router cannot gain a command
+    /// with a flag its subcommand does not have and stay green.
+    #[test]
+    fn clap_is_asked_about_every_ironmem_command_the_issue_router_holds() {
+        let known: Vec<&'static str> = ROUTER_COMMANDS
+            .into_iter()
+            .chain(
+                OTHER_ROUTER_COMMANDS
+                    .into_iter()
+                    .map(|(command, _)| command),
+            )
+            .chain(ROUTER_SUBCOMMAND_NAMES)
+            .collect();
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut found: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for rel in ROUTER_SURFACES {
+            let text = std::fs::read_to_string(root.join(rel))
+                .unwrap_or_else(|e| panic!("{rel}: cannot read router surface: {e}"));
+            assert!(
+                text.matches('`').count().is_multiple_of(2),
+                "{rel}: an unpaired backtick, so its code spans cannot be told apart"
+            );
+            for span in ironmem_spans(&text) {
+                assert!(
+                    known.contains(&span),
+                    "{rel} holds `{span}`, a command no test asks clap about: add it to \
+                     ROUTER_COMMANDS or OTHER_ROUTER_COMMANDS"
+                );
+                found.insert(span.to_string());
+            }
+        }
+        // Each list entry is still in some file, so neither list keeps a
+        // command the router dropped.
+        for command in &known {
+            assert!(
+                found.contains(*command),
+                "no router file holds `{command}` any more: drop it from its list"
+            );
+        }
+
+        for (command, subcommand) in OTHER_ROUTER_COMMANDS {
+            let cli = Cli::try_parse_from(router_argv(command))
+                .unwrap_or_else(|e| panic!("clap refuses the router's `{command}`: {e}"));
+            let Commands::Autopilot { cmd } = cli.command else {
+                panic!("`{command}` is not an autopilot command");
+            };
+            let parsed_as = match cmd {
+                AutopilotCmd::Lead { repos, base, .. } => {
+                    assert_eq!(
+                        repos,
+                        [format!("owner/repo={ROUTER_CHECKOUT}")],
+                        "{command}"
+                    );
+                    assert_eq!(base, "origin/main", "{command}");
+                    "lead"
+                }
+                AutopilotCmd::Advance { repos, .. } => {
+                    assert_eq!(
+                        repos,
+                        [format!("owner/repo={ROUTER_CHECKOUT}")],
+                        "{command}"
+                    );
+                    "advance"
+                }
+                AutopilotCmd::Status { db, repo, .. } => {
+                    assert_eq!(repo, "jeffreycrum/tenfourpro", "{command}");
+                    assert_eq!(db.as_deref(), Some(ROUTER_DB), "{command}");
+                    "status"
+                }
+                _ => panic!("`{command}` parsed as an unexpected autopilot subcommand"),
+            };
+            assert_eq!(parsed_as, subcommand, "{command}");
+        }
+        for name in ROUTER_SUBCOMMAND_NAMES {
+            let mut argv = router_argv(name);
+            argv.push("--help".to_string());
+            let asked = Cli::try_parse_from(argv).map(|_| ()).unwrap_err();
+            assert_eq!(
+                asked.kind(),
+                clap::error::ErrorKind::DisplayHelp,
+                "`{name}` is not a subcommand clap knows: {asked}"
+            );
         }
     }
 

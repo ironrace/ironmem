@@ -65,12 +65,20 @@ tracing.**
    (`crates/*/migrations/`, version bumps), or a **new subsystem / crate**.
 4. Read the unattended-route prerequisites for the **issue's** repo. All are
    reads; none creates, labels, or onboards anything:
-   - **Approved gate config** — ironmem MCP
-     `get_drawer(wing="autopilot", room="backlog-lineage", logical_key="gate-config:<slug>")`,
-     `<slug>` = `<owner>/<repo>` with every character other than `A-Z`,
-     `a-z`, `0-9`, `-`, `_`, `.` replaced by `-`. Approved only when found with
-     JSON `state` `"approved"`; keep its `gate_commands`.
-     Anything else — a tool error, redacted or non-JSON content, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
+   - **Approved gate config** — run
+     `ironmem autopilot status <owner>/<repo> --json` (read-only: it never
+     creates or migrates the database, though SQLite may leave `-wal`/`-shm`
+     side files beside it, and asks `gh` only to list labels).
+     Approved only when it exits 0 and its JSON `gate_config` is an object whose `state` is `"approved"`; keep that object's `gate_commands`.
+     Use only its exit status, `gate_config` and `db`: the label requirements come from the two `gh label list` reads below, never from its `labels` section.
+     A `null` `gate_config` is a repo not onboarded under that exact name in
+     the database the report names in `db` (a repo onboarded in another
+     database reads the same way); a `state` of `"pending"` is a proposal
+     nobody has approved.
+     When no config is stored under that exact name, a name that differs from an onboarded one only in letter case, or in whether it names a host, exits 1, and a name that a stored config that does not parse could be another spelling of exits 1 too; a config that does not parse under the exact name exits 1 whatever else is stored: each is a failed read, not `null`.
+     Anything else — a non-zero exit, output that is not JSON, a `null` `gate_config`, another `state`, or a `gate_commands` that is missing, empty or has a blank entry — means not approved. Never infer gate commands from the repo.
+     A non-zero exit, a run that could not be made, output that is not JSON, or a report that is none of approved, pending or `null` is a failed read: the router reports it as one, naming the command and its error, never as a repo that is not onboarded and with no onboard fix line.
+     An `ironmem` missing from `PATH` or too old to have the `status` subcommand fails this way; the fix is a current install.
    - **Agent labels** —
      `gh label list --repo <owner>/<repo> --search "agent:" --limit 100 --json name -q '.[].name'`
      must list all three of `agent:ready`, `agent:blocked`, `agent:exhausted`.
@@ -139,14 +147,18 @@ not justify COLLAB — it drives the review tier recommendation instead.
    When unsure between an envelope class and `logic`, the class is `logic`.
    If the issue otherwise fits but a prerequisite is missing, add
    `Missing AUTOPILOT prerequisite:` to *Why* with its fix, then continue
-   down the list. No approved gate config →
-   `ironmem autopilot onboard <owner>/<repo> --path '<checkout>'` (write any
-   `'` in `<checkout>` as `'\''`) then
-   `ironmem autopilot approve <owner>/<repo>`; agent labels missing →
+   down the list. Repo not onboarded (`gate_config` `null`) →
+   `ironmem autopilot onboard <owner>/<repo> --path '<checkout>' --db '<db>'`
+   then `ironmem autopilot approve <owner>/<repo> --db '<db>'`, where `<db>`
+   is the path the report gave in `db` (write any `'` in `<checkout>` or
+   `<db>` as `'\''`);
+   gate config `"pending"` → review its `gate_commands` and `manifest_warnings`, re-run that `onboard` command first if `proposed_at` is old or the checkout's build setup has changed since, then that `approve` command;
+   agent labels missing →
    `ironmem autopilot labels <owner>/<repo>`; `risk:<expected class>` label
    missing → `gh label create "risk:<expected class>" --repo <owner>/<repo>`;
    issue carries `risk:<other>` → name it; removing it is a human's risk
    call, never a printed command.
+   A failed `status` read gets neither command: its fix line gives the command that was run, its exit status if it had one, and its error; for an `ironmem` that is missing or too old, it also says to install a current one.
    Autopilot merges under the issue's `risk:*` label, which must still be on the issue when `advance` runs:
    `decide_merge` holds the PR unless that label's class equals the class the
    reviewer derives from the diff, and the gate and the review must also pass.
@@ -164,8 +176,9 @@ not justify COLLAB — it drives the review tier recommendation instead.
    than judgment-shaped; no open design decision. It covers unattended work
    outside the auto-merge envelope, in a repo without the labels, or wherever
    rule 1 (AUTOPILOT) does not hold; a human merges its PR. If it otherwise fits but the gate config is not approved,
-   add `Missing GOAL prerequisite:` to *Why* with the onboard + approve
-   commands and continue down the list.
+   add `Missing GOAL prerequisite:` to *Why*
+   with the fix rule 1 gives for that state (not onboarded, pending, or a failed `status` read)
+   and continue down the list.
 
 4. **COLLAB** — choose when **any** hold: requires real design judgment
    (public API/contract, state-machine, schema migration, new subsystem);
@@ -185,7 +198,9 @@ not justify COLLAB — it drives the review tier recommendation instead.
    `<COLLAB | IRON> → <GOAL | AUTOPILOT>` when **all** hold: phase 1 settles
    every decision the remainder depends on; the remainder, judged as if phase
    1 had merged, meets rule 1 or rule 3 on its own, prerequisites included;
-   the remainder is roughly half the effort or more. Never more than two
+   the remainder is roughly half the effort or more.
+   When the remainder would meet rule 1 or rule 3 but for a prerequisite, a failed read included, keep the single verdict and add that rule's `Missing AUTOPILOT prerequisite:` or `Missing GOAL prerequisite:` line to *Why*.
+   Never more than two
    phases; phase 2 is always GOAL or AUTOPILOT. A phase-2 AUTOPILOT runs on
    a remainder issue of its own, which the user opens after phase 1 merges so
    that it can cite phase 1's PR. At phase-1 time the router only drafts that
@@ -249,9 +264,12 @@ For GOAL or AUTOPILOT alone, stop after printing; otherwise **wait for the
 user**. On an explicit yes, invoke the recommended path; for a two-phase
 verdict, phase 1 only — phase 2 is the user's to run after phase 1's PR
 merges. A phase-2 GOAL is printed as a ready-to-run command: before running
-it, the user asks an agent session to run the Step 2 `get_drawer` read (no
-read-only CLI prints it) and confirms that the gate config is still approved
-and that its `gate_commands` still match the printed condition. Rerunning
+it, the user runs
+`ironmem autopilot status <owner>/<repo> --db '<db>'`
+for the issue's repo (the Step 2 read, as text, against the database that
+read named in `db`; write any `'` in `<db>` as `'\''`) and confirms that the
+gate config is still approved and that its `gate_commands` still match the
+printed condition. Rerunning
 `/evaluate-issue` on the parent is not the mechanism; it would re-score the
 original issue and print the same two-phase verdict. A
 phase-2 AUTOPILOT is printed as an instruction: the user opens the remainder

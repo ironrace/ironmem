@@ -269,6 +269,7 @@ pub mod review_prompt;
 pub mod run;
 pub mod scrub;
 pub mod stagnation;
+pub mod status;
 pub mod supervise;
 #[cfg(test)]
 pub(crate) use crate::test_git;
@@ -276,6 +277,7 @@ pub mod turn_prompt;
 pub mod worktree;
 
 use crate::db::drawers::{generate_id, Drawer};
+use crate::db::read_only::ReadOnlyDb;
 use crate::db::schema::Database;
 use crate::error::MemoryError;
 // Imported (not duplicated) from `crate::mcp::tools`, which re-exports them
@@ -544,6 +546,40 @@ pub(crate) fn write_current_tx(
 pub(crate) fn read_current(db: &Database, key: &str) -> Result<Option<Drawer>, MemoryError> {
     let id = logical_drawer_id(key);
     db.get_drawer(&id)
+}
+
+/// [`read_current`] over a read-only handle (#420).
+///
+/// Same id, same lookup. It is a separate function rather than a generic one
+/// so that `ironmem autopilot status` reads through a [`ReadOnlyDb`]. The
+/// connection under that handle is opened `SQLITE_OPEN_READ_ONLY`, and that
+/// flag is what refuses a write. The handle's own methods are reads, but it
+/// also lends its raw connection, so the type is not the guarantee.
+pub(crate) fn read_current_read_only(
+    db: &ReadOnlyDb,
+    key: &str,
+) -> Result<Option<Drawer>, MemoryError> {
+    db.get_drawer(&logical_drawer_id(key))
+}
+
+/// Fixtures shared by this module's children's unit tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use crate::db::schema::Database;
+
+    /// A migrated database on disk. `Database::open_read_only` refuses to
+    /// create a file, so a test of a read-only read needs a real one.
+    ///
+    /// The path is spelled as `std::path::absolute` spells it, so a test
+    /// that compares it with a path the code made absolute passes under a
+    /// `TMPDIR` that holds `//` or `/./`.
+    pub(crate) fn on_disk_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::path::absolute(dir.path().join("memory.sqlite3")).unwrap();
+        let db = Database::open(&path).unwrap();
+        db.migrate().unwrap();
+        (dir, path)
+    }
 }
 
 #[cfg(test)]
