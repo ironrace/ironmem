@@ -173,7 +173,9 @@ enum HookWiring {
     /// for this reason.
     MisShaped(String),
     /// settings.json sets `disableAllHooks: true`, so Claude Code runs no
-    /// hook, the plugin's included.
+    /// ironmem hook, the plugin's included, unless a project's settings set it
+    /// back to false (managed-policy hooks still run; doctor does not read
+    /// project or managed settings).
     AllHooksDisabled,
     /// The ironmem plugin is enabled; its hooks.json supplies the hooks.
     Plugin {
@@ -266,8 +268,9 @@ pub(super) fn claude_hook_checks(
                 CheckStatus::Warn,
                 format!(
                     "Claude Code hooks: {} sets disableAllHooks to true, so Claude Code runs no \
-                     hooks: no memory context is loaded at session start, prompt recall is off \
-                     and no hook mines workspace files",
+                     ironmem hook unless a project's settings set it back to false: no memory \
+                     context is loaded at session start, prompt recall is off and no hook mines \
+                     workspace files",
                     path.display()
                 ),
             )
@@ -275,7 +278,7 @@ pub(super) fn claude_hook_checks(
             Check::new(
                 HOOK_MINING_KEY,
                 CheckStatus::Info,
-                "hook mining: skipped (disableAllHooks is true in settings.json, so no hook runs)",
+                "hook mining: skipped (disableAllHooks is true in settings.json; see the hooks line)",
             ),
         ],
         HookWiring::Plugin {
@@ -914,8 +917,8 @@ impl NoMineCause {
                  (removing it leaves bare hook commands read-only)"
             ),
             Self::Shell(raw) => format!(
-                "Claude Code inherits IRONMEM_MCP_MODE={raw:?} from the shell that launches it; \
-                 launch it with IRONMEM_MCP_MODE=trusted to mine"
+                "doctor ran with IRONMEM_MCP_MODE={raw:?}, and a Claude Code launched from this \
+                 shell inherits it; launch Claude Code with IRONMEM_MCP_MODE=trusted to mine"
             ),
             Self::Default => read_only_hint(events),
         }
@@ -1565,8 +1568,9 @@ mod tests {
                 c[0].summary,
                 format!(
                     "Claude Code hooks: {} sets disableAllHooks to true, so Claude Code runs no \
-                     hooks: no memory context is loaded at session start, prompt recall is off \
-                     and no hook mines workspace files",
+                     ironmem hook unless a project's settings set it back to false: no memory \
+                     context is loaded at session start, prompt recall is off and no hook mines \
+                     workspace files",
                     path.display()
                 ),
                 "{settings}"
@@ -1575,7 +1579,7 @@ mod tests {
             assert_eq!(c[1].status, CheckStatus::Info, "{settings}");
             assert_eq!(
                 c[1].summary,
-                "hook mining: skipped (disableAllHooks is true in settings.json, so no hook runs)"
+                "hook mining: skipped (disableAllHooks is true in settings.json; see the hooks line)"
             );
             assert_eq!(c[1].hint, None);
         }
@@ -2387,10 +2391,9 @@ mod tests {
             Some("ReadOnly"),
         );
         let hint = c.hint.as_deref().unwrap();
-        assert!(hint.contains("launch"), "{hint}");
-        assert!(
-            hint.contains(r#"inherits IRONMEM_MCP_MODE="ReadOnly""#),
-            "{hint}"
+        assert_eq!(
+            hint,
+            r#"doctor ran with IRONMEM_MCP_MODE="ReadOnly", and a Claude Code launched from this shell inherits it; launch Claude Code with IRONMEM_MCP_MODE=trusted to mine"#
         );
         assert!(!hint.contains("prefix"), "{hint}");
     }
