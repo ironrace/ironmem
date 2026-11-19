@@ -14,8 +14,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::hook_command::{
-    best_result, hook_modes, runs_hook, source_label, ModeEnv, ModeError, ModeSource,
-    ProgramProblem, RunMode,
+    best_result, source_label, HookCommand, ModeEnv, ModeError, ModeSource, ProgramProblem, RunMode,
 };
 use super::{Check, CheckStatus};
 
@@ -103,18 +102,26 @@ IRONMEM_MCP_MODE=trusted in their commands; the installer wires them read-only, 
 mine";
 
 /// The hint for bare manual miners that run read-only, naming those `events`.
-fn read_only_hint(events: &[&str]) -> String {
-    let commands = if events.len() == 1 {
-        "command"
-    } else {
-        "commands"
+/// `exec` says they are exec-form entries (`args` set), whose command cannot
+/// take an assignment prefix: no shell reads it.
+fn read_only_hint(events: &[&str], exec: bool) -> String {
+    let events_text = events.join(" and ");
+    let fix = match (exec, events.len()) {
+        (false, 1) => format!("prefix the {events_text} command with IRONMEM_MCP_MODE=trusted"),
+        (false, _) => format!("prefix the {events_text} commands with IRONMEM_MCP_MODE=trusted"),
+        (true, 1) => format!(
+            "in the {events_text} entry (exec form, args set) make env the command and put \
+             IRONMEM_MCP_MODE=trusted, then the program, first in args"
+        ),
+        (true, _) => format!(
+            "in the {events_text} entries (exec form, args set) make env the command and put \
+             IRONMEM_MCP_MODE=trusted, then the program, first in args"
+        ),
     };
     format!(
         "expected outside a plugin install: MCP writes and prompt recall still work. A cheaper \
-         way to mine without the plugin is tracked in #418. To mine now, prefix the {} {commands} \
-         with IRONMEM_MCP_MODE=trusted; each run then loads the embedding model and rebuilds the \
-         vector index",
-        events.join(" and ")
+         way to mine without the plugin is tracked in #418. To mine now, {fix}; each run then \
+         loads the embedding model and rebuilds the vector index"
     )
 }
 
@@ -157,7 +164,7 @@ struct Context<'a> {
 }
 
 /// Plugin hooks that settings.json wires, with every command matching each.
-type WiredHooks = Vec<(&'static PluginHook, Vec<String>)>;
+type WiredHooks = Vec<(&'static PluginHook, Vec<HookCommand>)>;
 
 /// What `~/.claude/settings.json` says about the ironmem hooks.
 #[derive(Debug)]
@@ -287,7 +294,10 @@ pub(super) fn claude_hook_checks(
         } => {
             let wired: WiredHooks = PLUGIN_HOOKS
                 .iter()
-                .map(|hook| (hook, vec![format!("{PLUGIN_HOOK_COMMAND} {}", hook.name)]))
+                .map(|hook| {
+                    let command = format!("{PLUGIN_HOOK_COMMAND} {}", hook.name);
+                    (hook, vec![HookCommand::Shell(command)])
+                })
                 .collect();
             let ctx = Context {
                 env: ModeEnv {
@@ -404,9 +414,9 @@ fn detect_hook_wiring(claude_dir: &Path) -> HookWiring {
     let mut wired = Vec::new();
     let mut missing = Vec::new();
     for hook in &PLUGIN_HOOKS {
-        let matching: Vec<String> = commands_for(&doc, hook.event)
+        let matching: Vec<HookCommand> = commands_for(&doc, hook.event)
             .into_iter()
-            .filter(|c| runs_hook(c, hook.name))
+            .filter(|c| c.runs_hook(hook.name))
             .collect();
         if matching.is_empty() {
             missing.push(hook);
@@ -466,9 +476,9 @@ fn plugin_enabled(doc: &Value) -> bool {
         })
 }
 
-/// Every `command` string under `hooks.<event>[].hooks[]`, skipping anything
-/// not shaped like that rather than failing.
-fn commands_for(doc: &Value, event: &str) -> Vec<String> {
+/// Every hook entry's command under `hooks.<event>[].hooks[]`, skipping
+/// anything not shaped like that rather than failing.
+fn commands_for(doc: &Value, event: &str) -> Vec<HookCommand> {
     doc.get("hooks")
         .and_then(|h| h.get(event))
         .and_then(Value::as_array)
@@ -476,17 +486,38 @@ fn commands_for(doc: &Value, event: &str) -> Vec<String> {
         .flatten()
         .filter_map(|group| group.get("hooks").and_then(Value::as_array))
         .flatten()
-        .filter_map(|hook| hook.get("command").and_then(Value::as_str))
-        .map(str::to_owned)
+        .filter_map(hook_command)
         .collect()
+}
+
+/// One hook entry's command: shell form when it has no `args`, exec form
+/// when `args` is an array of strings (Claude Code's hooks docs: "A command
+/// hook runs as exec form when `args` is set, and shell form when `args` is
+/// omitted"). An entry whose `command` is not a string, or whose `args` is
+/// set to anything else (`null` included), is skipped, as other junk is; the
+/// installer's `_claude_hook_is_wired` skips the same entries.
+fn hook_command(hook: &Value) -> Option<HookCommand> {
+    let command = hook.get("command")?.as_str()?.to_owned();
+    match hook.get("args") {
+        None => Some(HookCommand::Shell(command)),
+        Some(Value::Array(args)) => args
+            .iter()
+            .map(|arg| arg.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .map(|args| HookCommand::Exec {
+                program: command,
+                args,
+            }),
+        Some(_) => None,
+    }
 }
 
 /// Every run of `hook` in `commands`, in order, with a run whose literal
 /// program path is not a runnable file marked [`ModeError::NoProgram`].
-fn runs(hook: &PluginHook, commands: &[String], ctx: Context<'_>) -> Vec<RunMode> {
+fn runs(hook: &PluginHook, commands: &[HookCommand], ctx: Context<'_>) -> Vec<RunMode> {
     commands
         .iter()
-        .flat_map(|c| hook_modes(c, hook.name, ctx.env))
+        .flat_map(|c| c.hook_modes(hook.name, ctx.env))
         .map(|mut run| {
             if let Some(program) = run.program.clone() {
                 if let Some(problem) = program_problem(&program, ctx.home) {
@@ -526,7 +557,7 @@ fn program_problem(program: &str, home: &Path) -> Option<ProgramProblem> {
 /// it in its matching commands, reduced by [`best_result`] (can mine without
 /// doctor's shell, then via the shell, then unknown, then cannot mine, then
 /// does not start; settings order breaks ties).
-fn event_mode(hook: &PluginHook, commands: &[String], ctx: Context<'_>) -> RunMode {
+fn event_mode(hook: &PluginHook, commands: &[HookCommand], ctx: Context<'_>) -> RunMode {
     best_result(runs(hook, commands, ctx))
 }
 
@@ -635,7 +666,7 @@ enum Starts {
 /// any run of the hook has a valid mode and a program that exists, across
 /// commands and within one, so a dynamic or failing run never hides a working
 /// one.
-fn starts(hook: &PluginHook, commands: &[String], ctx: Context<'_>) -> Starts {
+fn starts(hook: &PluginHook, commands: &[HookCommand], ctx: Context<'_>) -> Starts {
     let runs = runs(hook, commands, ctx);
     // No runs at all reads as the unset default, which starts.
     if runs.is_empty() || runs.iter().any(|r| r.mode.is_ok()) {
@@ -874,6 +905,8 @@ enum NoMineCause {
     Shell(String),
     /// A bare manual command: nothing sets the mode, so it is read-only.
     Default,
+    /// [`Self::Default`] for an exec-form entry (`args` set).
+    DefaultExec,
 }
 
 /// One hint's cause and the miners it applies to, in entry order.
@@ -883,9 +916,10 @@ struct CauseGroup {
 }
 
 impl NoMineCause {
-    fn of(source: ModeSource, raw: Option<String>, plugin: bool) -> Self {
+    fn of(source: ModeSource, raw: Option<String>, plugin: bool, exec: bool) -> Self {
         let raw = raw.unwrap_or_default();
         match source {
+            ModeSource::PluginWrapper | ModeSource::Default if exec => Self::DefaultExec,
             ModeSource::SettingsEnv | ModeSource::Environment if plugin => Self::PluginOverride,
             ModeSource::Inline => Self::Inline(raw),
             ModeSource::SettingsEnv => Self::SettingsEnv(raw),
@@ -920,7 +954,8 @@ impl NoMineCause {
                 "doctor ran with IRONMEM_MCP_MODE={raw:?}, and a Claude Code launched from this \
                  shell inherits it; launch Claude Code with IRONMEM_MCP_MODE=trusted to mine"
             ),
-            Self::Default => read_only_hint(events),
+            Self::Default => read_only_hint(events, false),
+            Self::DefaultExec => read_only_hint(events, true),
         }
     }
 }
@@ -980,7 +1015,7 @@ fn mining_headline(mined: &[&str], not_mined: &[&str], unknown: &[&str]) -> Stri
 /// with [`HINT_JOINER`]. `plugin` says the miners run on the plugin path (the
 /// plugin's hooks plus any hand-wired copies).
 fn mining_check(wired: &WiredHooks, ctx: Context<'_>, plugin: bool) -> Check {
-    let miners: Vec<&(&'static PluginHook, Vec<String>)> =
+    let miners: Vec<&(&'static PluginHook, Vec<HookCommand>)> =
         wired.iter().filter(|(hook, _)| hook.mines).collect();
     if miners.is_empty() {
         return no_miner_check();
@@ -1010,7 +1045,7 @@ fn mining_check(wired: &WiredHooks, ctx: Context<'_>, plugin: bool) -> Check {
                 not_mined.push(event);
                 add_cause(
                     &mut causes,
-                    NoMineCause::of(run.source, run.raw, plugin),
+                    NoMineCause::of(run.source, run.raw, plugin, run.exec),
                     event,
                 );
                 format!("{event}: {} ({label}) -> not mined", mode.as_str())
@@ -1129,7 +1164,7 @@ mod tests {
             let (event, name) = (hook.event, hook.name);
             let cmd = hooks[event][0]["hooks"][0]["command"].as_str().unwrap();
             assert!(
-                runs_hook(cmd, name),
+                HookCommand::Shell(cmd.to_owned()).runs_hook(name),
                 "{event}: `{cmd}` should run hook {name}"
             );
             assert_eq!(cmd, format!("{PLUGIN_HOOK_COMMAND} {name}"), "{event}");
@@ -2804,7 +2839,7 @@ mod tests {
         // plugin's command sets no mode, so its `Starts::Maybe` case never runs.
         for hook in &PLUGIN_HOOKS {
             let (event, name) = (hook.event, hook.name);
-            let plugin = [format!("{PLUGIN_HOOK_COMMAND} {name}")];
+            let plugin = [HookCommand::Shell(format!("{PLUGIN_HOOK_COMMAND} {name}"))];
             let home = tempfile::tempdir().unwrap();
             let settings = Context {
                 env: ModeEnv {
@@ -3243,6 +3278,292 @@ mod tests {
                 .contains("Stop: read-only (IRONMEM_MCP_MODE unset, so the default) -> not mined"),
             "{}",
             c.summary
+        );
+    }
+
+    /// A hook entry in exec form (`args` set).
+    fn exec_entry(command: &str, args: &[&str]) -> Value {
+        serde_json::json!({"type": "command", "command": command, "args": args})
+    }
+
+    /// settings.json with one hook entry per event.
+    fn settings_with_entries(entries: &[(&str, Value)]) -> String {
+        let mut hooks = serde_json::Map::new();
+        for (event, entry) in entries {
+            hooks.insert(
+                (*event).to_string(),
+                serde_json::json!([{ "hooks": [entry] }]),
+            );
+        }
+        serde_json::json!({ "hooks": hooks }).to_string()
+    }
+
+    /// A home as [`home_with_settings`] makes, with `settings(home)` as its
+    /// settings.json, for entries that name a program under the home.
+    fn home_with_settings_for(settings: impl FnOnce(&Path) -> String) -> tempfile::TempDir {
+        let home = home_with_settings("{}");
+        let text = settings(home.path());
+        std::fs::write(home.path().join(".claude").join("settings.json"), text).unwrap();
+        home
+    }
+
+    /// The ironmem program `home_with_settings` creates, as an absolute path.
+    fn home_program(home: &Path) -> String {
+        home.join(".ironrace/bin/ironmem").display().to_string()
+    }
+
+    /// Exec-form `Stop` entries and whether each runs `ironmem hook stop`.
+    /// scripts/test_install_ironmem.py's `EXEC_FORM_STOP_FIXTURES` holds the
+    /// same entries with the same answers for the installer's
+    /// `_claude_hook_is_wired`; change the two together.
+    fn exec_form_stop_fixtures() -> Vec<(Value, bool)> {
+        use serde_json::json;
+        vec![
+            (
+                json!({"command": "/opt/ironmem", "args": ["hook", "stop", "--harness", "claude-code"]}),
+                true,
+            ),
+            (
+                json!({"command": "ironmem", "args": ["hook", "--harness", "claude-code", "stop"]}),
+                true,
+            ),
+            (
+                json!({"command": "env", "args": ["IRONMEM_MCP_MODE=trusted", "ironmem", "hook", "stop"]}),
+                true,
+            ),
+            (
+                json!({"command": "/usr/bin/env", "args": ["-u", "X", "A=1", "/opt/ironmem", "hook", "stop"]}),
+                true,
+            ),
+            (
+                json!({"command": "exec", "args": ["nohup", "ironmem", "hook", "stop"]}),
+                true,
+            ),
+            (
+                json!({"command": "bash", "args": ["-c", "ironmem hook stop"]}),
+                true,
+            ),
+            (
+                json!({"command": "bash", "args": ["/p/hooks/ironmem-hook.sh", "stop"]}),
+                true,
+            ),
+            (json!({"command": "ironmem hook stop", "args": []}), false),
+            (
+                json!({"command": "IRONMEM_MCP_MODE=trusted", "args": ["ironmem", "hook", "stop"]}),
+                false,
+            ),
+            (
+                json!({"command": "echo", "args": ["ironmem", "hook", "stop"]}),
+                false,
+            ),
+            (
+                json!({"command": "/opt/other-tool", "args": ["hook", "stop"]}),
+                false,
+            ),
+            (
+                json!({"command": "ironmem", "args": ["hook", "stopx"]}),
+                false,
+            ),
+            (
+                json!({"command": "ironmem hook stop", "args": ["x", 5]}),
+                false,
+            ),
+            (
+                json!({"command": "ironmem hook stop", "args": "hook stop"}),
+                false,
+            ),
+            (json!({"command": "ironmem hook stop", "args": null}), false),
+        ]
+    }
+
+    #[test]
+    fn exec_form_entries_are_read_as_an_argument_vector() {
+        for (entry, wired) in exec_form_stop_fixtures() {
+            let runs = hook_command(&entry).is_some_and(|c| c.runs_hook("stop"));
+            assert_eq!(runs, wired, "{entry}");
+        }
+    }
+
+    /// The installer's exec-form miners hint, pinned word for word.
+    fn exec_read_only_text(entries: &str) -> String {
+        format!(
+            "expected outside a plugin install: MCP writes and prompt recall still work. \
+             A cheaper way to mine without the plugin is tracked in #418. To mine now, in \
+             the {entries} (exec form, args set) make env the command and put \
+             IRONMEM_MCP_MODE=trusted, then the program, first in args; each run then loads \
+             the embedding model and rebuilds the vector index"
+        )
+    }
+
+    #[test]
+    fn an_exec_form_wiring_of_all_four_is_wired_and_read_only() {
+        let home = home_with_settings_for(|home| {
+            let program = home_program(home);
+            let entries: Vec<(&str, Value)> = PLUGIN_HOOKS
+                .iter()
+                .map(|h| {
+                    let args = ["hook", h.name, "--harness", "claude-code"];
+                    (h.event, exec_entry(&program, &args))
+                })
+                .collect();
+            settings_with_entries(&entries)
+        });
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Ok, "{}", c[0].summary);
+        assert_eq!(c[0].summary, all_four_wired(home.path()));
+        assert_eq!(c[1].status, CheckStatus::Warn);
+        assert_eq!(
+            c[1].summary,
+            "no wired hook mines — Stop: read-only (IRONMEM_MCP_MODE unset, so the default) -> \
+             not mined; PreCompact: read-only (IRONMEM_MCP_MODE unset, so the default) -> not \
+             mined"
+        );
+        assert_eq!(
+            c[1].hint.as_deref(),
+            Some(exec_read_only_text("Stop and PreCompact entries").as_str())
+        );
+    }
+
+    #[test]
+    fn an_exec_form_env_assignment_sets_the_mode_and_mines() {
+        // What the exec-form read-only hint tells the user to write.
+        let home = home_with_settings_for(|home| {
+            let program = home_program(home);
+            let trusted = |name| {
+                let args = ["IRONMEM_MCP_MODE=trusted", program.as_str(), "hook", name];
+                exec_entry("env", &args)
+            };
+            settings_with_entries(&[
+                ("Stop", trusted("stop")),
+                ("PreCompact", trusted("precompact")),
+            ])
+        });
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[1].status, CheckStatus::Ok, "{}", c[1].summary);
+        assert_eq!(
+            c[1].summary,
+            "Stop and PreCompact are mined — Stop: trusted (set in the hook command) -> mined; \
+             PreCompact: trusted (set in the hook command) -> mined"
+        );
+        assert_eq!(c[1].hint, None);
+    }
+
+    #[test]
+    fn an_exec_form_program_that_does_not_exist_does_not_run() {
+        let gone = tempfile::tempdir().unwrap().path().join("old/bin/ironmem");
+        let gone = gone.display().to_string();
+        let entry = exec_entry(&gone, &["hook", "session-start"]);
+        let home = home_with_settings(&settings_with_entries(&[("SessionStart", entry)]));
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(c[0].status, CheckStatus::Warn, "{}", c[0].summary);
+        assert!(
+            c[0].summary.contains(&format!(
+                "SessionStart is wired to {gone}, which does not exist, so no memory context is \
+                 loaded at session start"
+            )),
+            "{}",
+            c[0].summary
+        );
+        assert!(c[0].hint.as_deref().unwrap().contains(MISSING_PROGRAM_HINT));
+    }
+
+    #[test]
+    fn an_exec_form_tilde_program_is_not_expanded() {
+        // ~/.ironrace/bin/ironmem exists under the test home, but no shell
+        // expands the ~ of an exec-form command.
+        let args = [
+            "IRONMEM_MCP_MODE=trusted",
+            "~/.ironrace/bin/ironmem",
+            "hook",
+            "stop",
+        ];
+        let settings = settings_with_entries(&[
+            ("Stop", exec_entry("env", &args)),
+            (
+                "SessionStart",
+                exec_entry("~/.ironrace/bin/ironmem", &["hook", "session-start"]),
+            ),
+        ]);
+        let home = home_with_settings(&settings);
+        let c = claude_hook_checks(Some(home.path()), None);
+        let why = "which starts with a ~ that is not expanded, because with args set (exec form) \
+                   no shell reads the command";
+        assert!(
+            c[0].summary.contains(&format!(
+                "SessionStart is wired to ~/.ironrace/bin/ironmem, {why}, so no memory context is \
+                 loaded at session start"
+            )),
+            "{}",
+            c[0].summary
+        );
+        assert_eq!(
+            c[1].summary,
+            format!("no wired hook mines — Stop: wired to ~/.ironrace/bin/ironmem, {why} -> does not run")
+        );
+        assert_eq!(c[1].hint.as_deref(), Some(MISSING_PROGRAM_HINT));
+    }
+
+    #[test]
+    fn an_exec_form_bash_c_string_is_read_as_shell_form() {
+        let script = "IRONMEM_MCP_MODE=trusted ~/.ironrace/bin/ironmem hook stop";
+        let settings = settings_with_entries(&[("Stop", exec_entry("bash", &["-c", script]))]);
+        let c = mining_of(&settings, None);
+        assert_eq!(c.status, CheckStatus::Ok, "{}", c.summary);
+        assert_eq!(
+            c.summary,
+            "Stop is mined — Stop: trusted (set in the hook command) -> mined"
+        );
+    }
+
+    #[test]
+    fn an_exec_form_entry_with_a_non_string_arg_is_skipped() {
+        let junk = serde_json::json!({"type": "command", "command": "ironmem hook stop", "args": ["x", 5]});
+        let mut doc: Value = serde_json::from_str(&settings_with(&ALL_FOUR_BARE)).unwrap();
+        doc["hooks"]["Stop"] = serde_json::json!([{ "hooks": [junk] }]);
+        let home = home_with_settings(&doc.to_string());
+        let c = claude_hook_checks(Some(home.path()), None);
+        let path = home.path().join(".claude").join("settings.json");
+        assert!(
+            c[0].summary.starts_with(&format!(
+                "Claude Code hooks: missing Stop in {} (",
+                path.display()
+            )),
+            "{}",
+            c[0].summary
+        );
+    }
+
+    #[test]
+    fn an_exec_form_dollar_is_literal_but_a_placeholder_is_unknown() {
+        let home = home_with_settings_for(|home| {
+            let program = home_program(home);
+            let stop = ["IRONMEM_MCP_MODE=$M", program.as_str(), "hook", "stop"];
+            let pre = [
+                "IRONMEM_MCP_MODE=${CLAUDE_PLUGIN_ROOT}",
+                program.as_str(),
+                "hook",
+                "precompact",
+            ];
+            settings_with_entries(&[
+                ("Stop", exec_entry("env", &stop)),
+                ("PreCompact", exec_entry("env", &pre)),
+            ])
+        });
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert!(
+            c[1].summary.contains(
+                r#"Stop: "$M" (set in the hook command) -> fails to start: IRONMEM_MCP_MODE="$M" is not trusted, read-only or restricted"#
+            ),
+            "{}",
+            c[1].summary
+        );
+        assert!(
+            c[1].summary.contains(
+                "PreCompact: ${CLAUDE_PLUGIN_ROOT} (set in the hook command) -> mode cannot be \
+                 determined statically"
+            ),
+            "{}",
+            c[1].summary
         );
     }
 }

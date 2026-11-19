@@ -485,3 +485,45 @@ fn a_hook_wired_to_a_program_that_does_not_exist_is_named_and_not_mined() {
         "{stdout}"
     );
 }
+
+#[test]
+fn exec_form_hooks_are_read_as_an_argument_vector_end_to_end() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    init_db(&home, &db_path);
+    // Exec form (`args` set): SessionStart and UserPromptSubmit run the
+    // program directly, Stop through `env` with a trusted mode, and
+    // PreCompact names a command that is a whole shell string, which exec
+    // form does not split, so it is not the hook.
+    let program = fake_program(temp.path());
+    let entry = |command: &str, args: &[&str]| serde_json::json!([{ "hooks": [{ "type": "command", "command": command, "args": args }] }]);
+    let precompact = format!("{program} hook precompact");
+    let doc = serde_json::json!({ "hooks": {
+        "SessionStart": entry(&program, &["hook", "session-start"]),
+        "UserPromptSubmit": entry(&program, &["hook", "user-prompt-submit"]),
+        "Stop": entry("env", &["IRONMEM_MCP_MODE=trusted", &program, "hook", "stop"]),
+        "PreCompact": entry(&precompact, &[]),
+    }});
+    write_claude_settings(&home, doc);
+
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env_remove("IRONMEM_MCP_MODE")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "warnings must not fail doctor: {out:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("Claude Code hooks: missing PreCompact in "),
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("Stop is mined — Stop: trusted (set in the hook command) -> mined"),
+        "{stdout}"
+    );
+}

@@ -1,11 +1,13 @@
-//! A small model of the shell commands in Claude Code hook entries (#377).
+//! A small model of the commands in Claude Code hook entries (#377).
 //!
-//! Answers two questions about a hook command string: does it run
-//! `ironmem hook <name>`, and in which `IRONMEM_MCP_MODE` does it run. It is
-//! a simple-command reader, not a shell; the limits are documented on
-//! [`runs_hook`] and [`hook_modes`]. Diagnose-only: it parses strings and never
-//! runs anything or touches the filesystem; it names the literal program path
-//! a run starts ([`RunMode::program`]) for `hooks.rs` to check.
+//! Answers two questions about a hook entry ([`HookCommand`], shell form or
+//! exec form): does it run `ironmem hook <name>`, and in which
+//! `IRONMEM_MCP_MODE` does it run. For shell form it is a simple-command
+//! reader, not a shell; the limits are documented on
+//! [`HookCommand::runs_hook`] and [`HookCommand::hook_modes`]. Diagnose-only:
+//! it parses strings and never runs anything or touches the filesystem; it
+//! names the literal program path a run starts ([`RunMode::program`]) for
+//! `hooks.rs` to check.
 
 use crate::config::McpAccessMode;
 
@@ -53,8 +55,9 @@ pub(super) enum ModeError {
     /// The value is built by the shell (`$VAR`, `$(..)`), so doctor can't know it.
     Unknown(String),
     /// The run's program is this literal path, which is not a runnable file,
-    /// so the shell cannot start it at all. Set by `hooks.rs`, which checks
-    /// [`RunMode::program`] on the file system.
+    /// so it cannot start at all. Set by `hooks.rs`, which checks
+    /// [`RunMode::program`] on the file system, and by
+    /// [`HookCommand::hook_modes`] for [`ProgramProblem::TildeNotExpanded`].
     NoProgram(String, ProgramProblem),
 }
 
@@ -65,6 +68,14 @@ pub(super) enum ProgramProblem {
     Missing,
     /// Something exists there, but it is not a file with an execute bit.
     NotExecutable,
+    /// An exec-form program (or the program `env` and the like run from its
+    /// arguments) starts with `~/`. Claude Code's hooks docs say exec form
+    /// runs no shell, passes each element "exactly as written" and
+    /// substitutes only path placeholders such as `${CLAUDE_PLUGIN_ROOT}`; they
+    /// never mention `~`, so doctor reads it as left literal, a path under a
+    /// directory named `~` that no install creates (inferred, not stated by
+    /// the docs).
+    TildeNotExpanded,
 }
 
 impl ProgramProblem {
@@ -73,6 +84,10 @@ impl ProgramProblem {
         match self {
             Self::Missing => "does not exist",
             Self::NotExecutable => "is not an executable file",
+            Self::TildeNotExpanded => {
+                "starts with a ~ that is not expanded, because with args set (exec form) no \
+                 shell reads the command"
+            }
         }
     }
 }
@@ -90,6 +105,10 @@ pub(super) struct RunMode {
     /// (no `$`, backtick, glob or brace). `None` for a PATH lookup (`ironmem`)
     /// and for anything doctor cannot know; those are not checked.
     pub(super) program: Option<String>,
+    /// The run is an exec-form entry's own argument vector (not a shell
+    /// string inside it, such as `bash -c`'s), so a fix cannot prefix its
+    /// command with an assignment.
+    pub(super) exec: bool,
 }
 
 impl RunMode {
@@ -100,6 +119,7 @@ impl RunMode {
             source,
             raw: None,
             program: None,
+            exec: false,
         }
     }
 }
@@ -114,20 +134,143 @@ pub(super) fn source_label(source: ModeSource) -> &'static str {
     }
 }
 
-/// One word of a shell command after quote removal.
+/// One hook entry's command, as Claude Code runs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum HookCommand {
+    /// Shell form (no `args`): a shell runs the `command` string.
+    Shell(String),
+    /// Exec form (`args` set, an array of strings): Claude Code spawns
+    /// `program` directly with `args` as the argument vector, no shell.
+    Exec { program: String, args: Vec<String> },
+}
+
+impl HookCommand {
+    /// True when the entry runs `ironmem hook <hook>`.
+    ///
+    /// Shell form: the model is a small simple-command reader, not a shell
+    /// (see [`split_commands`] for the word and operator rules). In each
+    /// simple command, leading `NAME=value` words are assignments; the
+    /// wrappers `env`, `exec`, `command` and `nohup` are peeled off. `env`
+    /// takes its own assignments, `-u NAME`/`--unset NAME`, `-C DIR`/`--chdir
+    /// DIR`, and flags without an argument (`-i`, `-`, `--unset=NAME`). The
+    /// program's basename must then be `ironmem` or `ironmem-mcp.sh` followed
+    /// by `hook`, optionally `--harness <v>` or `--harness=<v>`, then the
+    /// name; or `ironmem-hook.sh <name>`; either wrapper script may also be
+    /// run by `bash`/`sh` (after flags and `-o`/`+o <opt>`); or `bash`/`sh -c
+    /// <string>`, which is read recursively. Anything else (`echo`, `printf`,
+    /// `true`) is not the hook.
+    ///
+    /// Exec form: `program` and `args` are one simple command whose words are
+    /// exactly the elements, with no quoting, operators or leading
+    /// assignments (a `NAME=value` program is a program of that name). The
+    /// same wrappers, `env` options and programs apply to that vector, and a
+    /// `bash`/`sh -c <string>` element is read as shell form. An element
+    /// containing `${` holds a path placeholder Claude Code may substitute,
+    /// so doctor treats it as built at run time; any other `$` is literal.
+    ///
+    /// Known limits, documented rather than bugs: control flow is not
+    /// followed, so `true || ironmem hook stop` counts as wired; heredocs,
+    /// brace groups and `$(..)` bodies are not read; aliases and functions are
+    /// unknown; other options that take an argument (`env -S`, `bash --rcfile
+    /// F`) are not modelled; `env -i` or `env -u IRONMEM_MCP_MODE` clearing an
+    /// inherited mode is not modelled. The other way round, a hook that does
+    /// run reads as missing when it sits behind `if ...; then`, `{ ...; }`,
+    /// `timeout 5`, `time`, `nice`, `command -p` or any wrapper other than
+    /// `env`, `exec`, `command` and `nohup`: the first word is then not a
+    /// program doctor knows. scripts/install-ironmem.sh matches such shell-form
+    /// commands as already wired, so doctor's missing-hook hint says what to do
+    /// then.
+    pub(super) fn runs_hook(&self, hook: &str) -> bool {
+        self.invocations().iter().any(|i| i.hook == hook)
+    }
+
+    /// The [`RunMode`] of every run of `hook` in the entry, in order.
+    ///
+    /// Only the same simple command counts: the mode comes from the
+    /// assignment words (or `env` assignments) of the command that runs the
+    /// hook, or, in shell form, from an earlier `export IRONMEM_MCP_MODE=v` in
+    /// the same string, and the command's own assignment wins. It never comes
+    /// from a later or a different simple command, so `ironmem hook stop;
+    /// IRONMEM_MCP_MODE=trusted true` runs read-only and
+    /// `IRONMEM_MCP_MODE=bogus true || ironmem hook stop` runs in the default
+    /// mode. Callers that report one result for several runs reduce them with
+    /// [`best_result`].
+    ///
+    /// With no inline value the order is settings.json `env`, then the
+    /// inherited environment, then the plugin wrapper's [`WRAPPER_DEFAULT`]
+    /// (an empty value counts as unset to the wrapper, but `Config::load`
+    /// rejects it), then [`McpAccessMode::UNSET_DEFAULT`]. A value the shell
+    /// builds (`$`, a backtick) or, in exec form, one holding `${`, is
+    /// [`ModeError::Unknown`]. An exec-form program starting with `~/` is
+    /// [`ProgramProblem::TildeNotExpanded`]. The command-reading limits are
+    /// listed on [`Self::runs_hook`].
+    pub(super) fn hook_modes(&self, hook: &str, env: ModeEnv<'_>) -> Vec<RunMode> {
+        self.invocations()
+            .iter()
+            .filter(|i| i.hook == hook)
+            .map(|i| {
+                let mut run = RunMode {
+                    program: i.program.clone(),
+                    exec: i.exec,
+                    ..invocation_mode(i, env)
+                };
+                if let Some(path) = &i.unexpanded_tilde {
+                    run.mode = Err(ModeError::NoProgram(
+                        path.clone(),
+                        ProgramProblem::TildeNotExpanded,
+                    ));
+                }
+                run
+            })
+            .collect()
+    }
+
+    fn invocations(&self) -> Vec<Invocation> {
+        match self {
+            Self::Shell(command) => invocations(command, None),
+            Self::Exec { program, args } => {
+                let words: Vec<Word> = std::iter::once(program)
+                    .chain(args)
+                    .map(|text| Word::exec(text))
+                    .collect();
+                let mut found = Vec::new();
+                simple_command(&words, None, None, &mut found);
+                found
+            }
+        }
+    }
+}
+
+/// One word of a shell command after quote removal, or one element of an
+/// exec-form entry.
 #[derive(Debug, Clone)]
 struct Word {
     text: String,
     /// Contains an unquoted or double-quoted `$` or backtick: the shell
-    /// decides its value, not us.
+    /// decides its value, not us. For an exec-form element: contains `${`,
+    /// a path placeholder Claude Code may substitute.
     dynamic: bool,
     /// The byte offset in `text` where the first quoted or backslash-escaped
     /// character went, if any. The shell reads a `NAME=value` word as an
-    /// assignment only when nothing up to its first `=` was quoted.
+    /// assignment only when nothing up to its first `=` was quoted. An
+    /// exec-form element counts as quoted from its first byte: nothing in it
+    /// is shell syntax.
     first_quoted: Option<usize>,
+    /// An element of an exec-form entry, which no shell reads.
+    exec: bool,
 }
 
 impl Word {
+    /// One element of an exec-form entry.
+    fn exec(text: &str) -> Self {
+        Self {
+            text: text.to_owned(),
+            dynamic: text.contains("${"),
+            first_quoted: Some(0),
+            exec: true,
+        }
+    }
+
     /// True when a quote or backslash came before the first `=` (or there is
     /// no `=`), so the shell does not read the word as an assignment.
     fn quoted_name(&self) -> bool {
@@ -161,6 +304,7 @@ impl Splitter {
                 text: std::mem::take(&mut self.cur),
                 dynamic: self.dynamic,
                 first_quoted: self.first_quoted,
+                exec: false,
             };
             if self.skip_next {
                 self.skip_next = false;
@@ -380,6 +524,11 @@ struct Invocation {
     mode: Option<ModeValue>,
     /// See [`RunMode::program`].
     program: Option<String>,
+    /// An exec-form program word starting with `~/`, which nothing expands
+    /// ([`ProgramProblem::TildeNotExpanded`]).
+    unexpanded_tilde: Option<String>,
+    /// See [`RunMode::exec`].
+    exec: bool,
 }
 
 /// The program word's literal path, if doctor can check it: see
@@ -428,7 +577,8 @@ fn take_assignments(rest: &mut &[Word], inline: &mut Option<ModeValue>, env: boo
     }
 }
 
-/// The `ironmem hook` runs in `command`; see [`runs_hook`] for the model.
+/// The `ironmem hook` runs in shell-form `command`; see
+/// [`HookCommand::runs_hook`] for the model.
 fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
     let mut exported = inherited;
     let mut found = Vec::new();
@@ -436,51 +586,68 @@ fn invocations(command: &str, inherited: Option<ModeValue>) -> Vec<Invocation> {
         let mut inline = None;
         let mut rest: &[Word] = &words;
         take_assignments(&mut rest, &mut inline, false);
-        while let Some(first) = rest.first() {
-            let name = basename(&first.text);
-            if !matches!(name, "env" | "exec" | "command" | "nohup") {
-                break;
-            }
-            rest = &rest[1..];
-            if name == "env" {
-                take_assignments(&mut rest, &mut inline, true);
-            }
-        }
-        let Some((program_word, args)) = rest.split_first() else {
-            continue;
-        };
-        let program = basename(&program_word.text);
-        if program == "export" {
-            if let Some(value) = args.iter().find_map(|w| mode_assignment(w, false)) {
-                exported = Some(value);
-            }
-            continue;
-        }
-        let mode = inline.or_else(|| exported.clone());
-        let mut push = |hook: &str, wrapper: bool| {
-            found.push(Invocation {
-                hook: hook.to_owned(),
-                wrapper,
-                mode: mode.clone(),
-                program: literal_path(program_word),
-            });
-        };
-        match program {
-            "ironmem" | "ironmem-mcp.sh" => {
-                if let Some(hook) = hook_after_subcommand(args) {
-                    push(hook, program == "ironmem-mcp.sh");
-                }
-            }
-            "ironmem-hook.sh" => {
-                if let Some(hook) = args.first() {
-                    push(&hook.text, true);
-                }
-            }
-            "bash" | "sh" => shell_args(args, mode.clone(), &mut found),
-            _ => {}
+        if let Some(value) = simple_command(rest, inline, exported.as_ref(), &mut found) {
+            exported = Some(value);
         }
     }
     found
+}
+
+/// Read one simple command, `words`, whose leading assignments (shell form)
+/// are already taken into `inline`: peel the `env`/`exec`/`command`/`nohup`
+/// wrappers, then push the hook runs it starts to `found`. `exported` is the
+/// mode an earlier `export` set. Returns the value an `export
+/// IRONMEM_MCP_MODE=v` command sets, for the simple commands after it.
+fn simple_command(
+    words: &[Word],
+    mut inline: Option<ModeValue>,
+    exported: Option<&ModeValue>,
+    found: &mut Vec<Invocation>,
+) -> Option<ModeValue> {
+    let mut rest = words;
+    while let Some(first) = rest.first() {
+        let name = basename(&first.text);
+        if !matches!(name, "env" | "exec" | "command" | "nohup") {
+            break;
+        }
+        rest = &rest[1..];
+        if name == "env" {
+            take_assignments(&mut rest, &mut inline, true);
+        }
+    }
+    let (program_word, args) = rest.split_first()?;
+    let program = basename(&program_word.text);
+    if program == "export" {
+        return args.iter().find_map(|w| mode_assignment(w, false));
+    }
+    let mode = inline.or_else(|| exported.cloned());
+    let unexpanded_tilde = (program_word.exec && program_word.text.starts_with("~/"))
+        .then(|| program_word.text.clone());
+    let mut push = |hook: &str, wrapper: bool| {
+        found.push(Invocation {
+            hook: hook.to_owned(),
+            wrapper,
+            mode: mode.clone(),
+            program: literal_path(program_word),
+            unexpanded_tilde: unexpanded_tilde.clone(),
+            exec: program_word.exec,
+        });
+    };
+    match program {
+        "ironmem" | "ironmem-mcp.sh" => {
+            if let Some(hook) = hook_after_subcommand(args) {
+                push(hook, program == "ironmem-mcp.sh");
+            }
+        }
+        "ironmem-hook.sh" => {
+            if let Some(hook) = args.first() {
+                push(&hook.text, true);
+            }
+        }
+        "bash" | "sh" => shell_args(args, mode.clone(), found),
+        _ => {}
+    }
+    None
 }
 
 /// Handle the arguments of `bash`/`sh`: `-c <string>` (any single-dash option
@@ -522,79 +689,30 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
                 wrapper: true,
                 mode,
                 program: None,
+                unexpanded_tilde: None,
+                exec: false,
             });
         }
         return;
     }
 }
 
-/// True when `command` runs `ironmem hook <hook>`.
-///
-/// The model is a small simple-command reader, not a shell (see
-/// [`split_commands`] for the word and operator rules). In each simple
-/// command, leading `NAME=value` words are assignments; the wrappers `env`,
-/// `exec`, `command` and `nohup` are peeled off. `env` takes its own
-/// assignments, `-u NAME`/`--unset NAME`, `-C DIR`/`--chdir DIR`, and flags
-/// without an argument (`-i`, `-`, `--unset=NAME`). The program's basename
-/// must then be `ironmem` or `ironmem-mcp.sh` followed by `hook`, optionally
-/// `--harness <v>` or `--harness=<v>`, then the name; or `ironmem-hook.sh
-/// <name>`; either wrapper script may also be run by `bash`/`sh` (after flags
-/// and `-o`/`+o <opt>`); or `bash`/`sh -c <string>`, which is read
-/// recursively. Anything else (`echo`, `printf`, `true`) is not the hook.
-///
-/// Known limits, documented rather than bugs: control flow is not followed, so
-/// `true || ironmem hook stop` counts as wired; heredocs, brace groups and
-/// `$(..)` bodies are not read; aliases and functions are unknown; other
-/// options that take an argument (`env -S`, `bash --rcfile F`) are not
-/// modelled; `env -i` or `env -u IRONMEM_MCP_MODE` clearing an inherited mode
-/// is not modelled. The other way round, a hook that does run reads as
-/// missing when it sits behind `if ...; then`, `{ ...; }`, `timeout 5`,
-/// `time`, `nice`, `command -p` or any wrapper other than `env`, `exec`,
-/// `command` and `nohup`: the first word is then not a program doctor knows.
-/// scripts/install-ironmem.sh matches such commands as already wired, so
-/// doctor's missing-hook hint says what to do then.
+/// Shell-form shorthand for [`HookCommand::runs_hook`].
+#[cfg(test)]
 pub(super) fn runs_hook(command: &str, hook: &str) -> bool {
-    invocations(command, None).iter().any(|i| i.hook == hook)
+    HookCommand::Shell(command.to_owned()).runs_hook(hook)
 }
 
-/// The best mode of the `hook` runs in `command`, without its raw value:
-/// test shorthand for [`best_result`] over [`hook_modes`].
+/// The best mode of the `hook` runs in shell-form `command`, without its raw
+/// value: test shorthand for [`best_result`] over [`HookCommand::hook_modes`].
 #[cfg(test)]
 pub(super) fn hook_mode(
     command: &str,
     hook: &str,
     env: ModeEnv<'_>,
 ) -> (Result<McpAccessMode, ModeError>, ModeSource) {
-    let run = best_result(hook_modes(command, hook, env));
+    let run = best_result(HookCommand::Shell(command.to_owned()).hook_modes(hook, env));
     (run.mode, run.source)
-}
-
-/// The [`RunMode`] of every run of `hook` in `command`, in order.
-///
-/// Only the same simple command counts: the mode comes from the assignment
-/// words (or `env` assignments) of the command that runs the hook, or from an
-/// earlier `export IRONMEM_MCP_MODE=v` in the same string, and the command's
-/// own assignment wins. It never comes from a later or a different simple
-/// command, so `ironmem hook stop; IRONMEM_MCP_MODE=trusted true` runs
-/// read-only and `IRONMEM_MCP_MODE=bogus true || ironmem hook stop` runs
-/// in the default mode. Callers that report one result for several runs
-/// reduce them with [`best_result`].
-///
-/// With no inline value the order is settings.json `env`, then the inherited
-/// environment, then the plugin wrapper's [`WRAPPER_DEFAULT`] (an empty value
-/// counts as unset to the wrapper, but `Config::load` rejects it), then
-/// [`McpAccessMode::UNSET_DEFAULT`]. A value containing `$` or a backtick is
-/// [`ModeError::Unknown`]. The command-reading limits are listed on
-/// [`runs_hook`].
-pub(super) fn hook_modes(command: &str, hook: &str, env: ModeEnv<'_>) -> Vec<RunMode> {
-    invocations(command, None)
-        .iter()
-        .filter(|i| i.hook == hook)
-        .map(|i| RunMode {
-            program: i.program.clone(),
-            ..invocation_mode(i, env)
-        })
-        .collect()
 }
 
 /// How good a run is for mining, lowest first: can mine (its mode
@@ -638,6 +756,7 @@ fn invocation_mode(run: &Invocation, env: ModeEnv<'_>) -> RunMode {
         source,
         raw: Some(raw.to_owned()),
         program: None,
+        exec: false,
     };
     if dynamic {
         return read(Err(ModeError::Unknown(raw.to_owned())));
