@@ -689,37 +689,44 @@ register_json_mcpservers() {
 # A plugin install gets its four hooks from .claude-plugin/hooks/hooks.json. A
 # script install gets the same four here, in $CLAUDE_HOME/settings.json, each
 # running the installed binary directly. They carry no IRONMEM_MCP_MODE, so
-# they run read-only: SessionStart context and UserPromptSubmit recall work,
-# and Stop and PreCompact skip mining (a cheaper way to mine outside the
-# plugin is #418). `ironmem doctor` reports that on its hook_mining line.
+# unless settings.json's env sets one (or Claude Code inherits one) they run
+# read-only: SessionStart context and UserPromptSubmit recall work, and Stop
+# and PreCompact skip mining (a cheaper way to mine outside the plugin is
+# #418). `ironmem doctor` reports that on its hook_mining line. The line
+# printed after wiring says which: read-only, unless the file's
+# env.IRONMEM_MCP_MODE reads as trusted (trimmed, any case, as
+# McpAccessMode::parse reads it).
 #
 # The merge only appends. An event that already runs `ironmem hook <name>`
 # (from any path, or through the plugin's ironmem-hook.sh) is left alone, and
-# so is every other hook and key; if none of its commands names this install's
-# program, a WARN names what it runs. The result is built in temp files and
-# written to settings.json once, after every event is decided. A failure before
-# that write (unreadable, unparseable or read-only file, dangling symlink, a jq
-# error, a temp-file step) prints a WARN, leaves settings.json untouched and
-# lets the install go on. The write is `cat >` rather than a move, so a
-# settings.json symlinked into a dotfiles repo stays a symlink; `cat >`
-# truncates first, so if that one write fails partway (a full disk) the file
-# can be left incomplete, and its WARN says so and names the file. Every
-# outcome returns 0.
+# so is every other hook and key. If a run of it names a program by a literal
+# path (absolute or ~/) that is not the same file as this install's program,
+# and no run names that program, a WARN names what it runs. A PATH lookup, a
+# path the shell builds and the wrapper scripts get no WARN. The result is
+# built in temp files and written to settings.json once, after every event is
+# decided. A failure before that write (unreadable, unparseable or read-only
+# file, dangling symlink, a jq error, a temp-file step) prints a WARN, leaves
+# settings.json untouched and lets the install go on. The write is `cat >`
+# rather than a move, so a settings.json symlinked into a dotfiles repo stays a
+# symlink; `cat >` truncates first, so if that one write fails partway (a full
+# disk) the file can be left incomplete, and its WARN says so and names the
+# file. Every outcome returns 0.
 #
 # A hook entry is shell form (no `args`: a shell runs the `command` string) or
 # exec form (`args` an array of strings: `command` is the program and the args
-# its arguments, no shell). The installer writes shell form. For a shell-form
-# command the matcher is a regex that expects the hook name directly after
-# `hook`, so a hand-wired command in another shape (say `hook --harness
-# claude-code stop`) gets a second copy appended. An exec-form entry is read
-# as an argument vector, the way doctor reads it: env, exec, command and nohup
-# are peeled off, then the program's basename must be ironmem (or one of the
-# plugin's wrapper scripts) and the arguments `hook [--harness <v>] <name>`;
-# `bash -c <string>` is matched with the shell-form regex. An entry whose
-# `args` is anything else is skipped, as doctor skips it.
-# scripts/test_install_ironmem.py's EXEC_FORM_STOP_FIXTURES and doctor's
-# exec_form_stop_fixtures hold the same cases. Keep CLAUDE_HOOK_EVENTS in step
-# with PLUGIN_HOOKS in crates/ironmem/src/doctor/hooks.rs; the unit test
+# its arguments, no shell). The installer writes shell form. A shell-form
+# command is matched as described above _CLAUDE_HOOK_JQ_DEFS. An exec-form
+# entry is read as an argument vector, the way doctor reads it: env (with its
+# options and assignments), command and nohup are peeled off (not exec, which
+# is a shell builtin with no program to spawn); then the program's basename
+# must be ironmem or ironmem-mcp.sh followed by `hook [--harness <v>] <name>`
+# (or `--harness=<v>`), or ironmem-hook.sh followed by `<name>`; bash or sh
+# may run either script, and `bash -c <string>` (or sh) is matched with the
+# shell-form rule. An entry whose `args` is anything else is skipped, as
+# doctor skips it. scripts/fixtures/hook_stop_fixtures.json holds the Stop
+# entries both scripts/test_install_ironmem.py and doctor's unit tests read,
+# with one answer each. Keep CLAUDE_HOOK_EVENTS in step with PLUGIN_HOOKS in
+# crates/ironmem/src/doctor/hooks.rs; the unit test
 # plugin_hooks_table_matches_the_plugin_hooks_json pins that table to
 # hooks.json, and scripts/test_install_ironmem.py pins this one to it.
 CLAUDE_HOOK_EVENTS=(
@@ -803,24 +810,64 @@ _wire_claude_hooks_warn() {
 # jq definitions for reading hook entries, shared by the matcher and the
 # program check. A hook entry is shell form when it has no `args` and exec
 # form when `args` is an array of strings; any other `args` is neither, and
-# such an entry is skipped (as doctor skips it).
+# such an entry is skipped (as doctor skips it). They use only builtins jq 1.5
+# has (no `IN`, no `if` without `else`), so an older packaged jq still works.
+#
+# A shell-form command is read with regexes (re_*) that want ironmem where a
+# shell starts a program, as doctor's `HookCommand::runs_hook` does: at the
+# start, or after `;` `&` `|` `(` `)` or a line break (not after `$(`), then
+# after any unquoted NAME=value words and any env (with its own options and
+# assignments), exec, command or nohup, or at the start of a quoted `bash -c`
+# or `sh -c` string. So `echo ironmem hook stop`, `# ironmem hook stop` and
+# `"IRONMEM_MCP_MODE=trusted" ironmem hook stop` do not count, and `hook
+# --harness <v> <name>`, `hook --harness=<v> <name>` and a quoted name do.
+# Where the two still differ: here a `;` `&` `|` `(` `)` or line break inside
+# quotes or a comment starts a command (`echo "x; ironmem hook stop"` counts),
+# and in doctor it does not; doctor drops a redirection before the program
+# (`2>/dev/null ironmem hook stop` counts there), and this does not.
 _CLAUDE_HOOK_JQ_DEFS='
 def base: sub("^.*/"; "");
+def is_one_of(words): . as $w | any(words; . == $w);
 def exec_form: has("args") and (.args | type == "array" and all(.[]; type == "string"));
 def shell_form: has("args") | not;
-def esc: gsub("(?<c>[\\\\.^$|?*+()\\[\\]{}])"; "\\\(.c)");
+def re_seg: "(?:[^\\s\"\u0027\\\\;&|()<>]|\\\\.|\"(?:[^\"\\\\]|\\\\.)*\"|\u0027[^\u0027]*\u0027)";
+def re_word: re_seg + "+";
+def re_q: "[\"\u0027]?";
+def re_start: "(?:^|[;&|)\\n]|(?<!\\$)\\()\\s*";
+def re_assign: "[A-Za-z_][A-Za-z0-9_]*=" + re_seg + "*";
+def re_named($n): re_q + "(?:\\S*/)?" + $n + re_q;
+def re_env_arg:
+  "(?:(?:-u|--unset|-C|--chdir)\\s+" + re_word
+  + "|-(?!(?:u|-unset|C|-chdir)\\s)" + re_seg + "*"
+  + "|" + re_q + "[A-Za-z_][A-Za-z0-9_]*=" + re_seg + "*" + re_q + ")";
+def re_wrappers:
+  "(?:(?:" + re_named("(?:exec|command|nohup)")
+  + "|" + re_named("env") + "(?:\\s+" + re_env_arg + ")*)\\s+)*";
+def re_head: "(?:" + re_assign + "\\s+)*" + re_wrappers;
+def re_shell:
+  re_named("(?:bash|sh)")
+  + "(?:\\s+(?:[-+][oO]\\s+" + re_word + "|\\+" + re_seg + "*|--" + re_seg + "*|-[^\\sc\"\u0027;&|()<>]*))*";
+def re_bash_c: re_shell + "\\s+-(?!-)[^\\s\"\u0027;&|()<>]*c[^\\s\"\u0027;&|()<>]*\\s+[\"\u0027]\\s*";
+def re_lead: re_start + re_head + "(?:" + re_bash_c + re_head + ")*";
+def re_program($b):
+  "(?<p>(?:" + re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*/|\u0027[^\u0027]*/|/))?" + re_q + $b + re_q + ")";
+def re_name($name): "\\s+" + re_q + $name + re_q + "(?=[\\s;&|)<>]|$)";
+def re_hook($name):
+  "\\s+" + re_q + "hook" + re_q + "(?:\\s+--harness\\s+" + re_word + "|\\s+--harness=" + re_seg + "*)?"
+  + re_name($name);
 def shell_runs($name):
-  test("(^|[/\\s\"\u0027])ironmem(-mcp\\.sh)?[\"\u0027]?\\s+hook\\s+" + $name + "([\\s;&|)<>\"\u0027]|$)")
-  or test("(^|[/\\s\"\u0027])ironmem-hook\\.sh[\"\u0027]?\\s+" + $name + "([\\s;&|)<>\"\u0027]|$)");
+  test(re_lead + re_program("ironmem(?:-mcp\\.sh)?") + re_hook($name))
+  or test(re_lead + "(?:" + re_shell + "\\s+)?" + re_program("ironmem-hook\\.sh") + re_name($name))
+  or test(re_lead + re_shell + "\\s+" + re_program("ironmem-mcp\\.sh") + re_hook($name));
 def env_args:
   if length == 0 then .
-  elif (.[0] | IN("-u", "--unset", "-C", "--chdir")) then .[2:] | env_args
+  elif (.[0] | is_one_of("-u", "--unset", "-C", "--chdir")) then .[2:] | env_args
   elif (.[0] | test("^[A-Za-z_][A-Za-z0-9_]*=") or startswith("-")) then .[1:] | env_args
   else . end;
 def peel:
   if length == 0 then .
   elif (.[0] | base) == "env" then .[1:] | env_args | peel
-  elif (.[0] | base | IN("exec", "command", "nohup")) then .[1:] | peel
+  elif (.[0] | base | is_one_of("command", "nohup")) then .[1:] | peel
   else . end;
 def after_hook($name):
   .[0] == "hook"
@@ -835,7 +882,7 @@ def shell_script($name):
 def shell_args($name):
   if length == 0 then false
   elif (.[0] | startswith("-") and (startswith("--") | not) and contains("c")) then (.[1] // "") | shell_runs($name)
-  elif (.[0] | IN("-o", "+o", "-O", "+O")) then .[2:] | shell_args($name)
+  elif (.[0] | is_one_of("-o", "+o", "-O", "+O")) then .[2:] | shell_args($name)
   elif (.[0] | test("^[-+]")) then .[1:] | shell_args($name)
   else shell_script($name) end;
 def exec_runs($name):
@@ -852,6 +899,42 @@ def runs_hook($name):
   if shell_form then .command | shell_runs($name)
   elif exec_form then [.command] + .args | exec_runs($name)
   else false end;
+def esc_line: split("\\") | join("\\\\") | split("\n") | join("\\n") | split("\t") | join("\\t");
+def unquote:
+  [scan("\"(?:[^\"\\\\]|\\\\.)*\"|\u0027[^\u0027]*\u0027|\\\\.|[^\"\u0027\\\\]+")] as $s
+  | {text: ($s | map(
+        if startswith("\u0027") then .[1:-1]
+        elif startswith("\"") then .[1:-1] | [scan("\\\\[$`\"\\\\\\n]|[^\\\\]|\\\\")]
+          | map(if length == 2 then .[1:] else . end) | join("")
+        elif startswith("\\") then .[1:]
+        else . end) | join("")),
+     dynamic: any($s[]; ((startswith("\u0027") or startswith("\\")) | not) and test("[$`]")),
+     tilde: (($s[0] // "") | startswith("~/"))};
+def shell_programs($name):
+  [match(re_lead + re_program("ironmem") + re_hook($name); "g")
+   | .captures[] | select(.name == "p") | .string | unquote];
+def c_string:
+  if length == 0 then empty
+  elif (.[0] | startswith("-") and (startswith("--") | not) and contains("c")) then .[1] // empty
+  elif (.[0] | is_one_of("-o", "+o", "-O", "+O")) then .[2:] | c_string
+  elif (.[0] | test("^[-+]")) then .[1:] | c_string
+  else empty end;
+def exec_programs($name):
+  peel
+  | ((.[0] // "") | base) as $b
+  | if $b == "ironmem" and (.[1:] | after_hook($name)) then
+      [{text: .[0], dynamic: (.[0] | contains("${")), tilde: (.[0] | startswith("~/"))}]
+    elif $b == "bash" or $b == "sh" then [.[1:] | c_string | shell_programs($name)[]]
+    else [] end;
+def literal_path($home):
+  select((.dynamic | not) and (.text | test("[*?\\[{]") | not))
+  | if .tilde then $home + .text[1:] elif (.text | startswith("/")) then .text else empty end;
+def program_paths($name; $home):
+  (if shell_form then .command | shell_programs($name)
+   elif exec_form then [.command] + .args | exec_programs($name)
+   else [] end)
+  | .[] | literal_path($home);
+def shown: if shell_form then .command else "\(.command) with args \(.args | tojson)" end;
 '
 
 # Does hooks.<event> already run `ironmem hook <name>`? Exit 0 yes, 1 no, 2+ a
@@ -863,51 +946,78 @@ _claude_hook_is_wired() {
     "$1" >/dev/null
 }
 
-# The commands of hooks.<event> ($2) that run `ironmem hook <name>` ($3), one
-# per line, when none of them names this install's program: as $HOOK_PROGRAM
-# (or $HOOK_PROGRAM_TILDE) before `hook <name>` in a shell-form command, or as
-# $TARGET itself, after any env/exec/command/nohup, in an exec-form one.
-# Prints nothing when one does. A jq error exits non-zero.
-_claude_hook_other_programs() {
-  jq -r --arg name "$3" --arg ev "$2" --arg prog "$HOOK_PROGRAM" --arg alt "$HOOK_PROGRAM_TILDE" \
-    --arg target "$TARGET" "$_CLAUDE_HOOK_JQ_DEFS"'
-      def names_target:
-        if shell_form then
-          .command as $c
-          | any(($prog, $alt) | select(. != "");
-                . as $p
-                | $c | test("(^|[\\s;&|(])" + ($p | esc) + "\\s+hook\\s+" + ($name | esc)
-                            + "([\\s;&|)<>\"\u0027]|$)"))
-        elif exec_form then
-          [.command] + .args | peel | .[0] == $target and (.[1:] | after_hook($name))
-        else false end;
-      [entries($ev) | select(runs_hook($name))] as $wired
-      | if any($wired[]; names_target) then empty
-        else $wired[] | if shell_form then .command else "\(.command) with args \(.args | tojson)" end
-        end' \
+# For hooks.<event> ($2) in work file $1, one line for each run of `ironmem
+# hook <name>` ($3) whose program word is a literal path: absolute, or an
+# unquoted ~/ (read as under $HOME). Each line is that path, a tab, and the
+# entry as a WARN shows it, both with \ written as \\ and a line break or tab
+# as \n or \t, so `printf %b` reads them back. The program word may be single-
+# or double-quoted, and the run may sit in a bash/sh -c string of an exec-form
+# entry. A PATH lookup (a bare `ironmem`), a path the shell builds (`$HOME`,
+# `${HOME}`, a glob) and the plugin's wrapper scripts give no line, as
+# doctor's missing-program check skips them. A jq error exits non-zero.
+_claude_hook_program_paths() {
+  jq -r --arg ev "$2" --arg name "$3" --arg home "$HOME" "$_CLAUDE_HOOK_JQ_DEFS"'
+      entries($ev) | select(runs_hook($name)) | shown as $shown
+      | program_paths($name; $home) | "\(esc_line)\t\($shown | esc_line)"' \
     "$1"
 }
 
 # For an event ($3, hook $4) that is already wired in work file $1 (settings
-# file $2): when no wired command names this install's program, WARN with
-# what it runs. Never changes the entry; a jq error here is a WARN too.
+# file $2): WARN when a run of it names a program by a literal path that is not
+# the same file as $TARGET (bash -ef, so a symlink to it or another spelling of
+# its path counts as $TARGET), unless another run names $TARGET. Never changes
+# the entry; a jq error here is a WARN too.
 _warn_other_program() {
-  local work="$1" settings="$2" event="$3" name="$4" others line doctor_line
-  if ! others="$(_claude_hook_other_programs "$work" "$event" "$name" 2>&1)"; then
+  local work="$1" settings="$2" event="$3" name="$4" records epath eshown path shown line doctor_line i
+  local -a others=()
+  if ! records="$(_claude_hook_program_paths "$work" "$event" "$name" 2>&1)"; then
     echo "    WARN: jq failed checking which program the $event hook in $settings runs; left it as it is." >&2
-    echo "          jq said: ${others%%$'\n'*}" >&2
+    echo "          jq said: ${records%%$'\n'*}" >&2
     return 0
   fi
-  [[ -z "$others" ]] && return 0
-  echo "    WARN: $event in $settings is already wired, so this install left it as it is, but no command for it names $TARGET, the program this install put in place. It runs:" >&2
-  while IFS= read -r line; do
-    echo "            $line" >&2
-  done <<< "$others"
+  [[ -z "$records" ]] && return 0
+  while IFS=$'\t' read -r epath eshown; do
+    printf -v path '%b' "$epath"
+    if [[ "$path" == "$TARGET" || "$path" -ef "$TARGET" ]]; then
+      return 0
+    fi
+    printf -v shown '%b' "$eshown"
+    for ((i = 0; i < ${#others[@]}; i++)); do
+      [[ "${others[i]}" == "$shown" ]] && continue 2
+    done
+    others+=("$shown")
+  done <<< "$records"
+  echo "    WARN: $event in $settings is already wired, so this install left it as it is, but the program it names by path is not $TARGET, the program this install put in place. It runs:" >&2
+  for shown in "${others[@]}"; do
+    while IFS= read -r line; do
+      echo "            $line" >&2
+    done <<< "$shown"
+  done
   case "$event" in Stop | PreCompact) doctor_line="hook_mining" ;; *) doctor_line="hooks" ;; esac
   if _doctor_reads "$settings"; then
-    echo "          If that program is given as a full path and is not an executable file, \`ironmem doctor\` warns on its $doctor_line line." >&2
+    echo "          If that program is not an executable file, \`ironmem doctor\` warns on its $doctor_line line." >&2
   else
     echo "          \`ironmem doctor\` reads only $_DOCTOR_SETTINGS, not this file." >&2
+  fi
+}
+
+# Says whether the mining hooks just added ($3, e.g. "Stop PreCompact") mine.
+# The commands carry no mode, so settings file $2 (work copy $1) decides: an
+# env.IRONMEM_MCP_MODE that reads as trusted (trimmed, any case, as
+# McpAccessMode::parse reads it) reaches them, and anything else leaves them
+# read-only. A jq error prints neither line, since neither would be known true.
+_print_mining_line() {
+  local work="$1" settings="$2" mining="$3" see="" rc
+  if _doctor_reads "$settings"; then
+    see=" (see \`ironmem doctor\`)"
+  fi
+  jq -e '[.env | objects | .IRONMEM_MCP_MODE | strings
+          | sub("^\\s+"; "") | sub("\\s+$"; "") | ascii_downcase] | any(. == "trusted")' \
+    "$work" >/dev/null 2>&1 && rc=0 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    echo "    $mining get a trusted IRONMEM_MCP_MODE from env in $settings, so they mine$see."
+  elif [[ "$rc" -eq 1 ]]; then
+    echo "    $mining run read-only and skip mining$see; prompt recall still works."
   fi
 }
 
@@ -1026,10 +1136,8 @@ _wire_claude_hooks_into() {
       return 0
     fi
     echo "==> Wired Claude hooks in $settings: ${added% }"
-    if [[ -n "$mining" ]] && _doctor_reads "$settings"; then
-      echo "    ${mining% } run read-only and skip mining (see \`ironmem doctor\`); prompt recall still works."
-    elif [[ -n "$mining" ]]; then
-      echo "    ${mining% } run read-only and skip mining; prompt recall still works."
+    if [[ -n "$mining" ]]; then
+      _print_mining_line "$work" "$settings" "${mining% }"
     fi
   fi
   if [[ -n "$kept" ]]; then

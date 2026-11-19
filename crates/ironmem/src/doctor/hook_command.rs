@@ -607,7 +607,11 @@ fn simple_command(
     let mut rest = words;
     while let Some(first) = rest.first() {
         let name = basename(&first.text);
-        if !matches!(name, "env" | "exec" | "command" | "nohup") {
+        // `exec` is a shell builtin with no program behind it, so an
+        // argument vector that names it as a program (directly or after
+        // `env`) never starts; it is left as the program, which is no hook.
+        let builtin_in_exec = name == "exec" && first.exec;
+        if !matches!(name, "env" | "exec" | "command" | "nohup") || builtin_in_exec {
             break;
         }
         rest = &rest[1..];

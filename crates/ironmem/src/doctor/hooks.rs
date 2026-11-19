@@ -3320,75 +3320,37 @@ mod tests {
         home.join(".ironrace/bin/ironmem").display().to_string()
     }
 
-    /// Exec-form `Stop` entries and whether each runs `ironmem hook stop`.
-    /// scripts/test_install_ironmem.py's `EXEC_FORM_STOP_FIXTURES` holds the
-    /// same entries with the same answers for the installer's
-    /// `_claude_hook_is_wired`; change the two together.
-    fn exec_form_stop_fixtures() -> Vec<(Value, bool)> {
-        use serde_json::json;
-        vec![
-            (
-                json!({"command": "/opt/ironmem", "args": ["hook", "stop", "--harness", "claude-code"]}),
-                true,
-            ),
-            (
-                json!({"command": "ironmem", "args": ["hook", "--harness", "claude-code", "stop"]}),
-                true,
-            ),
-            (
-                json!({"command": "env", "args": ["IRONMEM_MCP_MODE=trusted", "ironmem", "hook", "stop"]}),
-                true,
-            ),
-            (
-                json!({"command": "/usr/bin/env", "args": ["-u", "X", "A=1", "/opt/ironmem", "hook", "stop"]}),
-                true,
-            ),
-            (
-                json!({"command": "exec", "args": ["nohup", "ironmem", "hook", "stop"]}),
-                true,
-            ),
-            (
-                json!({"command": "bash", "args": ["-c", "ironmem hook stop"]}),
-                true,
-            ),
-            (
-                json!({"command": "bash", "args": ["/p/hooks/ironmem-hook.sh", "stop"]}),
-                true,
-            ),
-            (json!({"command": "ironmem hook stop", "args": []}), false),
-            (
-                json!({"command": "IRONMEM_MCP_MODE=trusted", "args": ["ironmem", "hook", "stop"]}),
-                false,
-            ),
-            (
-                json!({"command": "echo", "args": ["ironmem", "hook", "stop"]}),
-                false,
-            ),
-            (
-                json!({"command": "/opt/other-tool", "args": ["hook", "stop"]}),
-                false,
-            ),
-            (
-                json!({"command": "ironmem", "args": ["hook", "stopx"]}),
-                false,
-            ),
-            (
-                json!({"command": "ironmem hook stop", "args": ["x", 5]}),
-                false,
-            ),
-            (
-                json!({"command": "ironmem hook stop", "args": "hook stop"}),
-                false,
-            ),
-            (json!({"command": "ironmem hook stop", "args": null}), false),
-        ]
+    /// The shared Stop fixtures in scripts/fixtures/hook_stop_fixtures.json:
+    /// each row as a hook entry, whether it runs `ironmem hook stop`, and its
+    /// note. scripts/test_install_ironmem.py reads the same file for the
+    /// installer's `_claude_hook_is_wired`, so both are pinned to one answer.
+    fn stop_fixtures() -> Vec<(Value, bool, String)> {
+        let doc: Value = serde_json::from_str(include_str!(
+            "../../../../scripts/fixtures/hook_stop_fixtures.json"
+        ))
+        .unwrap();
+        doc["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let mut entry = serde_json::json!({"type": "command", "command": row["command"]});
+                if let Some(args) = row.get("args") {
+                    entry["args"] = args.clone();
+                }
+                let wired = row["wired"].as_bool().unwrap();
+                (entry, wired, row["note"].as_str().unwrap().to_owned())
+            })
+            .collect()
     }
 
     #[test]
-    fn exec_form_entries_are_read_as_an_argument_vector() {
-        for (entry, wired) in exec_form_stop_fixtures() {
+    fn the_shared_stop_fixtures_are_read_as_the_installer_reads_them() {
+        let rows = stop_fixtures();
+        assert!(rows.len() > 30, "{} rows", rows.len());
+        for (entry, wired, note) in rows {
             let runs = hook_command(&entry).is_some_and(|c| c.runs_hook("stop"));
-            assert_eq!(runs, wired, "{entry}");
+            assert_eq!(runs, wired, "{entry} ({note})");
         }
     }
 

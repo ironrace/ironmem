@@ -1,0 +1,335 @@
+{
+  "_comment": "Hook entries for the Stop event and whether each runs `ironmem hook stop`. Read by doctor's unit tests (crates/ironmem/src/doctor/hooks.rs, via include_str!) and by scripts/test_install_ironmem.py, so doctor and the installer are pinned to the same answers. A row without `args` is shell form; a row with `args` (whatever its value) carries it into the entry as is.",
+  "rows": [
+    {
+      "command": "/opt/ironmem",
+      "args": [
+        "hook",
+        "stop",
+        "--harness",
+        "claude-code"
+      ],
+      "wired": true,
+      "note": "exec form, absolute program"
+    },
+    {
+      "command": "ironmem",
+      "args": [
+        "hook",
+        "--harness",
+        "claude-code",
+        "stop"
+      ],
+      "wired": true,
+      "note": "exec form, --harness <v> before the name"
+    },
+    {
+      "command": "ironmem",
+      "args": [
+        "hook",
+        "--harness=claude-code",
+        "stop"
+      ],
+      "wired": true,
+      "note": "exec form, --harness=<v> before the name"
+    },
+    {
+      "command": "env",
+      "args": [
+        "IRONMEM_MCP_MODE=trusted",
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": true,
+      "note": "exec form through env, as doctor's read-only hint says to write it"
+    },
+    {
+      "command": "/usr/bin/env",
+      "args": [
+        "-u",
+        "X",
+        "A=1",
+        "/opt/ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": true,
+      "note": "env with -u NAME and an assignment"
+    },
+    {
+      "command": "env",
+      "args": [
+        "-C",
+        "/tmp",
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": true,
+      "note": "env with -C DIR"
+    },
+    {
+      "command": "command",
+      "args": [
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": true,
+      "note": "the command wrapper is peeled off"
+    },
+    {
+      "command": "nohup",
+      "args": [
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": true,
+      "note": "the nohup wrapper is peeled off"
+    },
+    {
+      "command": "exec",
+      "args": [
+        "nohup",
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": false,
+      "note": "exec is a shell builtin with no program to spawn, so this never starts"
+    },
+    {
+      "command": "env",
+      "args": [
+        "IRONMEM_MCP_MODE=trusted",
+        "exec",
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": false,
+      "note": "env cannot run exec either: it has no program"
+    },
+    {
+      "command": "bash",
+      "args": [
+        "-c",
+        "ironmem hook stop"
+      ],
+      "wired": true,
+      "note": "bash -c string read as shell form"
+    },
+    {
+      "command": "sh",
+      "args": [
+        "-c",
+        "ironmem hook stop"
+      ],
+      "wired": true,
+      "note": "sh -c string read as shell form"
+    },
+    {
+      "command": "bash",
+      "args": [
+        "-o",
+        "pipefail",
+        "-c",
+        "ironmem hook stop"
+      ],
+      "wired": true,
+      "note": "-o takes an option name before -c"
+    },
+    {
+      "command": "bash",
+      "args": [
+        "/p/hooks/ironmem-hook.sh",
+        "stop"
+      ],
+      "wired": true,
+      "note": "bash runs the plugin's hook script"
+    },
+    {
+      "command": "/p/bin/ironmem-mcp.sh",
+      "args": [
+        "hook",
+        "stop"
+      ],
+      "wired": true,
+      "note": "the plugin's MCP wrapper as the program"
+    },
+    {
+      "command": "bash",
+      "args": [
+        "/p/bin/ironmem-mcp.sh",
+        "hook",
+        "--harness",
+        "claude-code",
+        "stop"
+      ],
+      "wired": true,
+      "note": "bash runs the plugin's MCP wrapper"
+    },
+    {
+      "command": "ironmem hook stop",
+      "args": [],
+      "wired": false,
+      "note": "a program named `ironmem hook stop`"
+    },
+    {
+      "command": "IRONMEM_MCP_MODE=trusted",
+      "args": [
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": false,
+      "note": "no shell reads the assignment: it is the program name"
+    },
+    {
+      "command": "echo",
+      "args": [
+        "ironmem",
+        "hook",
+        "stop"
+      ],
+      "wired": false,
+      "note": "echo is the program"
+    },
+    {
+      "command": "/opt/other-tool",
+      "args": [
+        "hook",
+        "stop"
+      ],
+      "wired": false,
+      "note": "another program"
+    },
+    {
+      "command": "ironmem",
+      "args": [
+        "hook",
+        "stopx"
+      ],
+      "wired": false,
+      "note": "a longer hook name"
+    },
+    {
+      "command": "ironmem hook stop",
+      "args": [
+        "x",
+        5
+      ],
+      "wired": false,
+      "note": "args holds a non-string: the entry is skipped"
+    },
+    {
+      "command": "ironmem hook stop",
+      "args": "hook stop",
+      "wired": false,
+      "note": "args is not an array: the entry is skipped"
+    },
+    {
+      "command": "ironmem hook stop",
+      "args": null,
+      "wired": false,
+      "note": "args is null: the entry is skipped"
+    },
+    {
+      "command": "ironmem hook stop",
+      "wired": true,
+      "note": "shell form, PATH lookup"
+    },
+    {
+      "command": "IRONMEM_MCP_MODE=trusted ~/.ironrace/bin/ironmem hook stop",
+      "wired": true,
+      "note": "an unquoted assignment prefix"
+    },
+    {
+      "command": "ironmem hook --harness claude-code stop",
+      "wired": true,
+      "note": "shell form, --harness <v> before the name"
+    },
+    {
+      "command": "ironmem hook --harness=claude-code stop",
+      "wired": true,
+      "note": "shell form, --harness=<v> before the name"
+    },
+    {
+      "command": "ironmem hook \"stop\"",
+      "wired": true,
+      "note": "a quoted hook name"
+    },
+    {
+      "command": "env -C /tmp ironmem hook stop",
+      "wired": true,
+      "note": "env with -C DIR"
+    },
+    {
+      "command": "command ironmem hook stop",
+      "wired": true,
+      "note": "the command wrapper"
+    },
+    {
+      "command": "sh -c 'ironmem hook stop'",
+      "wired": true,
+      "note": "sh -c string"
+    },
+    {
+      "command": "bash -o pipefail -c 'ironmem hook stop'",
+      "wired": true,
+      "note": "-o takes an option name before -c"
+    },
+    {
+      "command": "/p/bin/ironmem-mcp.sh hook stop",
+      "wired": true,
+      "note": "the plugin's MCP wrapper as the program"
+    },
+    {
+      "command": "echo ironmem hook stop",
+      "wired": false,
+      "note": "ironmem is an argument of echo, not a program"
+    },
+    {
+      "command": "# ironmem hook stop",
+      "wired": false,
+      "note": "a comment"
+    },
+    {
+      "command": "\"IRONMEM_MCP_MODE=trusted\" ironmem hook stop",
+      "wired": false,
+      "note": "a quoted assignment: the shell runs a program of that name"
+    },
+    {
+      "command": "timeout 5 ironmem hook stop",
+      "wired": false,
+      "note": "behind a wrapper neither side peels"
+    },
+    {
+      "command": "if true; then ironmem hook stop; fi",
+      "wired": false,
+      "note": "behind if/then"
+    },
+    {
+      "command": "{ ironmem hook stop; }",
+      "wired": false,
+      "note": "inside a brace group"
+    },
+    {
+      "command": "echo $(ironmem hook stop)",
+      "wired": false,
+      "note": "inside $(..), whose body is not read"
+    },
+    {
+      "command": "nohup A=1 ironmem hook stop",
+      "wired": false,
+      "note": "after nohup, A=1 is the program"
+    },
+    {
+      "command": "env -u ironmem hook stop",
+      "wired": false,
+      "note": "env -u takes ironmem as the name to unset"
+    }
+  ]
+}
