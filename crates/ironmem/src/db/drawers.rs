@@ -880,9 +880,15 @@ impl Database {
                 skipped_malformed += 1;
                 continue;
             }
-            let Some(candidate_norm) = vector_norm(&candidate) else {
-                skipped_malformed += 1;
-                continue;
+            // An all-zero row means "no vector" (see `EmbeddingNorm::Zero`),
+            // so it is skipped without counting as damage.
+            let candidate_norm = match embedding_norm(&candidate) {
+                EmbeddingNorm::Usable(norm) => norm,
+                EmbeddingNorm::Zero => continue,
+                EmbeddingNorm::Unusable => {
+                    skipped_malformed += 1;
+                    continue;
+                }
             };
             let Some(score) = cosine(embedding, query_norm, &candidate, candidate_norm) else {
                 skipped_malformed += 1;
@@ -3298,6 +3304,48 @@ mod tests {
             .find_near_duplicate(&query, "wing", "room", "excluded")
             .unwrap()
             .is_none());
+    }
+
+    /// A deliberate all-zero row is skipped without a warning; a damaged one
+    /// (a NaN component) is skipped and counted in the one warning.
+    #[test]
+    fn find_near_duplicate_warns_for_a_damaged_row_but_not_a_zero_one() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+
+        let db = Database::open_in_memory().unwrap();
+        let query = vec![1.0, 0.0];
+        db.insert_drawer("zero-row", "zero", &[0.0, -0.0], "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer("real-row", "real", &query, "wing", "room", "", "test")
+            .unwrap();
+
+        let (found, log) =
+            with_captured_log(|| db.find_near_duplicate(&query, "wing", "room", "excluded"));
+        assert_eq!(
+            found.unwrap().map(|(id, _)| id).as_deref(),
+            Some("real-row")
+        );
+        assert!(!log.contains("WARN"), "a zero row is not damage: {log}");
+
+        db.insert_drawer(
+            "nan-row",
+            "nan",
+            &[f32::NAN, 1.0],
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+        let (found, log) =
+            with_captured_log(|| db.find_near_duplicate(&query, "wing", "room", "excluded"));
+        assert_eq!(
+            found.unwrap().map(|(id, _)| id).as_deref(),
+            Some("real-row")
+        );
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("skipped=1"), "{log}");
     }
 
     #[test]
