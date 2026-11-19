@@ -14,7 +14,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::hook_command::{
-    best_result, source_label, HookCommand, ModeEnv, ModeError, ModeSource, ProgramProblem, RunMode,
+    best_result, source_label, HookCommand, ModeEnv, ModeError, ModeSource, ProgramProblem,
+    RunForm, RunMode,
 };
 use super::{Check, CheckStatus};
 
@@ -102,20 +103,34 @@ IRONMEM_MCP_MODE=trusted in their commands; the installer wires them read-only, 
 mine";
 
 /// The hint for bare manual miners that run read-only, naming those `events`.
-/// `exec` says they are exec-form entries (`args` set), whose command cannot
-/// take an assignment prefix: no shell reads it.
-fn read_only_hint(events: &[&str], exec: bool) -> String {
+/// `form` says where their runs sit: an exec-form entry's command (`args`
+/// set) cannot take an assignment prefix, as no shell reads it, and a run in
+/// a `-c` string of such an entry is fixed inside that string.
+fn read_only_hint(events: &[&str], form: RunForm) -> String {
     let events_text = events.join(" and ");
-    let fix = match (exec, events.len()) {
-        (false, 1) => format!("prefix the {events_text} command with IRONMEM_MCP_MODE=trusted"),
-        (false, _) => format!("prefix the {events_text} commands with IRONMEM_MCP_MODE=trusted"),
-        (true, 1) => format!(
+    let one = events.len() == 1;
+    let fix = match (form, one) {
+        (RunForm::Shell, true) => {
+            format!("prefix the {events_text} command with IRONMEM_MCP_MODE=trusted")
+        }
+        (RunForm::Shell, false) => {
+            format!("prefix the {events_text} commands with IRONMEM_MCP_MODE=trusted")
+        }
+        (RunForm::Exec, true) => format!(
             "in the {events_text} entry (exec form, args set) make env the command and put \
              IRONMEM_MCP_MODE=trusted, then the program, first in args"
         ),
-        (true, _) => format!(
+        (RunForm::Exec, false) => format!(
             "in the {events_text} entries (exec form, args set) make env the command and put \
              IRONMEM_MCP_MODE=trusted, then the program, first in args"
+        ),
+        (RunForm::ExecString, true) => format!(
+            "in the {events_text} entry (exec form, args set) put IRONMEM_MCP_MODE=trusted \
+             before the ironmem command inside its -c string"
+        ),
+        (RunForm::ExecString, false) => format!(
+            "in the {events_text} entries (exec form, args set) put IRONMEM_MCP_MODE=trusted \
+             before the ironmem command inside each -c string"
         ),
     };
     format!(
@@ -904,9 +919,8 @@ enum NoMineCause {
     /// A manual install inherits this raw mode from the shell.
     Shell(String),
     /// A bare manual command: nothing sets the mode, so it is read-only.
-    Default,
-    /// [`Self::Default`] for an exec-form entry (`args` set).
-    DefaultExec,
+    /// Its [`RunForm`] says where a fix puts the assignment.
+    Default(RunForm),
 }
 
 /// One hint's cause and the miners it applies to, in entry order.
@@ -916,15 +930,14 @@ struct CauseGroup {
 }
 
 impl NoMineCause {
-    fn of(source: ModeSource, raw: Option<String>, plugin: bool, exec: bool) -> Self {
+    fn of(source: ModeSource, raw: Option<String>, plugin: bool, form: RunForm) -> Self {
         let raw = raw.unwrap_or_default();
         match source {
-            ModeSource::PluginWrapper | ModeSource::Default if exec => Self::DefaultExec,
             ModeSource::SettingsEnv | ModeSource::Environment if plugin => Self::PluginOverride,
             ModeSource::Inline => Self::Inline(raw),
             ModeSource::SettingsEnv => Self::SettingsEnv(raw),
             ModeSource::Environment => Self::Shell(raw),
-            ModeSource::PluginWrapper | ModeSource::Default => Self::Default,
+            ModeSource::PluginWrapper | ModeSource::Default => Self::Default(form),
         }
     }
 
@@ -954,8 +967,7 @@ impl NoMineCause {
                 "doctor ran with IRONMEM_MCP_MODE={raw:?}, and a Claude Code launched from this \
                  shell inherits it; launch Claude Code with IRONMEM_MCP_MODE=trusted to mine"
             ),
-            Self::Default => read_only_hint(events, false),
-            Self::DefaultExec => read_only_hint(events, true),
+            Self::Default(form) => read_only_hint(events, *form),
         }
     }
 }
@@ -1045,7 +1057,7 @@ fn mining_check(wired: &WiredHooks, ctx: Context<'_>, plugin: bool) -> Check {
                 not_mined.push(event);
                 add_cause(
                     &mut causes,
-                    NoMineCause::of(run.source, run.raw, plugin, run.exec),
+                    NoMineCause::of(run.source, run.raw, plugin, run.form),
                     event,
                 );
                 format!("{event}: {} ({label}) -> not mined", mode.as_str())
@@ -3482,6 +3494,104 @@ mod tests {
         assert_eq!(
             c.summary,
             "Stop is mined — Stop: trusted (set in the hook command) -> mined"
+        );
+    }
+
+    /// Doctor's read-only hint for bare miners whose fix is `fix`, pinned
+    /// word for word.
+    fn read_only_text_fixed_by(fix: &str) -> String {
+        format!(
+            "expected outside a plugin install: MCP writes and prompt recall still work. \
+             A cheaper way to mine without the plugin is tracked in #418. To mine now, {fix}; \
+             each run then loads the embedding model and rebuilds the vector index"
+        )
+    }
+
+    const READ_ONLY_DEFAULT: &str =
+        "read-only (IRONMEM_MCP_MODE unset, so the default) -> not mined";
+
+    #[test]
+    fn a_bare_run_in_an_exec_form_c_string_is_told_to_edit_the_string() {
+        // Prefixing the entry's command (`bash`) would rename the program, so
+        // the fix goes inside the -c string.
+        let one =
+            settings_with_entries(&[("Stop", exec_entry("bash", &["-c", "ironmem hook stop"]))]);
+        let c = mining_of(&one, None);
+        assert_eq!(
+            c.summary,
+            format!("no wired hook mines — Stop: {READ_ONLY_DEFAULT}")
+        );
+        assert_eq!(
+            c.hint.as_deref(),
+            Some(
+                read_only_text_fixed_by(
+                    "in the Stop entry (exec form, args set) put IRONMEM_MCP_MODE=trusted before \
+                     the ironmem command inside its -c string"
+                )
+                .as_str()
+            )
+        );
+        let both = settings_with_entries(&[
+            ("Stop", exec_entry("bash", &["-c", "ironmem hook stop"])),
+            (
+                "PreCompact",
+                exec_entry("sh", &["-c", "ironmem hook precompact"]),
+            ),
+        ]);
+        assert_eq!(
+            mining_of(&both, None).hint.as_deref(),
+            Some(
+                read_only_text_fixed_by(
+                    "in the Stop and PreCompact entries (exec form, args set) put \
+                     IRONMEM_MCP_MODE=trusted before the ironmem command inside each -c string"
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn one_exec_form_bare_miner_gets_the_singular_exec_hint() {
+        let home = home_with_settings_for(|home| {
+            let program = home_program(home);
+            settings_with_entries(&[("Stop", exec_entry(&program, &["hook", "stop"]))])
+        });
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(
+            c[1].summary,
+            format!("no wired hook mines — Stop: {READ_ONLY_DEFAULT}")
+        );
+        assert_eq!(
+            c[1].hint.as_deref(),
+            Some(exec_read_only_text("Stop entry").as_str())
+        );
+    }
+
+    #[test]
+    fn exec_form_and_shell_form_bare_miners_get_one_hint_each() {
+        let home = home_with_settings_for(|home| {
+            let program = home_program(home);
+            let shell =
+                serde_json::json!({"type": "command", "command": "ironmem hook precompact"});
+            settings_with_entries(&[
+                ("Stop", exec_entry(&program, &["hook", "stop"])),
+                ("PreCompact", shell),
+            ])
+        });
+        let c = claude_hook_checks(Some(home.path()), None);
+        assert_eq!(
+            c[1].summary,
+            format!(
+                "no wired hook mines — Stop: {READ_ONLY_DEFAULT}; PreCompact: {READ_ONLY_DEFAULT}"
+            )
+        );
+        assert_eq!(
+            c[1].hint,
+            Some(format!(
+                "{} | {}",
+                exec_read_only_text("Stop entry"),
+                read_only_text("PreCompact command")
+            ))
         );
     }
 

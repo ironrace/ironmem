@@ -105,10 +105,22 @@ pub(super) struct RunMode {
     /// (no `$`, backtick, glob or brace). `None` for a PATH lookup (`ironmem`)
     /// and for anything doctor cannot know; those are not checked.
     pub(super) program: Option<String>,
-    /// The run is an exec-form entry's own argument vector (not a shell
-    /// string inside it, such as `bash -c`'s), so a fix cannot prefix its
-    /// command with an assignment.
-    pub(super) exec: bool,
+    /// Where the run sits in its entry, which decides how a fix adds an
+    /// assignment to it.
+    pub(super) form: RunForm,
+}
+
+/// Where a run sits in its hook entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RunForm {
+    /// A shell-form `command` string: an assignment prefix works.
+    Shell,
+    /// An exec-form entry's own argument vector: no shell reads `command`,
+    /// so an assignment prefix there would rename the program.
+    Exec,
+    /// A shell string inside an exec-form entry (`bash -c <string>` in
+    /// `args`): the fix goes inside that string, not on `command`.
+    ExecString,
 }
 
 impl RunMode {
@@ -119,7 +131,7 @@ impl RunMode {
             source,
             raw: None,
             program: None,
-            exec: false,
+            form: RunForm::Shell,
         }
     }
 }
@@ -211,7 +223,7 @@ impl HookCommand {
             .map(|i| {
                 let mut run = RunMode {
                     program: i.program.clone(),
-                    exec: i.exec,
+                    form: i.form,
                     ..invocation_mode(i, env)
                 };
                 if let Some(path) = &i.unexpanded_tilde {
@@ -524,11 +536,11 @@ struct Invocation {
     mode: Option<ModeValue>,
     /// See [`RunMode::program`].
     program: Option<String>,
-    /// An exec-form program word starting with `~/`, which nothing expands
-    /// ([`ProgramProblem::TildeNotExpanded`]).
+    /// An exec-form program word starting with `~/`, which doctor reads as
+    /// not expanded ([`ProgramProblem::TildeNotExpanded`]).
     unexpanded_tilde: Option<String>,
-    /// See [`RunMode::exec`].
-    exec: bool,
+    /// See [`RunMode::form`].
+    form: RunForm,
 }
 
 /// The program word's literal path, if doctor can check it: see
@@ -634,7 +646,11 @@ fn simple_command(
             mode: mode.clone(),
             program: literal_path(program_word),
             unexpanded_tilde: unexpanded_tilde.clone(),
-            exec: program_word.exec,
+            form: if program_word.exec {
+                RunForm::Exec
+            } else {
+                RunForm::Shell
+            },
         });
     };
     match program {
@@ -667,7 +683,14 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
         // `-ce`) as `-c`.
         if text.starts_with('-') && !text.starts_with("--") && text.contains('c') {
             if let Some(script) = args.get(i + 1) {
-                found.extend(invocations(&script.text, mode));
+                let runs = invocations(&script.text, mode);
+                // A string from an exec-form entry's args: a fix edits it.
+                found.extend(runs.into_iter().map(|mut run| {
+                    if script.exec {
+                        run.form = RunForm::ExecString;
+                    }
+                    run
+                }));
             }
             return;
         }
@@ -694,7 +717,11 @@ fn shell_args(args: &[Word], mode: Option<ModeValue>, found: &mut Vec<Invocation
                 mode,
                 program: None,
                 unexpanded_tilde: None,
-                exec: false,
+                form: if arg.exec {
+                    RunForm::Exec
+                } else {
+                    RunForm::Shell
+                },
             });
         }
         return;
@@ -760,7 +787,7 @@ fn invocation_mode(run: &Invocation, env: ModeEnv<'_>) -> RunMode {
         source,
         raw: Some(raw.to_owned()),
         program: None,
-        exec: false,
+        form: RunForm::Shell,
     };
     if dynamic {
         return read(Err(ModeError::Unknown(raw.to_owned())));
