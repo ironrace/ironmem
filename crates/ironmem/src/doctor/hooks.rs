@@ -1560,6 +1560,14 @@ mod tests {
             ),
             (r#"{"hooks": []}"#, "hooks is not an object"),
             (r#"{"hooks": "x"}"#, "hooks is not an object"),
+            // scripts/install-ironmem.sh refuses both `false`s too
+            // (test_hooks_false_is_refused_as_a_shape_problem), so the hint's
+            // "refuses the file until then" holds.
+            (r#"{"hooks": false}"#, "hooks is not an object"),
+            (
+                r#"{"hooks": {"Stop": false}}"#,
+                "hooks.Stop is not an array",
+            ),
         ] {
             let home = home_with_settings(settings);
             let c = claude_hook_checks(Some(home.path()), None);
