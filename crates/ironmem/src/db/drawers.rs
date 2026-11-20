@@ -1035,6 +1035,9 @@ impl Database {
     ///
     /// Returns an empty vec if the FTS table doesn't exist yet or the query is
     /// syntactically invalid — callers fall back to vector-only search gracefully.
+    /// Any other failure while it runs (a busy or locked database, I/O) also
+    /// returns the hits read so far, with a `warn`: every query is quoted, so
+    /// such a failure is almost always the database's, not the query's.
     pub fn bm25_search(
         &self,
         query: &str,
@@ -1293,7 +1296,11 @@ impl Database {
                 if strict && !is_fts_query_rejection(&e) {
                     return Err(e.into());
                 }
-                tracing::debug!("BM25 query failed (will use vector-only): {e}");
+                if is_fts_query_rejection(&e) {
+                    tracing::debug!("BM25 query failed (will use vector-only): {e}");
+                } else {
+                    tracing::warn!(error = %e, "BM25 search failed; the keyword leg returns no hits");
+                }
                 Ok(vec![])
             }
             Ok(rows) => {
@@ -1304,7 +1311,16 @@ impl Database {
                         // A truncated result would read as complete.
                         Err(e) if strict && !is_fts_query_rejection(&e) => return Err(e.into()),
                         Err(e) => {
-                            tracing::debug!("BM25 row error: {e}");
+                            if is_fts_query_rejection(&e) {
+                                tracing::debug!("BM25 row error: {e}");
+                            } else {
+                                tracing::warn!(
+                                    error = %e,
+                                    "BM25 search failed; the keyword leg returns the {} hit(s) \
+                                     read before it",
+                                    result.len()
+                                );
+                            }
                             break;
                         }
                     }
@@ -3214,6 +3230,44 @@ mod tests {
             }
         }
         assert!(rejected.is_empty(), "FTS5 rejected: {rejected:#?}");
+    }
+
+    /// The general BM25 search still degrades a failure to the hits it has,
+    /// but a failure that is not FTS5 rejecting the query (here an
+    /// interrupted step, standing in for a busy or I/O failure) is a warning:
+    /// since every query is quoted, such an error is almost always a real
+    /// database fault, not the query's.
+    #[test]
+    fn bm25_search_warns_on_a_database_error_but_still_returns() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        for i in 0..50 {
+            let id = format!("n{i:02}");
+            db.insert_drawer(&id, "a needle here", &emb, "w", "r", "", "test")
+                .unwrap();
+        }
+        let (hits, log) = with_captured_log(|| db.bm25_search("needle", 100, None, None));
+        assert_eq!(hits.unwrap().len(), 50);
+        assert!(!log.contains("WARN"), "{log}");
+
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&steps);
+        db.conn
+            .progress_handler(
+                1,
+                Some(move || counted.fetch_add(1, Ordering::SeqCst) > 100),
+            )
+            .unwrap();
+        let (hits, log) = with_captured_log(|| db.bm25_search("needle", 100, None, None));
+        db.conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert!(hits.unwrap().len() < 50);
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("interrupt"), "{log}");
     }
 
     #[test]
