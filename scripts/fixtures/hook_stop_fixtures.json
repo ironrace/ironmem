@@ -1,5 +1,5 @@
 {
-  "_comment": "Hook entries for the Stop event and whether each runs `ironmem hook stop`. Read by doctor's unit tests (crates/ironmem/src/doctor/hooks.rs, via include_str!) and by scripts/test_install_ironmem.py, so doctor and the installer are pinned to the same answers. A row without `args` is shell form; a row with `args` (whatever its value) carries it into the entry as is.",
+  "_comment": "Hook entries for the Stop event and whether each runs `ironmem hook stop` on a non-plugin install. Read by doctor's unit tests (crates/ironmem/src/doctor/hooks.rs, via include_str!) and by scripts/test_install_ironmem.py, so doctor and the installer are pinned to the same answers; both also run every row with `stop` swapped for each of the four hook names. A row without `args` is shell form; a row with `args` (whatever its value) carries it into the entry as is. A run whose program or wrapper-script word uses ${CLAUDE_PLUGIN_ROOT} is `wired: false`: Claude Code leaves that variable unset for a settings.json hook (measured on 2.1.329). The installer does not count it; doctor matches it but reads it as not starting, which is what its side of these rows checks. `env_rows` are settings.json `env` values (`env` absent: no env key) and whether the Stop hook the installer wires then mines: `unset` (no string IRONMEM_MCP_MODE, so the launch environment decides), `writes` (a mode that writes) or `does_not_write`.",
   "rows": [
     {
       "command": "/opt/ironmem",
@@ -453,6 +453,159 @@
       "command": "bash /x/notironmem-hook.sh stop",
       "wired": false,
       "note": "a script whose name ends in ironmem-hook.sh"
+    },
+    {
+      "command": "\"/opt/a\\b/ironmem\" hook stop",
+      "wired": true,
+      "note": "a backslash in double quotes before a plain character is kept"
+    },
+    {
+      "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh stop",
+      "wired": false,
+      "note": "the plugin's hook command copied into settings.json"
+    },
+    {
+      "command": "bash \"${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh\" stop",
+      "wired": false,
+      "note": "the plugin's hook command, quoted script"
+    },
+    {
+      "command": "$CLAUDE_PLUGIN_ROOT/hooks/ironmem-hook.sh stop",
+      "wired": false,
+      "note": "$CLAUDE_PLUGIN_ROOT without braces, script as the program"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh hook stop",
+      "wired": false,
+      "note": "the plugin's MCP wrapper as the program"
+    },
+    {
+      "command": "bash -c '${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh hook stop'",
+      "wired": false,
+      "note": "the plugin's MCP wrapper inside bash -c"
+    },
+    {
+      "command": "bash",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh",
+        "stop"
+      ],
+      "wired": false,
+      "note": "exec form, the plugin's hook script run by bash"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh",
+      "args": [
+        "hook",
+        "stop"
+      ],
+      "wired": false,
+      "note": "exec form, the plugin's MCP wrapper as the program"
+    },
+    {
+      "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh stop; ~/.ironrace/bin/ironmem hook stop",
+      "wired": true,
+      "note": "a plugin-root run beside a run of the installed program"
+    },
+    {
+      "command": "bash ${CLAUDE_PLUGIN_ROOTS}/hooks/ironmem-hook.sh stop",
+      "wired": true,
+      "note": "a longer variable name is another variable"
+    }
+  ],
+  "env_rows": [
+    {
+      "note": "no env key",
+      "mines": "unset"
+    },
+    {
+      "env": {
+        "OTHER": "trusted"
+      },
+      "note": "env without IRONMEM_MCP_MODE",
+      "mines": "unset"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": true
+      },
+      "note": "a boolean value",
+      "mines": "unset"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": 1
+      },
+      "note": "a number value",
+      "mines": "unset"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": {}
+      },
+      "note": "an object value",
+      "mines": "unset"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": null
+      },
+      "note": "a null value",
+      "mines": "unset"
+    },
+    {
+      "env": "IRONMEM_MCP_MODE=trusted",
+      "note": "env is a string, not an object",
+      "mines": "unset"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": "trusted"
+      },
+      "note": "trusted",
+      "mines": "writes"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": " Trusted "
+      },
+      "note": "McpAccessMode::parse trims and ignores case",
+      "mines": "writes"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": "TRUSTED"
+      },
+      "note": "upper case",
+      "mines": "writes"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": "read-only"
+      },
+      "note": "read-only",
+      "mines": "does_not_write"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": "restricted"
+      },
+      "note": "restricted",
+      "mines": "does_not_write"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": "trusted-ish"
+      },
+      "note": "an invalid mode: the hook exits at startup",
+      "mines": "does_not_write"
+    },
+    {
+      "env": {
+        "IRONMEM_MCP_MODE": ""
+      },
+      "note": "an empty mode: Config::load rejects it",
+      "mines": "does_not_write"
     }
   ]
 }
