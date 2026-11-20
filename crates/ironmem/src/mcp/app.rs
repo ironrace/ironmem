@@ -532,7 +532,7 @@ impl App {
     /// every rebuild and classifies them the same way
     /// (`crate::db::drawers::embedding_norm`): an all-zero embedding is
     /// skipped at `debug`, any other unusable one with a `warn` naming the
-    /// drawer.
+    /// drawer (a rebuild counts them in one warning instead).
     pub fn insert_into_index(&self, drawer_id: &str, embedding: &[f32]) -> Result<(), MemoryError> {
         let mut state = self
             .index_state
@@ -557,8 +557,8 @@ impl App {
             crate::db::drawers::EmbeddingNorm::Unusable => {
                 tracing::warn!(
                     drawer_id = %drawer_id,
-                    "drawer left out of the vector index: its embedding has no usable norm \
-                     (a non-finite value, or a norm that overflows or underflows)"
+                    "drawer {}",
+                    crate::db::schema::UNUSABLE_NORM_LEFT_OUT
                 );
                 false
             }

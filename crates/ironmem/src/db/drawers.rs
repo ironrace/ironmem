@@ -2577,10 +2577,12 @@ mod tests {
         }
     }
 
-    /// A damaged embedding is a warning naming the drawer; a deliberate zero
-    /// vector is not. Neither is indexed.
+    /// Damaged embeddings are one warning per rebuild, with their count and
+    /// the first few ids (a rebuild runs on every search after a write, so a
+    /// warning per drawer would repeat for every damaged row each time); a
+    /// deliberate zero vector is not warned about. None of them is indexed.
     #[test]
-    fn load_all_vectors_warns_for_a_damaged_embedding_but_not_a_zero_one() {
+    fn load_all_vectors_warns_once_for_damaged_embeddings_but_not_a_zero_one() {
         use crate::autopilot::worktree::testing::with_captured_log;
 
         let db = Database::open_in_memory().unwrap();
@@ -2595,17 +2597,67 @@ mod tests {
             .unwrap();
         db.insert_drawer("overflow-row", "c", &vec![1e20; dim], "w", "r", "", "mcp")
             .unwrap();
+        let damaged: Vec<String> = (0..5).map(|i| format!("damaged-{i}")).collect();
+        for id in &damaged {
+            db.insert_drawer(id, id, &nan, "w", "r", "", "mcp").unwrap();
+        }
 
         let (vectors, log) = with_captured_log(|| db.load_all_vectors().unwrap());
         let ids: Vec<&str> = vectors.iter().map(|(id, _)| id.as_str()).collect();
         assert_eq!(ids, ["real"]);
         let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
-        assert_eq!(warnings.len(), 2, "{log}");
-        for id in ["nan-row", "overflow-row"] {
-            let named = format!("drawer_id={id}");
-            assert!(warnings.iter().any(|line| line.contains(&named)), "{log}");
-        }
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("unusable=7"), "{log}");
+        // The first five damaged rows are named, and no more.
+        let named = ["nan-row", "overflow-row"]
+            .into_iter()
+            .chain(damaged.iter().map(String::as_str))
+            .filter(|id| warnings[0].contains(&format!("\"{id}\"")))
+            .count();
+        assert_eq!(named, 5, "{log}");
         assert!(!log.contains("zero-row"), "{log}");
+    }
+
+    /// A row whose embedding cannot be converted (a blob of another length,
+    /// a value that is not a blob) is skipped and counted. Any other error
+    /// fails the load: SQLite ends the statement at the first one (here an
+    /// interrupted step, standing in for a busy or I/O failure), so returning
+    /// the rows read so far would install a truncated index as a whole one.
+    #[test]
+    fn load_all_vectors_skips_unconvertible_rows_but_fails_on_a_step_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut db = Database::open_in_memory().unwrap();
+        for i in 0..50 {
+            let id = format!("row{i:02}");
+            db.insert_drawer(&id, "c", &dummy_embedding(), "w", "r", "", "mcp")
+                .unwrap();
+        }
+        db.insert_drawer("short", "c", &[1.0; 4], "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("text", "c", &dummy_embedding(), "w", "r", "", "mcp")
+            .unwrap();
+        db.exec_raw("UPDATE drawers SET embedding = 'text' WHERE id = 'text'")
+            .unwrap();
+        assert_eq!(db.load_all_vectors().unwrap().len(), 50);
+
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&steps);
+        db.conn
+            .progress_handler(
+                1,
+                Some(move || counted.fetch_add(1, Ordering::SeqCst) > 100),
+            )
+            .unwrap();
+        let result = db.load_all_vectors();
+        db.conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert!(
+            steps.load(Ordering::SeqCst) > 100,
+            "the scan was not interrupted"
+        );
+        let error = result.expect_err("an interrupted scan must not read as complete");
+        assert!(error.to_string().contains("interrupt"), "{error}");
     }
 
     #[test]

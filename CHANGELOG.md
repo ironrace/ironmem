@@ -343,9 +343,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   id. Everything the noop embedder (`IRONMEM_EMBED_MODE=noop`) writes is an
   all-zero vector too, so search over a store it wrote is keyword-only.
   A damaged stored embedding (a NaN or infinite value, or a norm that
-  overflows or underflows) is now logged as a warning naming the drawer when
-  the vector index is built or a drawer is added to it; an all-zero one is not
-  warned about, by the index or by `add_drawer`'s near-duplicate check. A
+  overflows or underflows) is now logged: as one warning per index build, with
+  the count and the first five drawer ids, and as a warning naming the drawer
+  when one is added to the index; an all-zero one is not warned about, by the
+  index or by `add_drawer`'s near-duplicate check. An index build whose read
+  of the table fails partway (busy, I/O) now fails instead of installing the
+  rows read so far as the whole index. A
   scoped search logs one warning, naming the wing and room, with the count of
   in-scope rows it skips as malformed: an undecodable blob, a length other
   than the query's, a NaN, infinite, overflowing or underflowing norm, or a
