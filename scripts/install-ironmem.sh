@@ -722,6 +722,10 @@ register_json_mcpservers() {
 # so is every other hook and key. A run whose program or script word uses
 # ${CLAUDE_PLUGIN_ROOT} does not count: Claude Code leaves that variable unset
 # for a settings.json hook (measured on 2.1.329), so the run finds no script.
+# When an event holds such an entry and nothing else that runs the hook, the
+# hook is added beside it and, once the file is written, a WARN names the
+# event and says that entry does not run outside the plugin and can be
+# deleted (never the entry itself).
 # If a run of an event names a program by a literal path (absolute or ~/) that
 # is not the same file as this install's program, and no run names that
 # program, a WARN names the event and that path (never the whole entry, which
@@ -954,6 +958,12 @@ def runs_hook($name):
   if shell_form then .command | shell_runs($name)
   elif exec_form then [.command] + .args | exec_runs($name)
   else false end;
+def unroot:
+  gsub("\\$\\{CLAUDE_PLUGIN_ROOT\\}"; "/claude-plugin-root")
+  | gsub("\\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])"; "/claude-plugin-root");
+def plugin_root_copy($name):
+  ([.command] + (if exec_form then .args else [] end) | any(.[]; plugin_root))
+  and (.command |= unroot | (if exec_form then .args |= map(unroot) else . end) | runs_hook($name));
 def esc_line: split("\\") | join("\\\\") | split("\n") | join("\\n") | split("\t") | join("\\t");
 def unquote:
   [scan("\"(?:[^\"\\\\]|\\\\.)*\"|\u0027[^\u0027]*\u0027|\\\\.|[^\"\u0027\\\\]+")] as $s
@@ -1001,6 +1011,15 @@ def visible: explode | map(if . < 32 or . == 127 then 63 else . end) | implode;
 _claude_hook_is_wired() {
   jq -e --arg ev "$2" --arg name "$3" "$_CLAUDE_HOOK_JQ_DEFS"'
       [entries($ev) | select(runs_hook($name))] | length > 0' \
+    "$1" >/dev/null
+}
+
+# Does hooks.<event> ($2) in work file $1 hold an entry that would run
+# `ironmem hook <name>` ($3) but for its ${CLAUDE_PLUGIN_ROOT}, which Claude
+# Code leaves unset for a settings.json hook? Exit 0 yes, 1 no, 2+ a jq error.
+_claude_hook_has_plugin_root_copy() {
+  jq -e --arg ev "$2" --arg name "$3" "$_CLAUDE_HOOK_JQ_DEFS"'
+      [entries($ev) | select(plugin_root_copy($name))] | length > 0' \
     "$1" >/dev/null
 }
 
@@ -1208,7 +1227,7 @@ wire_claude_hooks() {
 _wire_claude_hooks_into() {
   local settings="$1" work="$2" next="$3" err_file="${2%/*}/jq.err"
   local dir real real_dir before now pair event name rc err shape
-  local added="" kept="" mining="" wired_too="" disabled=0
+  local added="" kept="" mining="" wired_too="" root_copies="" disabled=0
 
   if [[ -L "$settings" && ! -e "$settings" ]]; then
     _wire_claude_hooks_warn "$settings is a dangling symlink" "$settings"
@@ -1335,6 +1354,13 @@ _wire_claude_hooks_into() {
       _wire_claude_hooks_warn "jq failed reading the $event hooks in $settings" "$settings" "$err"
       return 0
     fi
+    err="$(_claude_hook_has_plugin_root_copy "$work" "$event" "$name" 2>&1)" && rc=0 || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      root_copies+="$event "
+    elif [[ "$rc" -ne 1 ]]; then
+      echo "    WARN: jq failed checking the $event hooks in $settings for a \${CLAUDE_PLUGIN_ROOT} command; adding the hook anyway." >&2
+      echo "          jq said: ${err%%$'\n'*}" >&2
+    fi
     if ! err="$(jq --arg ev "$event" --arg cmd "$HOOK_PROGRAM hook $name --harness claude-code" \
       '.hooks = (.hooks // {}) | .hooks[$ev] = ((.hooks[$ev] // []) + [{hooks: [{type: "command", command: $cmd}]}])' \
       "$work" 2>&1 > "$next")" || [[ ! -s "$next" ]]; then
@@ -1390,6 +1416,9 @@ _wire_claude_hooks_into() {
       return 0
     fi
     echo "==> Wired Claude hooks in $settings: ${added% }"
+    for event in $root_copies; do
+      echo "    WARN: $event in $settings already has an ironmem hook entry that runs through \${CLAUDE_PLUGIN_ROOT}, which Claude Code sets only for plugin hooks, so that entry does not run outside the plugin. This install added its own $event hook beside it; you can delete the old entry." >&2
+    done
     if [[ -n "$mining" && "$disabled" -eq 0 ]]; then
       _print_mining_line "$work" "$settings" "${mining% }"
     fi

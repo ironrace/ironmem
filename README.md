@@ -608,7 +608,10 @@ the first `[FAIL]`:
   UserPromptSubmit, Stop, PreCompact) are not all wired and working. The line
   says which case it is, and the hint on the line beneath says what to do for
   that case; follow it:
-  - `settings.json` does not exist, or is not a JSON object doctor can read.
+  - `settings.json` does not exist, or is not a JSON object doctor can read:
+    doctor reports a dangling symlink, a FIFO or other non-regular file, a
+    file over 8 MiB or one that is not UTF-8 without reading it, and a
+    `~/.claude` that is not a directory instead of skipping the checks.
   - Its `hooks` block is mis-shaped: `hooks` is not an object (`[]`, `false`, a
     string), or a `hooks.<event>` is not an array. The line reads `Claude Code
     hooks: cannot read the hooks in <path>: <reason>`, with a reason such as
@@ -629,14 +632,22 @@ the first `[FAIL]`:
     shapes the same way, with one difference: it reads a `;`, `&`, `|`, `(`,
     `)` or line break inside quotes or a comment as the start of a command, so
     it can call a hook already wired that doctor reports missing (`echo "x;
-    ironmem hook stop"`), and the hint says what to do then.
+    ironmem hook stop"`), and the hint says what to do then. When a missing
+    hook's entry mentions its command (`timeout 5 ironmem hook stop`), a
+    further hint says not to re-run the installer if that entry does run the
+    hook, since the installer would add a second copy beside it.
   - A SessionStart or UserPromptSubmit hook fails or may fail to start: its
     `IRONMEM_MCP_MODE` is invalid or cannot be judged statically, or its
-    program is a full path (or `~/...`) that does not exist or is not an
-    executable file, as in `Claude Code hooks: SessionStart is wired to <path>,
-    which does not exist, so no memory context is loaded at session start`. A
-    Stop or PreCompact that fails to start is reported on `hook_mining`
-    instead.
+    program is a full path (or `~/...`) that does not exist, is not an
+    executable file or cannot be reached (`cannot be reached (not a
+    directory)`), as in `Claude Code hooks: SessionStart is wired to <path>,
+    which does not exist, so no memory context is loaded at session start`.
+    On a non-plugin install, a command whose program or wrapper script uses
+    `${CLAUDE_PLUGIN_ROOT}` (copied from the plugin's hooks.json) does not
+    run either: Claude Code sets that variable only for plugin hooks
+    (measured on 2.1.329), and the line says `uses ${CLAUDE_PLUGIN_ROOT}, a
+    variable Claude Code sets only for plugin hooks`. A Stop or PreCompact
+    that fails to start is reported on `hook_mining` instead.
   - The enabled plugin and a hand-wired entry both supply a hook, so it runs
     twice, or one copy does not start, as in `the hand-wired <Event> is wired
     to <path>, which does not exist, so only the plugin's copy runs`.
@@ -671,7 +682,8 @@ the first `[FAIL]`:
   unreadable `settings.json`, which you fix by hand. A command that reaches
   the hook through `${CLAUDE_PLUGIN_ROOT}` does not count as wired: Claude
   Code leaves that variable unset for a `settings.json` hook, so the
-  installer adds its own, and you can delete the copied plugin command. With
+  installer adds its own and prints a WARN naming the event; you can delete
+  the copied plugin command. With
   the plugin enabled it wires nothing and warns when `settings.json` also
   hand-wires any of the four. The hooks it adds bring back session
   context and prompt recall. They set no `IRONMEM_MCP_MODE`, so they mine only
@@ -706,11 +718,23 @@ the first `[FAIL]`:
   own environment applies to a Claude Code launched from that same shell.
   Read-only is the expected state for a script install: MCP writes and prompt
   recall still work. Prefixing the Stop and PreCompact commands with
-  `IRONMEM_MCP_MODE=trusted` turns mining on (for an exec-form entry, make
+  `IRONMEM_MCP_MODE=trusted` turns mining on when ironmem runs in the
+  command's first simple command; a prefix reaches only that one, so for
+  `cd /x && ironmem hook stop` put `export IRONMEM_MCP_MODE=trusted;` at the
+  start instead (the hint says which; doctor follows `export`, `unset` and a
+  plain `IRONMEM_MCP_MODE=v` earlier in the same command, but not `env -i` or
+  `env -u`) (for an exec-form entry, make
   `env` the command and put `IRONMEM_MCP_MODE=trusted`, then the program,
   first in `args`; for a run inside an exec-form entry's `bash -c` string, put
   it before the ironmem command inside that string), at the cost of loading the embedding model and rebuilding
-  the vector index on each run; a cheaper path is tracked in #418. The line is
+  the vector index on each run; a cheaper path is tracked in #418. A
+  `settings.json` `env.IRONMEM_MCP_MODE` that is not a string reads as unset,
+  with a hint to make it one. On the plugin path the OK lines end `(if the
+  plugin's wrapper starts; doctor does not check the plugin's own files)`:
+  the plugin's wrapper exits without running a hook when the `ironmem`
+  binary's version differs from the plugin's `plugin.json` version (or no
+  binary resolves), and doctor does not check that, so after an upgrade keep
+  the binary and the plugin on the same version. The line is
   an `[INFO]` skip when the `hooks` block cannot be read (`hook mining:
   skipped (the hooks in settings.json cannot be read)`) or `disableAllHooks`
   is true (`hook mining: skipped (disableAllHooks is true in settings.json;
@@ -718,7 +742,8 @@ the first `[FAIL]`:
 - **`mined_rows` older than 7 days** (a `[WARN]`) → no workspace file has been
   mined in that time. Mining stores only files whose content changed, so a
   workspace you haven't edited looks the same as mining that stopped; MCP writes
-  don't count. Check the `hook_mining` line. With no mined row at all the line
+  don't count. Check the `hook_mining` line. A newest row dated in the future
+  warns about the system clock. With no mined row at all the line
   is an `[INFO]`, and its hint lists what mines: trusted Stop and PreCompact
   hooks on every run, `ironmem mine <dir>`, the `ironmem claude` and `ironmem
   codex` launchers, and, the first time for a workspace, a trusted SessionStart

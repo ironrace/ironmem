@@ -58,8 +58,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read-only hint for a run inside an exec-form `bash -c` string says to put
   `IRONMEM_MCP_MODE=trusted` before the ironmem command inside that string.
   When `settings.json`'s `env` sets a writing `IRONMEM_MCP_MODE`, the install
-  hints say the hooks the installer wires mine. Problems are warnings and never fail `doctor`
-  (exit 0).
+  hints say the hooks the installer wires mine. On a non-plugin install a
+  command whose program or wrapper script uses `${CLAUDE_PLUGIN_ROOT}` reads
+  as not running (`Stop: wired to ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh,
+  which uses ${CLAUDE_PLUGIN_ROOT}, a variable Claude Code sets only for
+  plugin hooks -> does not run`), since Claude Code leaves that variable unset
+  for a `settings.json` hook (measured on 2.1.329). A program path whose
+  lookup fails for another reason than not found (a file used as a
+  directory, a symlink loop, a directory the user may not search) reads as
+  `cannot be reached (<reason>)`. Doctor follows `export`, `unset` and a plain
+  `IRONMEM_MCP_MODE=v` earlier in the same command, and reads a backslash in
+  double quotes as POSIX does. When the ironmem command is not the first
+  simple command of its entry (`cd /x && ironmem hook stop`), the read-only
+  hint says to add `export IRONMEM_MCP_MODE=trusted;` at the start instead of
+  a prefix that would not reach it. A missing hook whose entry mentions its
+  command (behind `timeout`, `if` or `{ }`) gets a hint not to re-run the
+  installer, which would add a second copy. A `settings.json` that is a
+  dangling symlink, not a regular file (a FIFO), over 8 MiB or not UTF-8 is
+  reported, not read, and so is a `~/.claude` that is not a directory; a
+  non-string `env.IRONMEM_MCP_MODE` gets a hint; control characters from the
+  file are escaped in doctor's lines. The plugin path's OK lines say `(if the
+  plugin's wrapper starts; doctor does not check the plugin's own files)`:
+  the wrapper refuses to start when the binary's version differs from the
+  plugin's. A newest mined row dated in the future warns about the clock.
+  Problems are warnings and never fail `doctor` (exit 0).
   `scripts/install-ironmem.sh` now appends the four hooks to
   `$CLAUDE_HOME/settings.json` (override with `CLAUDE_SETTINGS_JSON`) unless
   the ironmem plugin is enabled. Hooks already wired, in shell or exec form,
@@ -70,7 +92,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside quotes or a comment as the start of a command. A command whose
   program or script path uses `${CLAUDE_PLUGIN_ROOT}` does not count as
   wired: Claude Code leaves that variable unset for a `settings.json` hook
-  (measured on 2.1.329), so the installer adds its own. When an already-wired
+  (measured on 2.1.329), so the installer adds its own and warns that the old
+  entry does not run outside the plugin and can be deleted (naming only the
+  event). When an already-wired
   hook names a program by a full path (or `~/...`) that is not the same file
   as the installed one, and none of its commands names the installed one, a
   WARN names the event and that program path (not the whole entry, which can

@@ -1619,38 +1619,26 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertEqual(len(lines), 1, result.stdout)
             return lines[0].replace(str(path), "<path>")
 
-    def test_a_trusted_settings_env_says_the_added_miners_mine(self) -> None:
-        # McpAccessMode::parse trims and ignores case.
-        for mode in ("trusted", " Trusted ", "TRUSTED"):
-            with self.subTest(mode=mode):
-                self.assertEqual(
-                    self.mining_line_after_install({"env": {"IRONMEM_MCP_MODE": mode}}),
-                    "    Stop PreCompact get a trusted IRONMEM_MCP_MODE from env in <path>, so they mine "
-                    "(see `ironmem doctor`).",
-                )
-
-    def test_without_a_settings_env_mode_the_line_names_the_launch_environment(self) -> None:
-        # The installer cannot see the environment Claude Code is launched
-        # with, which reaches the hooks when settings.json's env sets no mode.
-        unset = "    Stop PreCompact run read-only and skip mining (prompt recall still works) unless the environment Claude Code is launched with sets IRONMEM_MCP_MODE; trusted there makes them mine (see `ironmem doctor`)."
-        for settings in (
-            {},
-            {"env": {"OTHER": "trusted"}},
-            {"env": {"IRONMEM_MCP_MODE": True}},
-            {"env": "IRONMEM_MCP_MODE=trusted"},
-        ):
-            with self.subTest(settings=settings):
-                self.assertEqual(self.mining_line_after_install(settings), unset)
-
-    def test_a_settings_env_mode_that_does_not_write_says_they_do_not_mine(self) -> None:
-        # settings.json's env beats the launch environment, so this is known.
-        other = (
-            "    Stop PreCompact do not mine: env in <path> sets IRONMEM_MCP_MODE to a value "
-            "other than trusted (see `ironmem doctor`)."
-        )
-        for mode in ("read-only", "restricted", "trusted-ish", ""):
-            with self.subTest(mode=mode):
-                self.assertEqual(self.mining_line_after_install({"env": {"IRONMEM_MCP_MODE": mode}}), other)
+    def test_shared_env_rows_say_whether_the_added_miners_mine(self) -> None:
+        # The shared fixture's env_rows, which doctor's unit tests read too.
+        # settings.json's env beats the launch environment, so a string mode
+        # there is known; with none, the launch environment decides, which
+        # the installer cannot see.
+        lines = {
+            "writes": "    Stop PreCompact get a trusted IRONMEM_MCP_MODE from env in <path>, so they mine "
+            "(see `ironmem doctor`).",
+            "does_not_write": "    Stop PreCompact do not mine: env in <path> sets IRONMEM_MCP_MODE to a value "
+            "other than trusted (see `ironmem doctor`).",
+            "unset": "    Stop PreCompact run read-only and skip mining (prompt recall still works) unless the "
+            "environment Claude Code is launched with sets IRONMEM_MCP_MODE; trusted there makes them mine "
+            "(see `ironmem doctor`).",
+        }
+        rows = json.loads(HOOK_STOP_FIXTURES.read_text(encoding="utf-8"))["env_rows"]
+        self.assertGreaterEqual(len(rows), 10)
+        for row in rows:
+            settings = {"env": row["env"]} if "env" in row else {}
+            with self.subTest(note=row["note"], settings=settings):
+                self.assertEqual(self.mining_line_after_install(settings), lines[row["mines"]])
 
     def settings_with_stop(self, home: pathlib.Path, stop: object) -> pathlib.Path:
         path = home / ".claude" / "settings.json"
@@ -2090,22 +2078,26 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertIn("SessionStart", result.stdout)
             self.assertNotIn("skip mining", result.stdout)
 
-    def test_a_plugin_root_command_in_settings_does_not_count_as_wired(self) -> None:
+    def plugin_root_warning(self, settings: pathlib.Path, event: str) -> str:
+        return (
+            f"    WARN: {event} in {settings} already has an ironmem hook entry that runs through "
+            "${CLAUDE_PLUGIN_ROOT}, which Claude Code sets only for plugin hooks, so that entry does not run "
+            f"outside the plugin. This install added its own {event} hook beside it; you can delete the old entry.\n"
+        )
+
+    def test_a_plugin_root_command_in_settings_is_added_beside_with_a_warn(self) -> None:
         # Measured on Claude Code 2.1.329: a settings.json hook (no plugin)
-        # runs with CLAUDE_PLUGIN_ROOT unset, so these find no script.
-        for entry in (
-            {"command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh stop"},
-            {"command": 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh" stop'},
-            {"command": "$CLAUDE_PLUGIN_ROOT/hooks/ironmem-hook.sh stop"},
-            {"command": "${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh hook stop"},
-            {"command": "bash -c '${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh hook stop'"},
-            {"command": "bash", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh", "stop"]},
-            {"command": "${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh", "args": ["hook", "stop"]},
-        ):
+        # runs with CLAUDE_PLUGIN_ROOT unset, so these find no script. The
+        # rows are the shared fixture's, which doctor reads as not running.
+        rows = json.loads(HOOK_STOP_FIXTURES.read_text(encoding="utf-8"))["rows"]
+        root_rows = [row for row in rows if not row["wired"] and "CLAUDE_PLUGIN_ROOT" in json.dumps(row)]
+        self.assertGreaterEqual(len(root_rows), 6)
+        for row in root_rows:
+            entry = {key: value for key, value in row.items() if key not in ("wired", "note")}
             with self.subTest(entry=entry), tempfile.TemporaryDirectory() as directory:
                 home = pathlib.Path(directory)
                 group = {"hooks": [{"type": "command", **entry}]}
-                self.settings_with_stop(home, [group])
+                path = self.settings_with_stop(home, [group])
 
                 result = self.run_installer(home, home / ".claude.json")
 
@@ -2113,7 +2105,56 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 self.assertEqual(stop[0], group)
                 self.assertEqual(len(stop), 2, stop)
                 self.assertIn("hook stop --harness claude-code", json.dumps(stop[1]))
-                self.assertIn("Stop", result.stdout.split("Wired Claude hooks", 1)[1].splitlines()[0])
+                self.assertIn(self.plugin_root_warning(path, "Stop"), result.stderr)
+                # Only the event and the variable are named, never the entry.
+                self.assertNotIn(entry["command"], result.stderr)
+                self.assertEqual(result.stderr.count("CLAUDE_PLUGIN_ROOT"), 1, result.stderr)
+
+    def test_no_plugin_root_warn_for_another_script_or_a_wired_event(self) -> None:
+        for stop in (
+            [{"hooks": [{"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/other.sh stop"}]}],
+            [{"hooks": [{"type": "command", "command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh stop"},
+                        {"type": "command", "command": "bash /p/hooks/ironmem-hook.sh stop"}]}],
+        ):
+            with self.subTest(stop=stop), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                self.settings_with_stop(home, stop)
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                self.assertNotIn("CLAUDE_PLUGIN_ROOT", result.stderr)
+
+    def test_a_plugin_root_warn_per_event(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            path.parent.mkdir(parents=True)
+            hooks = {
+                event: [{"hooks": [{"type": "command", "command": f"bash ${{CLAUDE_PLUGIN_ROOT}}/hooks/ironmem-hook.sh {name}"}]}]
+                for event, name in self.plugin_hook_names().items()
+            }
+            path.write_text(json.dumps({"hooks": hooks}), encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            for event in self.plugin_hook_names():
+                self.assertIn(self.plugin_root_warning(path, event), result.stderr)
+            self.assertIn("Wired Claude hooks", result.stdout)
+
+    def test_a_jq_error_in_the_plugin_root_check_warns_and_still_adds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            env = self.jq_stub(home, "--arg ev Stop --arg name stop |select(plugin_root_copy($name))")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertIn(
+                f"WARN: jq failed checking the Stop hooks in {path} for a ${{CLAUDE_PLUGIN_ROOT}} command; adding the hook anyway.",
+                result.stderr,
+            )
+            self.assertIn("          jq said: stub jq failure\n", result.stderr)
+            self.assertEqual(len(self.ironmem_hook_commands(self.claude_settings(home), "Stop")), 1)
 
     @staticmethod
     def path_without_jq(bin_dir: pathlib.Path) -> str:
