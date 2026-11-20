@@ -1,6 +1,6 @@
 # cargo-audit ignore list.
 #
-# These are transitive advisories that remain after updating the lockfile.
+# These are advisories that remain after updating the lockfile.
 # Each entry documents the actual reason we accept the risk today and what
 # condition should trigger removal from this list.
 
@@ -23,11 +23,8 @@ ignore = [
     # with this list, and benchmarks/provbench/{scoring,baseline,phase1} have
     # the same proc-macro under simba (statrs -> nalgebra -> simba).
     "RUSTSEC-2024-0436",
-    # RUSTSEC-2026-0381 — webpki-roots 0.26.11 is a wrapper pinned by
-    # ureq 2.12.1 (`^0.26`, no newer 0.26 exists). The wrapper only
-    # re-exports webpki-roots 1.x, which the lockfile now pins at 1.0.10
-    # (the patched version removing the emSign root), so the roots
-    # actually compiled in are fixed; audit still flags the wrapper's
-    # own version string. Remove when ureq/hf-hub drop the 0.26 pin.
-    "RUSTSEC-2026-0381",
+    # RUSTSEC-2026-0543 — chrono is unmaintained (not a vulnerability).
+    # Direct dependency in crates/ironmem and benchmarks/abeval. Remove in the
+    # PR that migrates off chrono to jiff or time (#440).
+    "RUSTSEC-2026-0543",
 ]
