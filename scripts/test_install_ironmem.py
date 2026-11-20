@@ -1421,6 +1421,31 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 self.assertNotIn("WARN", result.stderr)
                 self.assertIn("already wired, left as they are: Stop PreCompact", result.stdout)
 
+    def test_every_run_of_a_double_quoted_c_string_is_read_for_its_program(self) -> None:
+        # The first run too: when it names this install's program there is no
+        # WARN about the run after it, and when it names another one the WARN
+        # lists both.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            target = home / ".ironrace" / "bin" / "ironmem"
+            stop = f'bash -c "{target} hook stop; /old/ironmem hook stop"'
+            self.settings_with_stop(home, [{"hooks": [{"type": "command", "command": stop}]}])
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertNotIn("the program it names by path is not", result.stderr)
+            self.assertIn("Claude hooks already wired, left as they are: Stop", result.stdout)
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            stop = 'bash -c "/older/ironmem hook stop; /old/ironmem hook stop"'
+            self.settings_with_stop(home, [{"hooks": [{"type": "command", "command": stop}]}])
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertIn("the program it names by path is not", result.stderr)
+            for program in ("/older/ironmem", "/old/ironmem"):
+                self.assertIn(f"            {program}\n", result.stderr)
+
     def test_an_exec_form_tilde_program_gets_a_warning_even_for_this_install(self) -> None:
         # Doctor reads an exec-form ~/ program as not expanded, so the hook
         # does not run, even when ~/ would expand to this install's program.

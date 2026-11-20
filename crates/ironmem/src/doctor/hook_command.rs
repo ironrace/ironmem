@@ -309,9 +309,8 @@ struct Word {
     /// shell-form word that is a `$` outside single quotes with no backslash
     /// before it, any `$` in a `$( .. )` or backtick body (the body is not
     /// read), and a `$` that a shell which read the string earlier had
-    /// already expanded: one from a double-quoted part of the word that
-    /// held this `-c` string. No shell reads an exec-form element, so it has
-    /// none.
+    /// already expanded: one that shell expanded in the word that held this
+    /// `-c` string. No shell reads an exec-form element, so it has none.
     expanded: Vec<usize>,
 }
 

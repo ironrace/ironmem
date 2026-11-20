@@ -698,6 +698,21 @@
       "command": "bash -c \"true; \\\\\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop\"",
       "wired": false,
       "note": "three backslashes before the $ in the second command of a double-quoted bash -c string: not expanded"
+    },
+    {
+      "command": "bash -c \"\\${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "a default of one escaped quote pair in a double-quoted bash -c string: the outer shell leaves \"\" for the inner one, so the default is empty"
+    },
+    {
+      "command": "bash -c \"true; ${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "the same default in the second command of the string, with no backslash before the $: the outer shell expands it to \"\" and the inner one reads that as empty"
+    },
+    {
+      "command": "bash -c \"'${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem' hook stop\"",
+      "wired": true,
+      "note": "the same default in single quotes inside the string: the inner shell keeps the two quote characters, so it is not empty"
     }
   ],
   "env_rows": [

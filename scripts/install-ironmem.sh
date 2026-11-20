@@ -900,14 +900,23 @@ _wire_claude_hooks_warn() {
 # its own. So there a use is not expanded when it is `\$` in single quotes
 # (any odd number of backslashes) or `\\\$` outside them (three, seven, ...),
 # and does not match, default or not; every other use is expanded and only
-# its default decides (`""` and `''` both empty). Not told apart: a default
-# that is empty for another reason (${CLAUDE_PLUGIN_ROOT:-$UNSET} matches),
-# and a -c string nested in a double-quoted -c string, which is read as the
-# outer string is. No shell reads
-# an exec-form element, so there every use is refused (plugin_root); what
-# Claude Code does with a default in one was not measured. unroot puts a path
-# where each use was, to ask whether the entry would run the hook but for the
-# variable.
+# its default decides. `""` and `''` are both empty there, and so is `\"\"`
+# outside single quotes, which reaches the inner shell as `""`; in single
+# quotes the inner shell keeps those two characters, so that default is not
+# empty. The commands of such a string are judged only this way: the pass
+# with $dq false reads the command with the `;` `&` `|` `(` `)` and line
+# breaks taken out of every string the $dq pass reads (dq_c_strings_unsplit),
+# so it starts no command inside one. re_dq_later takes the nearest command
+# first, so shell_programs gets the first run of such a string from the $dq
+# pass and the runs after it from the other one. Not told apart: a default
+# that is empty for another reason (${CLAUDE_PLUGIN_ROOT:-$UNSET} matches), a
+# `''` default in a double-quoted use inside a single-quoted -c string (read
+# as two characters, though the outer shell drops them), and a -c string
+# nested in a double-quoted -c string, which is read as the outer string is.
+# No shell reads an exec-form element, so there every use is refused
+# (plugin_root); what Claude Code does with a default in one was not
+# measured. unroot puts a path where each use was, to ask whether the entry
+# would run the hook but for the variable.
 _CLAUDE_HOOK_JQ_DEFS='
 def base: sub("^.*/"; "");
 def is_one_of(words): . as $w | any(words; . == $w);
@@ -933,7 +942,7 @@ def re_shell:
   + "(?:\\s+(?:[-+][oO]\\s+" + re_word + "|\\+" + re_seg + "*|--" + re_seg + "*|-[^\\sc\"\u0027;&|()<>]*))*";
 def re_bash_c($q): re_shell + "\\s+-(?!-)[^\\s\"\u0027;&|()<>]*c[^\\s\"\u0027;&|()<>]*\\s+" + $q + "\\s*";
 def re_c_strings($q): "(?:" + re_bash_c($q) + re_head + ")*";
-def re_dq_later: "(?:(?:[^\"\\\\]|\\\\.)*(?:[;&|)\\n]|(?<!\\$)\\()\\s*)?";
+def re_dq_later: "(?:(?:[^\"\\\\]|\\\\.)*?(?:[;&|)\\n]|(?<!\\$)\\()\\s*)??";
 def re_lead($dq):
   re_start + re_head
   + (if $dq then
@@ -946,7 +955,8 @@ def re_in_dq: "\"(?:[^\"\\\\]|\\\\.)*";
 def re_plugin_root($dq):
   re_seg + "*(?:"
   + (if $dq then
-       "(?:" + re_in_dq + "|\u0027[^\u0027]*)?\\\\?" + re_root_empty("\"\"|\u0027\u0027")
+       "(?:" + re_in_dq + ")?\\\\?" + re_root_empty("\"\"|\u0027\u0027|\\\\\"\\\\\"")
+       + "|\u0027[^\u0027]*" + re_root_empty("\"\"|\u0027\u0027")
        + "|(?<!\\\\)(?:\\\\{4})*\\\\{3}" + re_root
        + "|\u0027[^\u0027]*(?<!\\\\)(?:\\\\{2})*\\\\" + re_root
      else
@@ -967,7 +977,10 @@ def shell_runs($name; $dq):
   test(re_lead($dq) + re_program("ironmem(?:-mcp\\.sh)?"; $dq) + re_hook($name))
   or test(re_lead($dq) + "(?:" + re_shell + "\\s+)?" + re_program("ironmem-hook\\.sh"; $dq) + re_name($name))
   or test(re_lead($dq) + re_shell + "\\s+" + re_program("ironmem-mcp\\.sh"; $dq) + re_hook($name));
-def shell_runs($name): shell_runs($name; false) or shell_runs($name; true);
+def dq_c_strings_unsplit:
+  gsub("(?<lead>" + re_start + re_head + re_c_strings("[\"\u0027]") + re_bash_c("\"") + ")(?<body>(?:[^\"\\\\]|\\\\.)*)";
+       .lead + ((.body // "") | [scan("[^;&|()\\n]+")] | join(" ")));
+def shell_runs($name): (dq_c_strings_unsplit | shell_runs($name; false)) or shell_runs($name; true);
 def env_args:
   if length == 0 then .
   elif (.[0] | is_one_of("-u", "--unset", "-C", "--chdir")) then .[2:] | env_args
