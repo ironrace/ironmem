@@ -527,3 +527,56 @@ fn exec_form_hooks_are_read_as_an_argument_vector_end_to_end() {
         "{stdout}"
     );
 }
+
+#[test]
+fn doctor_passes_its_own_mcp_mode_to_the_hook_checks() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    init_db(&home, &db_path);
+    let hooks = bare_hooks(&fake_program(temp.path()));
+    write_claude_settings(&home, hooks_doc(&refs(&hooks)));
+
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env("IRONMEM_MCP_MODE", "trusted")
+        .output()
+        .unwrap();
+
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains(
+            "Stop: trusted (inherited from this shell; Claude Code must be launched with it) \
+             -> mined"
+        ),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn an_unusable_database_skips_the_mined_row_check() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(&db_path, b"not a database").unwrap();
+
+    let out = doctor_command(&home, &db_path)
+        .env("IRONMEM_EMBED_MODE", "noop")
+        .env_remove("IRONMEM_MCP_MODE")
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "an unusable database blocks: {out:?}"
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(stdout.contains("[FAIL] database"), "{stdout}");
+    assert!(
+        stdout.contains("mined-row age: skipped (no usable database)"),
+        "{stdout}"
+    );
+}
