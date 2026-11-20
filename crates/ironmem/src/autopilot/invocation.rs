@@ -2905,7 +2905,7 @@ pub(crate) mod contract_tests {
     /// a probe that has ended. Exits 97 if none recorded it, or 96 if the
     /// identity file is there and cannot be read (while it waits, a failed
     /// read only means "not yet"). A test that supervises the stub gives
-    /// its run a ceiling (3 to 20 s) shorter than the probe's 120 s, so
+    /// its run a ceiling (3 to 60 s) shorter than the probe's 120 s, so
     /// there the ceiling ends a run no sample recorded, and 97 and 96 are
     /// seen only where the probe is shortened.
     pub(crate) fn await_first_sample() -> &'static str {
@@ -3285,7 +3285,8 @@ exit {code}"#
             &binary(dir.path(), &script(&observable(extra), 0)),
             dir.path(),
             &s,
-            Duration::from_secs(5),
+            // Only a deadlock should reach this, not a slow runner.
+            Duration::from_secs(60),
         )
         .unwrap();
         assert!(o.is_met(), "{o:?}");
@@ -3304,19 +3305,41 @@ exit {code}"#
             // Build a synthetic credential at runtime so secret scanners do
             // not mistake the redaction fixture for a checked-in credential.
             let fixture_token = format!("sk-{}", "abcdefghijklmnopqrstuvwxyz1234567890");
-            let extra=format!("printf '%s' 'OPENAI_API_KEY={fixture_token}' >&2\nhead -c {bytes} /dev/zero > '{target}'\nsleep 10");
+            // The stub outlives the timeout, so only the limit ends the run
+            // early. Both are far longer than a limit kill takes (under a
+            // second on a quiet machine): a loaded CI runner once spent over
+            // four seconds on one, which a five-second timeout could not
+            // tell from a kill that never came.
+            let timeout = Duration::from_secs(60);
+            // A stub that exited by itself before the timeout would pass
+            // the `timed_out` check below without any limit kill.
+            let outlive = timeout.as_secs() * 2;
+            let extra=format!("printf '%s' 'OPENAI_API_KEY={fixture_token}' >&2\nhead -c {bytes} /dev/zero > '{target}'\nsleep {outlive}");
             let start = std::time::Instant::now();
             let o = run_supervised_bounded(
                 &binary(dir.path(), &script(&extra, 0)),
                 dir.path(),
                 &s,
-                Duration::from_secs(5),
+                timeout,
             )
             .unwrap();
-            assert!(start.elapsed() < Duration::from_secs(4), "{field}");
+            let elapsed = start.elapsed();
+            // A run the timeout ended also reports the limit, from the check
+            // after the root is reaped, so "limit" in the reason does not
+            // say which of the two ended it. This rules the timeout out.
+            assert!(!o.timed_out, "{field}: the timeout ended the run");
+            // `elapsed` also covers writing the stub; `duration_ms` is the
+            // supervisor's own spawn-to-record time, to tell the two apart.
+            assert!(
+                elapsed < timeout / 2,
+                "{field} took {elapsed:?} ({}ms supervised)",
+                o.duration_ms
+            );
             assert!(!o.is_met());
             let reason = o.reason.unwrap();
             assert!(reason.contains("limit"), "{reason}");
+            // Killed, rather than a stub that exited by itself.
+            assert!(reason.contains("exited with None"), "{reason}");
             assert!(reason.chars().count() <= 500);
             assert!(!reason.contains(&fixture_token));
         }
