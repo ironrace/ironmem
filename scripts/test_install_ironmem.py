@@ -314,6 +314,129 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             self.assertFalse((home / ".config" / "muse" / "settings.json").exists())
 
+    def read_agy_server(self, config: pathlib.Path) -> dict[str, object]:
+        payload = json.loads(config.read_text(encoding="utf-8"))
+        return payload["mcpServers"]["ironmem"]
+
+    def test_fresh_agy_registration_uses_trusted_mode_and_ignores_xdg(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            xdg = home / "xdg-elsewhere"
+            agy_config = home / ".gemini" / "config" / "mcp_config.json"
+
+            self.run_installer(
+                home, home / ".claude.json", extra_env={"XDG_CONFIG_HOME": str(xdg)}
+            )
+
+            self.assertTrue(agy_config.is_file())
+            server = self.read_agy_server(agy_config)
+            self.assertEqual(server.get("command"), str(home / ".ironrace" / "bin" / "ironmem"))
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+            self.assertEqual(len(server.get("args", [])), 3)
+            self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
+            self.assertNotIn("mode", server)
+
+    def test_existing_agy_bare_serve_is_upgraded_preserving_siblings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config = home / ".gemini" / "config" / "mcp_config.json"
+            agy_config.parent.mkdir(parents=True, exist_ok=True)
+            agy_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "other": {"command": "/bin/other", "args": ["run"]},
+                            "ironmem": {
+                                "command": str(home / ".ironrace" / "bin" / "ironmem"),
+                                "args": ["serve"],
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.run_installer(home, home / ".claude.json")
+
+            payload = json.loads(agy_config.read_text(encoding="utf-8"))
+            self.assertEqual(payload["mcpServers"]["other"]["command"], "/bin/other")
+            server = payload["mcpServers"]["ironmem"]
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+            self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
+
+    def test_explicit_agy_mode_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config = home / ".gemini" / "config" / "mcp_config.json"
+            agy_config.parent.mkdir(parents=True, exist_ok=True)
+            agy_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ironmem": {
+                                "command": str(home / ".ironrace" / "bin" / "ironmem"),
+                                "args": ["serve"],
+                                "env": {"IRONMEM_MCP_MODE": "read-only"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.run_installer(home, home / ".claude.json")
+
+            server = self.read_agy_server(agy_config)
+            self.assertEqual(server["env"]["IRONMEM_MCP_MODE"], "read-only")
+            self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
+
+    def test_skip_wiring_leaves_agy_untouched(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+
+            self.run_installer(home, home / ".claude.json", skip_wiring=True)
+
+            self.assertFalse((home / ".gemini" / "config" / "mcp_config.json").exists())
+            self.assertFalse((home / ".gemini" / "config" / "hooks.json").exists())
+
+    def test_fresh_agy_hooks_registration_and_idempotency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            hooks_path = home / ".gemini" / "config" / "hooks.json"
+            hooks_path.parent.mkdir(parents=True, exist_ok=True)
+            # Pre-existing sibling hook must survive untouched.
+            hooks_path.write_text(
+                json.dumps(
+                    {
+                        "lint-checker": {
+                            "Stop": [{"type": "command", "command": "./lint.sh"}]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.run_installer(home, home / ".claude.json")
+
+            payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+            self.assertIn("lint-checker", payload)
+            ironmem = payload["ironmem"]
+            target = str(home / ".ironrace" / "bin" / "ironmem")
+            for event, subcmd in (
+                ("SessionStart", "session-start"),
+                ("PreInvocation", "user-prompt-submit"),
+                ("Stop", "stop"),
+            ):
+                cmd = ironmem[event][0]["command"]
+                self.assertIn(target, cmd)
+                self.assertIn(f"hook {subcmd} --harness agy", cmd)
+                self.assertIn("IRONMEM_MCP_MODE=trusted", cmd)
+
+            # Second run is idempotent and reports already registered.
+            second = self.run_installer(home, home / ".claude.json")
+            self.assertIn("already registered for Antigravity", second.stdout)
+            self.assertEqual(json.loads(hooks_path.read_text(encoding="utf-8")), payload)
+
     def test_full_install_moves_bases_outside_discovery_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)

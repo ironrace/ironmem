@@ -1,0 +1,22 @@
+{
+  "ironmem": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "bash ./hooks/ironmem-hook.sh session-start"
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "bash ./hooks/ironmem-hook.sh user-prompt-submit"
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "bash ./hooks/ironmem-hook.sh stop"
+      }
+    ]
+  }
+}

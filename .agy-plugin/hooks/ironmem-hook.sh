@@ -9,4 +9,4 @@ INPUT_FILE="$(mktemp)"
 trap 'rm -f "$INPUT_FILE"' EXIT
 cat > "$INPUT_FILE"
 
-cat "$INPUT_FILE" | "$PLUGIN_ROOT/bin/ironmem-mcp.sh" hook "$HOOK_NAME" --harness gemini
+cat "$INPUT_FILE" | "$PLUGIN_ROOT/bin/ironmem-mcp.sh" hook "$HOOK_NAME" --harness agy

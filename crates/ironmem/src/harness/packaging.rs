@@ -97,8 +97,7 @@ mod tests {
 
     /// Synthetic-failure: adding an unpackaged harness (one with no matching
     /// `.<id>-plugin/` root) must produce a non-empty Err list naming it.
-    /// Uses a placeholder id rather than "gemini" — gemini is now a REAL
-    /// registered harness with real (if minimal) packaging (#190 Task 11).
+    /// Uses a placeholder id that is guaranteed absent from the repo root.
     #[test]
     fn packaging_coverage_fails_for_unpackaged_synthetic_harness() {
         const UNPACKAGED_SPEC: HarnessSpec = HarnessSpec {

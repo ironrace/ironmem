@@ -30,10 +30,10 @@ Codex is one registered harness in the `REGISTRY` constant
   `codex-final` row per session, cached tokens subtracted from input).
 
 Run `ironmem harnesses --format=json` to inspect the current registry at any
-time. The registry also carries `grok`, `gemini`, and `muse` rows
-(`GROK.md`/`GEMINI.md`/`MUSE.md` via `@AGENTS.md` import,
-`write_rules_default: false`) — scaffolding for the `ironmem grok`/`ironmem
-gemini`/`ironmem muse` launchers, not yet default `write-rules` targets. See
+time. The registry also carries `grok`, `agy` (Antigravity), and `muse` rows
+(`GROK.md`/`MUSE.md` via `@AGENTS.md` import, `AGENTS.md` native for `agy`;
+all `write_rules_default: false`) — backing the `ironmem grok`/`ironmem
+agy`/`ironmem muse` launchers, not yet default `write-rules` targets. See
 [First run: one-command launchers](../README.md#first-run-one-command-launchers)
 in the main README.
 
@@ -124,7 +124,7 @@ The hooks are diff-aware:
   escalating a workflow edit would run cargo gates that cannot parse YAML.
   CI is its own backstop
 - a path under a harness plugin root (`.claude-plugin/`, `.codex-plugin/`,
-  `.gemini-plugin/`, `.grok-plugin/`, or any future `.<name>-plugin/`) is
+  `.agy-plugin/`, `.grok-plugin/`, `.muse-plugin/`, or any future `.<name>-plugin/`) is
   NOT inert, even though its content is JSON/shell/Markdown: `cargo test
   --workspace` reads `plugin.json`/`hooks.json`/`.mcp.json` and asserts
   `plugin.json`'s version matches `Cargo.toml` (`plugin_metadata.rs`),
@@ -244,7 +244,7 @@ shape) and returns one of:
 `is_gate_covered_plugin_path` (checked first inside both `is_docs_path` and
 `is_inert_config_path`) matches any path whose leading `/`-split segment has
 the shape `.<name>-plugin` — `.claude-plugin`, `.codex-plugin`,
-`.gemini-plugin`, `.grok-plugin`, and any future one. Every one of those
+`.agy-plugin`, `.grok-plugin`, `.muse-plugin`, and any future one. Every one of those
 directories' JSON, shell assets, and agent Markdown is read by `cargo test
 --workspace` (`plugin_metadata.rs`'s `read_json`/
 `plugin_versions_match_cargo_toml`/`claude_review_agents_advertise_lean_

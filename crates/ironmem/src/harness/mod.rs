@@ -201,20 +201,20 @@ pub const REGISTRY: &[HarnessSpec] = &[
         transcript_parser: TranscriptParserKind::None,
     },
     HarnessSpec {
-        id: "gemini",
-        display_name: "Gemini CLI",
-        binary: "gemini",
-        rules_file: "GEMINI.md",
-        rules_strategy: RulesStrategy::Import {
-            directive: "@AGENTS.md",
-        },
-        // Scaffolding only (#190 Task 11): not yet a default write-rules
-        // target, and its `.gemini-plugin/` packaging is a minimal stand-in —
-        // real Gemini CLI integration lands separately.
+        id: "agy",
+        display_name: "Antigravity",
+        binary: "agy",
+        rules_file: "AGENTS.md",
+        rules_strategy: RulesStrategy::Native,
+        // Not yet a default write-rules target. Antigravity natively reads
+        // AGENTS.md (and GEMINI.md), matching Codex's Native strategy; its
+        // global MCP config path (~/.gemini/config/mcp_config.json) and
+        // interactive prompt flag (`-i <prompt>`) are verified live against
+        // `agy`.
         write_rules_default: false,
-        client_info_aliases: &["gemini"],
-        env_aliases: &["gemini"],
-        additional_context_support: false,
+        client_info_aliases: &["antigravity", "agy"],
+        env_aliases: &["agy", "antigravity"],
+        additional_context_support: true,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
     },
@@ -839,16 +839,12 @@ mod tests {
         let val: serde_json::Value =
             serde_json::from_str(&json).expect("output must be valid JSON");
         let arr = val.as_array().expect("top-level must be an array");
-        assert_eq!(
-            arr.len(),
-            5,
-            "claude, codex, grok, gemini (#190 Task 11), muse"
-        );
+        assert_eq!(arr.len(), 5, "claude, codex, grok, agy, muse");
         let ids: Vec<&str> = arr.iter().filter_map(|e| e["id"].as_str()).collect();
         assert!(ids.contains(&"claude"), "must contain claude entry");
         assert!(ids.contains(&"codex"), "must contain codex entry");
         assert!(ids.contains(&"grok"), "must contain grok entry");
-        assert!(ids.contains(&"gemini"), "must contain gemini entry");
+        assert!(ids.contains(&"agy"), "must contain agy entry");
         assert!(ids.contains(&"muse"), "must contain muse entry");
     }
 
@@ -1139,32 +1135,38 @@ mod tests {
     }
 
     #[test]
-    fn registry_contains_gemini_spec() {
-        let spec = by_id("gemini", REGISTRY).expect("gemini must be in REGISTRY");
-        assert_eq!(spec.display_name, "Gemini CLI");
-        assert_eq!(spec.binary, "gemini");
-        assert_eq!(spec.rules_file, "GEMINI.md");
-        assert_eq!(
-            spec.rules_strategy,
-            RulesStrategy::Import {
-                directive: "@AGENTS.md"
-            }
-        );
+    fn registry_contains_agy_spec() {
+        let spec = by_id("agy", REGISTRY).expect("agy must be in REGISTRY");
+        assert_eq!(spec.display_name, "Antigravity");
+        assert_eq!(spec.binary, "agy");
+        assert_eq!(spec.rules_file, "AGENTS.md");
+        assert_eq!(spec.rules_strategy, RulesStrategy::Native);
         assert!(
             !spec.write_rules_default,
-            "gemini is scaffolding-only, not yet a default write-rules target"
+            "agy is not yet a default write-rules target"
         );
-        assert_eq!(spec.client_info_aliases, &["gemini"]);
-        assert_eq!(spec.env_aliases, &["gemini"]);
+        assert_eq!(spec.client_info_aliases, &["antigravity", "agy"]);
+        assert_eq!(spec.env_aliases, &["agy", "antigravity"]);
+        assert!(
+            spec.additional_context_support,
+            "agy supports context injection via SessionStart/PreInvocation injectSteps"
+        );
+        assert_eq!(
+            classify_client_info("antigravity-cli", REGISTRY),
+            Some("agy")
+        );
+        assert_eq!(classify_client_info("agy", REGISTRY), Some("agy"));
+        assert_eq!(canonicalize_input("agy", REGISTRY), Some("agy"));
+        assert_eq!(canonicalize_input("antigravity", REGISTRY), Some("agy"));
     }
 
     #[test]
-    fn grok_and_gemini_ids_are_valid_harness_slugs() {
+    fn grok_and_agy_ids_are_valid_harness_slugs() {
         // Guards against a typo'd/uppercase id shipping undetected, same as
         // `every_registry_id_is_a_valid_harness_slug` above but scoped to
-        // just the two new rows for a focused failure message.
+        // focused rows for a clear failure message.
         assert!(HarnessId::validate("grok").is_ok());
-        assert!(HarnessId::validate("gemini").is_ok());
+        assert!(HarnessId::validate("agy").is_ok());
     }
 
     fn test_config_for_proxy_helper(state_dir: &std::path::Path) -> crate::config::Config {
@@ -1218,7 +1220,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_config_for_proxy_helper(dir.path());
 
-        let args = proxy_command_args("gemini", &cfg);
+        let args = proxy_command_args("agy", &cfg);
         let socket_arg = args.last().expect("args must end with the socket path");
         assert_eq!(socket_arg, &cfg.daemon_socket_path().display().to_string());
         assert!(

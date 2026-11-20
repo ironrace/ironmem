@@ -25,9 +25,9 @@ pub(crate) use binary::{cached_launcher, find_launcher};
 /// Each variant's behavior (`spec`/`binary`/`label`) is entirely
 /// registry-driven (#190 Task 13): `harness_id` is the only per-variant
 /// mapping, and everything else comes from `crate::harness::REGISTRY` via
-/// `spec()`. `Grok`/`Gemini` onboard the same way Claude/Codex already did —
-/// one registry row (added in Task 11) plus one `harness_id` mapping here.
-/// The enum itself (and clap's `Commands::Grok`/`Commands::Gemini` in
+/// `spec()`. `Grok`/`Agy`/`Muse` onboard the same way Claude/Codex already did
+/// — one registry row plus one `harness_id` mapping here.
+/// The enum itself (and clap's `Commands::Grok`/`Commands::Agy` in
 /// `main.rs`) still needs one variant per launchable harness: clap subcommands
 /// are compile-time, so the CLI surface can't be generated from a runtime
 /// registry without a larger redesign (e.g. a single generic `launch
@@ -37,7 +37,7 @@ pub enum Harness {
     Claude,
     Codex,
     Grok,
-    Gemini,
+    Agy,
     Muse,
 }
 
@@ -49,7 +49,7 @@ impl Harness {
             Harness::Claude => "claude",
             Harness::Codex => "codex",
             Harness::Grok => "grok",
-            Harness::Gemini => "gemini",
+            Harness::Agy => "agy",
             Harness::Muse => "muse",
         }
     }
@@ -118,8 +118,8 @@ fn codex_config_path() -> Result<PathBuf, MemoryError> {
 }
 
 /// Resolve the `mcpServers`-JSON settings file for a harness that shares
-/// Claude's object-shaped `mcpServers` (Claude, Gemini CLI, Grok CLI, Muse),
-/// reading the ambient `XDG_CONFIG_HOME`. The pure core is
+/// Claude's object-shaped `mcpServers` (Claude, Antigravity (`agy`), Grok CLI,
+/// Muse), reading the ambient `XDG_CONFIG_HOME`. The pure core is
 /// [`json_mcpservers_config_path_for`], shared with `doctor` so launcher,
 /// doctor and tests all resolve exactly one file per harness.
 fn json_mcpservers_config_path(id: &str) -> Result<PathBuf, MemoryError> {
@@ -136,12 +136,13 @@ fn json_mcpservers_config_path(id: &str) -> Result<PathBuf, MemoryError> {
 /// and tests share one table:
 ///
 /// - `claude` → `~/.claude.json`.
-/// - `gemini` → `~/.gemini/settings.json`, Gemini CLI's documented global
-///   settings file, whose top-level `mcpServers` object has the exact same
-///   shape as Claude's — hence the shared writer.
+/// - `agy` → `~/.gemini/config/mcp_config.json`, Antigravity's global MCP
+///   configuration file (verified live via `agy mcp add` and `agy mcp list`;
+///   ignores `XDG_CONFIG_HOME`), whose top-level `mcpServers` object has the
+///   exact same shape as Claude's — hence the shared writer.
 /// - `grok` → `~/.grok/settings.json`, best-effort. Unlike Claude/Codex/
-///   Gemini there is no single confirmed "the" Grok CLI config convention as
-///   of #190 Task 13 — multiple tools answer to "grok cli" (xAI's own "Grok
+///   Antigravity there is no single confirmed "the" Grok CLI config convention
+///   as of #190 Task 13 — multiple tools answer to "grok cli" (xAI's own "Grok
 ///   Build" agent vs. community projects) and documentation for either's MCP
 ///   client config is thin. `.grok/settings.json` with an `mcpServers` key is
 ///   `superagent-ai/grok-cli`'s documented convention; grok registration is
@@ -164,7 +165,7 @@ pub(crate) fn json_mcpservers_config_path_for(
 ) -> Option<PathBuf> {
     match id {
         "claude" => Some(home?.join(".claude.json")),
-        "gemini" => Some(home?.join(".gemini").join("settings.json")),
+        "agy" => Some(home?.join(".gemini").join("config").join("mcp_config.json")),
         "grok" => Some(home?.join(".grok").join("settings.json")),
         "muse" => {
             if let Some(xdg) = xdg_config_home {
@@ -182,7 +183,7 @@ pub(crate) fn json_mcpservers_config_path_for(
 ///
 /// Registers the shared-daemon proxy command (`harness::proxy_command_args` —
 /// `["serve", "--connect", <socket>]`), the canonical invocation every
-/// harness should converge on (#190 Task 11/12). Claude, Gemini CLI,
+/// harness should converge on (#190 Task 11/12). Claude, Antigravity (`agy`),
 /// (best-effort) Grok CLI, and Muse all share the same `mcpServers`-JSON
 /// config shape — Muse's is proven live to be Claude's id-keyed object, not
 /// the `{id, ...}` array from the binary's embedded plugin-manifest docs —
@@ -203,7 +204,7 @@ fn register(harness: Harness) -> Result<mcp_setup::RegisterOutcome, MemoryError>
         Harness::Codex => {
             mcp_setup::ensure_codex_registered(&codex_config_path()?, &exe, &proxy_args)
         }
-        Harness::Claude | Harness::Gemini | Harness::Grok | Harness::Muse => {
+        Harness::Claude | Harness::Agy | Harness::Grok | Harness::Muse => {
             let id = harness.harness_id();
             mcp_setup::ensure_json_mcpservers_registered(
                 &json_mcpservers_config_path(id)?,
@@ -275,7 +276,7 @@ pub fn run_launcher(
     // failure or when disabled.
     let prompt = context_inject::maybe_inject_context(&canonical, prompt, &opts);
 
-    let args = argv::build_args(prompt.as_deref());
+    let args = argv::build_args_for(harness.harness_id(), prompt.as_deref());
     eprintln!(
         "ironmem: launching {} in {}",
         harness.label(),
@@ -311,7 +312,10 @@ pub(crate) fn launch_invocation(
     spec: &crate::harness::HarnessSpec,
     prompt: Option<&str>,
 ) -> (String, Vec<String>) {
-    (spec.binary.to_string(), argv::build_args(prompt))
+    (
+        spec.binary.to_string(),
+        argv::build_args_for(spec.id, prompt),
+    )
 }
 
 #[cfg(test)]
@@ -327,18 +331,18 @@ mod tests {
         assert_eq!(Harness::Codex.label(), "Codex");
     }
 
-    /// #190 Task 13 acceptance: grok/gemini launchers resolve from the
-    /// registry (added in Task 11) exactly the way Claude/Codex already do —
-    /// one registry row, one `harness_id` mapping, everything else derived.
+    /// Grok and Antigravity (`agy`) launchers resolve from the registry
+    /// exactly the way Claude/Codex already do — one registry row, one
+    /// `harness_id` mapping, everything else derived.
     #[test]
-    fn grok_and_gemini_harness_resolve_from_registry() {
+    fn grok_and_agy_harness_resolve_from_registry() {
         assert_eq!(Harness::Grok.harness_id(), "grok");
         assert_eq!(Harness::Grok.binary(), "grok");
         assert_eq!(Harness::Grok.label(), "Grok");
 
-        assert_eq!(Harness::Gemini.harness_id(), "gemini");
-        assert_eq!(Harness::Gemini.binary(), "gemini");
-        assert_eq!(Harness::Gemini.label(), "Gemini CLI");
+        assert_eq!(Harness::Agy.harness_id(), "agy");
+        assert_eq!(Harness::Agy.binary(), "agy");
+        assert_eq!(Harness::Agy.label(), "Antigravity");
     }
 
     #[test]
@@ -361,17 +365,16 @@ mod tests {
             .expect("grok must be in REGISTRY");
         assert_eq!(grok_spec.id, "grok");
 
-        let gemini_spec =
-            crate::harness::by_id(Harness::Gemini.harness_id(), crate::harness::REGISTRY)
-                .expect("gemini must be in REGISTRY");
-        assert_eq!(gemini_spec.id, "gemini");
+        let agy_spec = crate::harness::by_id(Harness::Agy.harness_id(), crate::harness::REGISTRY)
+            .expect("agy must be in REGISTRY");
+        assert_eq!(agy_spec.id, "agy");
     }
 
     /// Muse launcher resolves from the registry exactly the way Claude/Codex
-    /// (and Grok/Gemini scaffolding) already do — one registry row, one
-    /// `harness_id` mapping, everything else derived. Measured: the `muse`
-    /// binary runs (`muse --help`, 1.0.2) and the product names itself
-    /// "Muse Code" (startup banner + embedded identity string).
+    /// (and Grok/Agy) already do — one registry row, one `harness_id` mapping,
+    /// everything else derived. Measured: the `muse` binary runs
+    /// (`muse --help`, 1.0.2) and the product names itself "Muse Code"
+    /// (startup banner + embedded identity string).
     #[test]
     fn muse_harness_resolves_from_registry() {
         assert_eq!(Harness::Muse.harness_id(), "muse");
@@ -418,8 +421,8 @@ mod tests {
             PathBuf::from("/home/u/.claude.json")
         );
         assert_eq!(
-            json_mcpservers_config_path_for("gemini", home(), xdg()).unwrap(),
-            PathBuf::from("/home/u/.gemini/settings.json")
+            json_mcpservers_config_path_for("agy", home(), xdg()).unwrap(),
+            PathBuf::from("/home/u/.gemini/config/mcp_config.json")
         );
         assert_eq!(
             json_mcpservers_config_path_for("grok", home(), xdg()).unwrap(),
@@ -427,8 +430,24 @@ mod tests {
         );
         // Codex is TOML and unknown ids are not this resolver's business.
         assert_eq!(json_mcpservers_config_path_for("codex", home(), None), None);
+        assert_eq!(
+            json_mcpservers_config_path_for("gemini", home(), None),
+            None
+        );
         assert_eq!(json_mcpservers_config_path_for("zeta", home(), None), None);
         assert_eq!(json_mcpservers_config_path_for("claude", None, None), None);
+    }
+
+    #[test]
+    fn launch_invocation_agy_uses_interactive_flag() {
+        let spec = Harness::Agy.spec();
+        let (bin, args) = launch_invocation(spec, Some("do the thing"));
+        assert_eq!(bin, "agy");
+        assert_eq!(args, vec!["-i".to_string(), "do the thing".to_string()]);
+
+        let (bin, args) = launch_invocation(spec, None);
+        assert_eq!(bin, "agy");
+        assert!(args.is_empty());
     }
 
     const GEMINI_SPEC: HarnessSpec = HarnessSpec {

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "ironmem": {
+      "command": "./bin/ironmem-mcp.sh",
+      "args": [
+        "serve"
+      ]
+    }
+  }
+}

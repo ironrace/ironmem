@@ -82,9 +82,9 @@ fn is_bare_serve_json(entry: &serde_json::Value) -> bool {
 
 /// Ensure `mcpServers.ironmem = { command: <exe>, args: <proxy_args> }` exists
 /// in ANY config file that shares Claude's object-shaped `mcpServers` JSON:
-/// Claude's `~/.claude.json`, Gemini CLI's and (best-effort) Grok CLI's
-/// `settings.json` (#190 Task 13), and Muse's `settings.json` (object shape
-/// proven live on Muse Code 1.0.2). Idempotent; upgrades a stale bare
+/// Claude's `~/.claude.json`, Antigravity's `~/.gemini/config/mcp_config.json`,
+/// (best-effort) Grok CLI's `settings.json`, and Muse's `settings.json` (object
+/// shape proven live on Muse Code 1.0.2). Idempotent; upgrades a stale bare
 /// `["serve"]` entry in place (see module docs).
 ///
 /// `seed` is the document a MISSING file starts from before the entry is
@@ -173,7 +173,7 @@ pub(crate) fn ensure_json_mcpservers_registered(
 /// (read live from `~/.config/muse/settings.json` on Muse Code 1.0.2), so a
 /// file ironmem creates from scratch must carry it too rather than be a bare
 /// `{"mcpServers": ...}` in a schema ironmem knows to be incomplete. Every
-/// other JSON harness (Claude, Gemini CLI, Grok CLI) is unversioned and
+/// other JSON harness (Claude, Antigravity, Grok CLI) is unversioned and
 /// starts from `{}`. Making this the writer's own seed (rather than a
 /// separate pre-write step) means any caller that registers Muse gets the
 /// envelope, and a fresh file is written exactly once.
@@ -200,7 +200,7 @@ pub(crate) fn fresh_file_seed(harness_id: &str) -> serde_json::Value {
 /// depends on a binary path and a daemon socket that can go stale (moved
 /// install, unspawnable daemon) — so ironmem registers itself as
 /// `optional`, matching how the other harnesses behave when the server is
-/// down (Claude, Gemini CLI and Grok CLI have no abort-on-failure mode).
+/// down (Claude, Antigravity and Grok CLI have no abort-on-failure mode).
 /// Every other JSON harness gets no extra keys.
 pub(crate) fn fresh_entry_extras(harness_id: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut extras = serde_json::Map::new();
@@ -617,7 +617,7 @@ mod tests {
             fresh_file_seed("muse"),
             serde_json::json!({ "schema_version": 1 })
         );
-        for id in ["claude", "gemini", "grok", "zeta"] {
+        for id in ["claude", "agy", "grok", "zeta"] {
             assert_eq!(fresh_file_seed(id), serde_json::json!({}), "{id}");
         }
     }
@@ -692,7 +692,7 @@ mod tests {
         let muse = fresh_entry_extras("muse");
         assert_eq!(muse.len(), 1, "{muse:?}");
         assert_eq!(muse.get("mode"), Some(&serde_json::json!("optional")));
-        for id in ["claude", "gemini", "grok", "zeta"] {
+        for id in ["claude", "agy", "grok", "zeta"] {
             assert!(fresh_entry_extras(id).is_empty(), "{id}");
         }
     }

@@ -58,11 +58,11 @@ enum Commands {
         #[arg(long)]
         wing: Option<String>,
     },
-    /// Run a hook (called by Claude Code / Codex)
+    /// Run a hook (called by Claude Code / Codex / Antigravity)
     Hook {
         /// Hook name: stop, precompact, session-start, user-prompt-submit
         name: String,
-        /// Harness: claude-code, codex
+        /// Harness: claude-code, codex, agy
         #[arg(long, default_value = "claude-code")]
         harness: String,
     },
@@ -249,12 +249,12 @@ enum Commands {
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
     },
-    /// Launch Gemini CLI in a repo with the ironmem MCP server attached
-    Gemini {
+    /// Launch Antigravity CLI (agy) in a repo with the ironmem MCP server attached
+    Agy {
         /// Repository path to launch in
         #[arg(default_value = ".")]
         path: String,
-        /// Optional initial prompt for the session
+        /// Optional initial prompt for the session (passed via `agy -i <prompt>`)
         prompt: Option<String>,
         /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
         #[arg(long)]
@@ -1863,7 +1863,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
         Commands::Hook { name, harness } => {
             let cfg = config::Config::load(None)?;
             let response = ironmem::hook::run_hook(&name, &harness, cfg)?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            println!("{}", ironmem::hook::format_hook_output(&response)?);
             Ok(())
         }
         Commands::Report {
@@ -1979,7 +1979,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 budget_tokens: budget,
             },
         ),
-        Commands::Gemini {
+        Commands::Agy {
             path,
             prompt,
             no_mcp_setup,
@@ -1987,7 +1987,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             no_context,
             budget,
         } => launcher::run_launcher(
-            launcher::Harness::Gemini,
+            launcher::Harness::Agy,
             &path,
             prompt,
             launcher::LaunchOptions {

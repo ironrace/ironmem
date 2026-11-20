@@ -386,9 +386,10 @@ fn muse_launcher_registers_mcp_server_by_default() {
     assert_eq!(server["mode"], serde_json::json!("optional"));
 }
 
-/// Same acceptance for the gemini launcher.
+/// Same acceptance for the Antigravity (`agy`) launcher: registers into
+/// `~/.gemini/config/mcp_config.json` (ignoring `XDG_CONFIG_HOME`).
 #[test]
-fn gemini_launcher_registers_mcp_server_by_default() {
+fn agy_launcher_registers_mcp_server_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let db_path = temp.path().join("memory.sqlite3");
@@ -399,17 +400,18 @@ fn gemini_launcher_registers_mcp_server_by_default() {
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
-    write_stub(&bin_dir, "gemini", &record, 0);
+    write_stub(&bin_dir, "agy", &record, 0);
 
     let out = launcher_command(&home, &db_path, &bin_dir)
-        .arg("gemini")
+        .env("XDG_CONFIG_HOME", temp.path().join("ignored-xdg"))
+        .arg("agy")
         .arg(&repo)
         .output()
         .unwrap();
-    assert!(out.status.success(), "gemini launcher failed: {out:?}");
+    assert!(out.status.success(), "agy launcher failed: {out:?}");
     assert!(std::fs::metadata(format!("{}.cwd", record.display())).is_ok());
 
-    let cfg_path = home.join(".gemini").join("settings.json");
+    let cfg_path = home.join(".gemini").join("config").join("mcp_config.json");
     let cfg = std::fs::read_to_string(&cfg_path)
         .unwrap_or_else(|e| panic!("launcher should create {}: {e}", cfg_path.display()));
     let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
@@ -425,6 +427,39 @@ fn gemini_launcher_registers_mcp_server_by_default() {
     assert_eq!(
         server["args"],
         serde_json::json!(["serve", "--connect", expected_socket.display().to_string()])
+    );
+}
+
+#[test]
+fn agy_launcher_passes_prompt_via_interactive_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "agy", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("agy")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--no-context")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "agy launcher failed: {out:?}");
+
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    let lines: Vec<&str> = recorded_args.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["-i", "fix the login bug"],
+        "agy rejects positional prompts and must receive -i <prompt>"
     );
 }
 

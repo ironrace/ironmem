@@ -190,14 +190,15 @@ fn autospawn_check(cfg: &Config) -> Check {
 ///
 /// Detection strategy is dispatched per harness `id`:
 /// - `"codex"` → line-match TOML via `codex_config_path`.
-/// - `"claude"`, `"gemini"`, `"grok"`, `"muse"` → one shared JSON parse
+/// - `"claude"`, `"agy"`, `"grok"`, `"muse"` → one shared JSON parse
 ///   ([`detect_json_mcpservers`]) of the file
 ///   [`crate::launcher::json_mcpservers_config_path_for`] resolves for the
 ///   id — the same table the launcher writes through — matching the
 ///   `mcpServers` OBJECT for an `"ironmem"` entry. Muse's object shape is
 ///   proven live on Muse Code 1.0.2 (`muse exec` completes `initialize` +
 ///   `tools/list` on it, while an array-shaped `mcpServers` is silently
-///   ignored); Gemini's is documented; Grok's is best-effort (see the
+///   ignored); Antigravity's (`~/.gemini/config/mcp_config.json`) is verified
+///   live via `agy mcp add`/`agy mcp list`; Grok's is best-effort (see the
 ///   resolver). ironmem reads and writes only the `mcpServers` key.
 /// - Any other id → an `Info` check noting detection is not yet implemented.
 ///
@@ -227,7 +228,7 @@ fn harness_checks(
                 "claude" => "harness_claude",
                 "codex" => "harness_codex",
                 "grok" => "harness_grok",
-                "gemini" => "harness_gemini",
+                "agy" => "harness_agy",
                 "muse" => "harness_muse",
                 other => Box::leak(format!("harness_{other}").into_boxed_str()),
             };
@@ -252,7 +253,7 @@ fn harness_checks(
                     }
                     None => skipped(),
                 },
-                "claude" | "gemini" | "grok" | "muse" => {
+                "claude" | "agy" | "grok" | "muse" => {
                     let path = crate::launcher::json_mcpservers_config_path_for(
                         spec.id,
                         home.map(Path::to_path_buf),
@@ -262,19 +263,23 @@ fn harness_checks(
                         Some(path) => {
                             let (state, wired) = detect_json_mcpservers(&path);
                             let check = harness_check(key, spec.display_name, &path, state.clone());
-                            // scripts/install-ironmem.sh wires Claude, Codex
-                            // and Muse. Muse therefore has two ways back to a
-                            // registration and the script is the one that also
-                            // refreshes the binary, so it leads. Gemini and Grok
-                            // have no script coverage at all and point at their
-                            // launcher, which is their only route.
+                            // scripts/install-ironmem.sh wires Claude, Codex,
+                            // Muse and Antigravity (`agy`). Muse and agy
+                            // therefore have two ways back to a registration
+                            // and the script is the one that also refreshes
+                            // the binary, so it leads. Grok has no script
+                            // coverage at all and points at its launcher,
+                            // which is its only route.
                             let check = if state == HarnessState::NotRegistered && spec.id != "claude"
                             {
-                                check.with_hint(if spec.id == "muse" {
-                                    "re-run scripts/install-ironmem.sh to register it (`ironmem muse` also registers, but needs the muse binary on PATH and then launches a session)".to_string()
+                                check.with_hint(if matches!(spec.id, "muse" | "agy") {
+                                    format!(
+                                        "re-run scripts/install-ironmem.sh to register it (`ironmem {}` also registers, but needs the {} binary on PATH and then launches a session)",
+                                        spec.id, spec.binary
+                                    )
                                 } else {
                                     format!(
-                                        "run `ironmem {}` to register it (scripts/install-ironmem.sh covers Claude, Codex and Muse)",
+                                        "run `ironmem {}` to register it (scripts/install-ironmem.sh covers Claude, Codex, Muse and Antigravity)",
                                         spec.id
                                     )
                                 })
@@ -535,7 +540,8 @@ fn read_harness_config(path: &Path) -> Result<String, HarnessState> {
 }
 
 /// Resolve registration in a Claude-shaped `mcpServers` JSON config
-/// (`~/.claude.json`, Gemini/Grok `settings.json`, Muse `settings.json`)
+/// (`~/.claude.json`, Antigravity `~/.gemini/config/mcp_config.json`, Grok
+/// `settings.json`, Muse `settings.json`)
 /// with ONE read + parse, returning the state and — when `Registered` —
 /// whether the `ironmem` entry is wired with the shared-daemon proxy command
 /// (`args[1] == "--connect"`; `None` when `args` is absent or not an array).
@@ -999,18 +1005,18 @@ mod tests {
 
     #[test]
     fn json_harnesses_not_registered_hint_points_at_their_launcher() {
-        // scripts/install-ironmem.sh wires Claude, Codex and Muse; the JSON
-        // harnesses it does NOT cover (Gemini, Grok) must send the user to
-        // `ironmem <id>` instead.
+        // scripts/install-ironmem.sh wires Claude, Codex, Muse and Antigravity;
+        // the JSON harness it does NOT cover (Grok) must send the user to
+        // `ironmem grok` instead.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         std::fs::create_dir_all(home.join(".config").join("muse")).unwrap();
-        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::fs::create_dir_all(home.join(".gemini").join("config")).unwrap();
         std::fs::create_dir_all(home.join(".grok")).unwrap();
         for rel in [
             ".claude.json",
             ".config/muse/settings.json",
-            ".gemini/settings.json",
+            ".gemini/config/mcp_config.json",
             ".grok/settings.json",
         ] {
             std::fs::write(home.join(rel), r#"{"mcpServers":{}}"#).unwrap();
@@ -1026,29 +1032,34 @@ mod tests {
                 .unwrap_or_default()
         };
         assert!(hint("harness_claude").contains("install-ironmem.sh"));
-        // Muse is script-covered now, so its hint leads with the script rather
-        // than sending the user to a launcher the script already runs past.
-        let muse = hint("harness_muse");
-        assert!(muse.contains("install-ironmem.sh"), "harness_muse: {muse}");
-        assert!(muse.contains("ironmem muse"), "harness_muse: {muse}");
-        assert!(!muse.contains("covers"), "harness_muse: {muse}");
-        for (name, id) in [("harness_gemini", "gemini"), ("harness_grok", "grok")] {
+        // Muse and Antigravity are script-covered, so their hints lead with the
+        // script rather than sending the user to a launcher the script already
+        // covers.
+        for (name, id) in [("harness_muse", "muse"), ("harness_agy", "agy")] {
             let h = hint(name);
+            assert!(h.contains("install-ironmem.sh"), "{name}: {h}");
             assert!(h.contains(&format!("ironmem {id}")), "{name}: {h}");
-            assert!(h.contains("covers Claude, Codex and Muse"), "{name}: {h}");
+            assert!(!h.contains("covers"), "{name}: {h}");
         }
+        let grok = hint("harness_grok");
+        assert!(grok.contains("ironmem grok"), "harness_grok: {grok}");
+        assert!(
+            grok.contains("covers Claude, Codex, Muse and Antigravity"),
+            "harness_grok: {grok}"
+        );
     }
 
     #[test]
-    fn harness_checks_detect_grok_and_gemini_through_the_shared_table() {
-        // The launcher writes ~/.gemini/settings.json and ~/.grok/settings.json
-        // in Claude's shape; doctor must read them back from the same table.
+    fn harness_checks_detect_grok_and_agy_through_the_shared_table() {
+        // The launcher writes ~/.gemini/config/mcp_config.json and
+        // ~/.grok/settings.json in Claude's shape; doctor must read them back
+        // from the same table.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::fs::create_dir_all(home.join(".gemini").join("config")).unwrap();
         std::fs::create_dir_all(home.join(".grok")).unwrap();
         std::fs::write(
-            home.join(".gemini").join("settings.json"),
+            home.join(".gemini").join("config").join("mcp_config.json"),
             r#"{"mcpServers":{"ironmem":{"command":"ironmem","args":["serve","--connect","/tmp/d.sock"]}}}"#,
         )
         .unwrap();
@@ -1064,13 +1075,12 @@ mod tests {
                 .find(|c| c.name == name)
                 .unwrap_or_else(|| panic!("{name} must exist"))
         };
-        let gemini = by_name("harness_gemini");
-        assert_eq!(gemini.status, CheckStatus::Ok, "{gemini:?}");
+        let agy = by_name("harness_agy");
+        assert_eq!(agy.status, CheckStatus::Ok, "{agy:?}");
         assert!(
-            gemini
-                .summary
+            agy.summary
                 .contains("wired with the shared-daemon proxy command"),
-            "{gemini:?}"
+            "{agy:?}"
         );
         let grok = by_name("harness_grok");
         assert_eq!(grok.status, CheckStatus::Ok, "{grok:?}");
@@ -1175,10 +1185,10 @@ mod tests {
                 "warmup",
                 "harness_claude",
                 "harness_codex",
-                // grok + gemini (#190 Task 11) and muse all resolve through
+                // grok, agy, and muse all resolve through
                 // the shared JSON-mcpServers detector (object shape).
                 "harness_grok",
-                "harness_gemini",
+                "harness_agy",
                 "harness_muse",
             ],
             "the toolable check-key set must stay stable"
@@ -1469,7 +1479,7 @@ mod tests {
                 "harness_claude",
                 "harness_codex",
                 "harness_grok",
-                "harness_gemini",
+                "harness_agy",
                 "harness_muse",
                 "daemon",
                 "daemon_autospawn",

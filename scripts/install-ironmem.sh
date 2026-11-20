@@ -10,8 +10,8 @@
 #
 # The script builds release (unless --skip-build), atomically replaces
 # ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies
-# and Muse managed-store skills, registers the MCP server for Claude, Codex
-# and Muse, and verifies the resulting binary runs.
+# and Muse managed-store skills, registers the MCP server for Claude, Codex,
+# Muse and Antigravity (agy), and verifies the resulting binary runs.
 
 set -euo pipefail
 
@@ -140,16 +140,16 @@ Options:
   --skip-build     Install the existing target/release/ironmem binary.
   --skip-skills    Do not install bundled Codex/Claude/Muse skill, agent,
                    command, and prompt dependencies.
-  --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse
-                   config.
+  --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse/
+                   Antigravity config.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
                    files update by default (three-way merged for Codex/Claude,
                    overwritten in the Muse managed store); use --skip-skills
                    to leave existing copies untouched.
   --force-wiring   Replace an existing 'ironmem' MCP entry in ~/.claude.json,
-                   ~/.codex/config.toml or ~/.config/muse/settings.json with
-                   the bundled one (use only when the config has drifted from
-                   a fresh install).
+                   ~/.codex/config.toml, ~/.config/muse/settings.json, or
+                   ~/.gemini/config/mcp_config.json with the bundled one (use
+                   only when the config has drifted from a fresh install).
 EOF
 }
 
@@ -586,12 +586,13 @@ install_md_set() {
 }
 
 # Register the ironmem MCP server in a harness config that keys its servers by
-# id in a top-level `mcpServers` object -- Claude Code and Muse Code both do,
-# so one writer serves both. This mirrors the Rust
-# `mcp_setup::ensure_json_mcpservers_registered`, which routes Claude, Gemini
-# CLI, Grok CLI and Muse through a single function; keeping the two writers in
-# the same shape matters because either can create the entry (this script on
-# install, `ironmem <harness>` on launch) and neither should surprise the other.
+# id in a top-level `mcpServers` object -- Claude Code, Muse Code, and
+# Antigravity (agy) all do, so one writer serves all three. This mirrors the
+# Rust `mcp_setup::ensure_json_mcpservers_registered`, which routes Claude,
+# Antigravity (agy), Grok CLI and Muse through a single function; keeping the
+# two writers in the same shape matters because either can create the entry
+# (this script on install, `ironmem <harness>` on launch) and neither should
+# surprise the other.
 #
 # Two per-harness knobs, named after their Rust counterparts:
 #   seed   -- the document a missing config starts from
@@ -681,6 +682,45 @@ register_json_mcpservers() {
   else
     echo "    WARN: 'ironmem' MCP entry already exists with command=$existing_cmd" >&2
     echo "          Expected: $TARGET. Re-run with --force-wiring to replace." >&2
+  fi
+}
+
+# Register the ironmem lifecycle hooks (`SessionStart`, `PreInvocation`, `Stop`)
+# in Antigravity's global hooks file (`~/.gemini/config/hooks.json`). Top-level
+# keys in Antigravity `hooks.json` are named hook groups, so we manage only the
+# `ironmem` key and leave every other user hook group untouched.
+register_agy_hooks() {
+  local config="$1"
+  local existing_cmd tmp expected_start expected_pre expected_stop
+
+  expected_start="IRONMEM_MCP_MODE=trusted \"$TARGET\" hook session-start --harness agy"
+  expected_pre="IRONMEM_MCP_MODE=trusted \"$TARGET\" hook user-prompt-submit --harness agy"
+  expected_stop="IRONMEM_MCP_MODE=trusted \"$TARGET\" hook stop --harness agy"
+
+  if [[ ! -f "$config" ]]; then
+    mkdir -p "$(dirname "$config")"
+    printf '{}\n' > "$config"
+  fi
+
+  existing_cmd="$(jq -r '.ironmem.SessionStart[0].command // empty' "$config" 2>/dev/null || echo "")"
+
+  if [[ -z "$existing_cmd" ]]; then
+    echo "==> Registering 'ironmem' lifecycle hooks in $config"
+    tmp="$(mktemp)"
+    jq --arg start "$expected_start" --arg pre "$expected_pre" --arg stop "$expected_stop" \
+      '. + {ironmem: {SessionStart: [{type: "command", command: $start}], PreInvocation: [{type: "command", command: $pre}], Stop: [{type: "command", command: $stop}]}}' \
+      "$config" > "$tmp" && mv -f "$tmp" "$config"
+  elif [[ "$existing_cmd" == "$expected_start" ]]; then
+    echo "    'ironmem' lifecycle hooks already registered for Antigravity"
+  elif [[ "$FORCE_WIRING" -eq 1 ]]; then
+    echo "==> Replacing divergent 'ironmem' Antigravity hooks entry"
+    tmp="$(mktemp)"
+    jq --arg start "$expected_start" --arg pre "$expected_pre" --arg stop "$expected_stop" \
+      '.ironmem = {SessionStart: [{type: "command", command: $start}], PreInvocation: [{type: "command", command: $pre}], Stop: [{type: "command", command: $stop}]}' \
+      "$config" > "$tmp" && mv -f "$tmp" "$config"
+  else
+    echo "    WARN: 'ironmem' Antigravity hooks entry already exists with SessionStart command=$existing_cmd" >&2
+    echo "          Expected: $expected_start. Re-run with --force-wiring to replace." >&2
   fi
 }
 
@@ -790,11 +830,13 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     MUSE_CONFIG_DEFAULT="$HOME/.config/muse/settings.json"
   fi
   MUSE_CONFIG_JSON="${MUSE_CONFIG_JSON:-$MUSE_CONFIG_DEFAULT}"
+  AGY_CONFIG_JSON="${AGY_CONFIG_JSON:-$HOME/.gemini/config/mcp_config.json}"
+  AGY_HOOKS_JSON="${AGY_HOOKS_JSON:-$HOME/.gemini/config/hooks.json}"
 
-  # ---- Claude Code and Muse Code: object-shaped mcpServers ------------------
+  # ---- Claude Code, Muse Code, and Antigravity: object-shaped mcpServers ----
   if ! command -v jq >/dev/null 2>&1; then
-    echo "==> WARN: jq not installed; skipping Claude and Muse MCP registration checks." >&2
-    echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON:" >&2
+    echo "==> WARN: jq not installed; skipping Claude, Muse, and Antigravity MCP/hook registration checks." >&2
+    echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON and $AGY_CONFIG_JSON:" >&2
     echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" } } } }" >&2
     echo "          ...and the same to $MUSE_CONFIG_JSON, with \"mode\": \"optional\" added to" >&2
     echo "          the ironmem entry so a stale command cannot abort a Muse session, and" >&2
@@ -804,6 +846,8 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \
       '{"schema_version": 1}' '{"mode": "optional"}'
+    register_json_mcpservers "Antigravity" "$AGY_CONFIG_JSON" '{}' '{}'
+    register_agy_hooks "$AGY_HOOKS_JSON"
   fi
 
   # ---- Codex: ~/.codex/config.toml [mcp_servers.ironmem] --------------------
@@ -925,8 +969,8 @@ if [[ -n "$DAEMON_PIDS" ]]; then
     fi
   done
   echo ""
-  echo "    New Claude Code / Codex / Muse sessions auto-spawn a daemon running"
-  echo "    the freshly installed binary. What happens to sessions attached"
+  echo "    New Claude Code / Codex / Muse / Antigravity sessions auto-spawn a"
+  echo "    daemon running the freshly installed binary. What happens to sessions"
   echo "    RIGHT NOW depends on which build the signalled daemon was running,"
   echo "    and this script cannot tell from the outside:"
   echo "      - Built from this change onward: SIGTERM is a graceful retire."

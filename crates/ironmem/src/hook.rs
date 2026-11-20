@@ -152,6 +152,49 @@ struct VectorHandoff {
     deadline: Instant,
 }
 
+/// Serialize a [`HookResponse`] to the JSON stdout contract expected by its
+/// harness.
+///
+/// Antigravity (`agy`) parses hook stdout as strict camelCase protojson:
+/// - `SessionStart` and `PreInvocation` (`user-prompt-submit`) expect
+///   `{"injectSteps": [{"systemMessage": {"systemMessage": "..."}}]}` (or `{}`
+///   when nothing is injected).
+/// - `Stop` expects `{"decision": "continue", "reason": "..."}` to block
+///   stopping, or `{}` to allow stopping.
+///
+/// All other harnesses (Claude Code, Codex, etc.) receive the standard
+/// [`HookResponse`] JSON serialization unchanged.
+pub fn format_hook_output(response: &HookResponse) -> Result<String, serde_json::Error> {
+    if resolve_harness_spec(&response.harness, crate::harness::REGISTRY).id == "agy" {
+        let payload = if response.hook == "stop" {
+            if matches!(response.decision.as_deref(), Some("block" | "continue")) {
+                let mut map = serde_json::Map::new();
+                map.insert("decision".to_string(), serde_json::json!("continue"));
+                if let Some(reason) = &response.reason {
+                    map.insert("reason".to_string(), serde_json::json!(reason));
+                }
+                serde_json::Value::Object(map)
+            } else {
+                serde_json::json!({})
+            }
+        } else if let Some(out) = &response.hook_specific_output {
+            serde_json::json!({
+                "injectSteps": [
+                    {
+                        "systemMessage": {
+                            "systemMessage": out.additional_context,
+                        }
+                    }
+                ]
+            })
+        } else {
+            serde_json::json!({})
+        };
+        return serde_json::to_string_pretty(&payload);
+    }
+    serde_json::to_string_pretty(response)
+}
+
 /// Run a session lifecycle hook, reading the harness JSON payload from stdin.
 ///
 /// `harness` gates harness-specific output. Two hooks populate the returned
@@ -1131,12 +1174,29 @@ fn run_user_prompt_submit(
             limit: crate::search::tunables::prompt_hook_hybrid_limit(),
         });
 
+    // Antigravity's `PreInvocation` fires before EVERY model call in a turn
+    // (`invocationNum`: 0 on the initial call after user input, 1+ on
+    // subsequent tool-result round-trips). Since injected `systemMessage`
+    // steps persist in the conversation trajectory, skip recall after the
+    // first invocation of a turn to avoid injecting duplicates.
+    if input
+        .get("invocationNum")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|n| n > 0)
+    {
+        return response;
+    }
+
     // `budget` (not a pre-shrunk copy) goes to recall: `effective_hybrid_vector_budget`
     // already reserves `PROMPT_HOOK_OCCUPANCY_RESERVE_MS` once for the hybrid path, and
     // the post-hoc `remaining >= reserve` gate below already makes the occupancy sample
     // best-effort. Reserving the same 30ms a second time here would halve hybrid's
     // window whenever occupancy sampling is active, with no corresponding benefit.
-    if let Some(prompt) = input.get("prompt").and_then(|v| v.as_str()) {
+    if let Some(prompt) = input
+        .get("prompt")
+        .or_else(|| input.get("lastUserInput"))
+        .and_then(|v| v.as_str())
+    {
         if !is_trivial_prompt(prompt) && !budget.is_zero() {
             if let Some(ctx) = search_prompt_context(
                 &config.db_path,
@@ -2337,6 +2397,7 @@ fn read_hook_input() -> Result<serde_json::Value, MemoryError> {
 fn parse_transcript_path(input: &serde_json::Value) -> Option<PathBuf> {
     input
         .get("transcript_path")
+        .or_else(|| input.get("transcriptPath"))
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
@@ -2347,6 +2408,14 @@ fn parse_workspace_root(input: &serde_json::Value) -> Option<PathBuf> {
         .get("cwd")
         .and_then(|value| value.as_str())
         .or_else(|| input.get("workspace_root").and_then(|value| value.as_str()))
+        .or_else(|| {
+            input
+                .get("workspacePaths")
+                .and_then(|value| value.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|value| value.as_str())
+        })
+        .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from);
     resolve_workspace_root(explicit.as_deref())
 }
@@ -2354,6 +2423,7 @@ fn parse_workspace_root(input: &serde_json::Value) -> Option<PathBuf> {
 fn parse_session_id(input: &serde_json::Value) -> Option<String> {
     input
         .get("session_id")
+        .or_else(|| input.get("conversationId"))
         .and_then(|value| value.as_str())
         .map(sanitize_session_id)
 }
@@ -2367,11 +2437,19 @@ fn session_summary(
 ) -> Option<String> {
     let transcript_path = input
         .get("transcript_path")
+        .or_else(|| input.get("transcriptPath"))
         .and_then(|value| value.as_str())
         .unwrap_or("");
     let cwd = input
         .get("cwd")
         .and_then(|value| value.as_str())
+        .or_else(|| {
+            input
+                .get("workspacePaths")
+                .and_then(|value| value.as_array())
+                .and_then(|arr| arr.first())
+                .and_then(|value| value.as_str())
+        })
         .unwrap_or("");
     if transcript_path.is_empty() && cwd.is_empty() && session_id.is_none() {
         return None;
@@ -9042,5 +9120,161 @@ mod tests {
         assert!(!catalog.contains("parent copy"), "{catalog}");
         let worktree = recall(&nested_worktree);
         assert!(worktree.contains("worktree copy"), "{worktree}");
+    }
+
+    #[test]
+    fn agy_session_start_formats_as_protojson_inject_steps() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("repo");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let db_path = dir.path().join("memory.sqlite3");
+        let cfg = Config {
+            db_path,
+            model_dir: dir.path().join("models"),
+            model_dir_explicit: true,
+            state_dir: dir.path().join("state"),
+            mcp_access_mode: crate::config::McpAccessMode::ReadOnly,
+            embed_mode: crate::config::EmbedMode::Noop,
+        };
+        let resp = run_hook_with_input(
+            "session-start",
+            "agy",
+            cfg,
+            serde_json::json!({
+                "conversationId": "conv-123",
+                "workspacePaths": [workspace],
+                "transcriptPath": dir.path().join("transcript.jsonl"),
+                "hookEventName": "SessionStart"
+            }),
+        )
+        .unwrap();
+        assert!(
+            resp.hook_specific_output.is_some(),
+            "agy session-start must build context when additional_context_support=true"
+        );
+        let rendered = format_hook_output(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        let obj = v.as_object().expect("agy output must be JSON object");
+        assert_eq!(
+            obj.len(),
+            1,
+            "agy protojson must not leak unknown top-level keys: {rendered}"
+        );
+        let msg = v["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .expect("injectSteps[0].systemMessage.systemMessage must be string");
+        assert!(
+            msg.contains("MEMORY_PROTOCOL:"),
+            "session-start systemMessage must contain MEMORY_PROTOCOL: {msg}"
+        );
+    }
+
+    #[test]
+    fn agy_pre_invocation_injects_on_first_invocation_and_skips_followups() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().canonicalize().unwrap();
+        let repo = base.join("shop-api");
+        std::fs::create_dir_all(repo.join("docs")).unwrap();
+        let db_path = base.join("memory.sqlite3");
+        let db = crate::db::schema::Database::open(&db_path).unwrap();
+        db.migrate().unwrap();
+        insert_mined_drawer(
+            &db,
+            "checkout idempotency token expires after 24 hours",
+            "shop-api",
+            &repo.join("docs").join("checkout.md"),
+        );
+        drop(db);
+        let config = prompt_hook_config(db_path, base.join("state"));
+
+        // First model call of the turn (`invocationNum: 0`): injects recalled memory.
+        let first = run_hook_with_input(
+            "user-prompt-submit",
+            "agy",
+            config.clone(),
+            serde_json::json!({
+                "hookEventName": "PreInvocation",
+                "conversationId": "conv-456",
+                "invocationNum": 0,
+                "lastUserInput": "checkout idempotency token expires",
+                "cwd": repo,
+            }),
+        )
+        .unwrap();
+        let first_json: serde_json::Value =
+            serde_json::from_str(&format_hook_output(&first).unwrap()).unwrap();
+        let msg = first_json["injectSteps"][0]["systemMessage"]["systemMessage"]
+            .as_str()
+            .expect("invocationNum=0 must inject recall via injectSteps");
+        assert!(msg.contains("idempotency token"), "{msg}");
+
+        // Follow-up model call in the same turn (`invocationNum: 1`): emits `{}`
+        // so the persisted systemMessage is not injected a second time.
+        let followup = run_hook_with_input(
+            "user-prompt-submit",
+            "agy",
+            config,
+            serde_json::json!({
+                "hookEventName": "PreInvocation",
+                "conversationId": "conv-456",
+                "invocationNum": 1,
+                "lastUserInput": "checkout idempotency token expires",
+                "cwd": repo,
+            }),
+        )
+        .unwrap();
+        let followup_json: serde_json::Value =
+            serde_json::from_str(&format_hook_output(&followup).unwrap()).unwrap();
+        assert_eq!(followup_json, serde_json::json!({}));
+    }
+
+    #[test]
+    fn format_hook_output_translates_agy_stop_and_preserves_claude() {
+        let stop_allow = HookResponse {
+            decision: None,
+            reason: None,
+            hook: "stop".into(),
+            harness: "agy".into(),
+            workspace_root: Some("/tmp/repo".into()),
+            hook_specific_output: None,
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&format_hook_output(&stop_allow).unwrap())
+                .unwrap(),
+            serde_json::json!({})
+        );
+
+        let stop_block = HookResponse {
+            decision: Some("block".into()),
+            reason: Some("save a handoff drawer".into()),
+            hook: "stop".into(),
+            harness: "agy".into(),
+            workspace_root: Some("/tmp/repo".into()),
+            hook_specific_output: None,
+        };
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&format_hook_output(&stop_block).unwrap())
+                .unwrap(),
+            serde_json::json!({
+                "decision": "continue",
+                "reason": "save a handoff drawer"
+            })
+        );
+
+        let claude = HookResponse {
+            decision: None,
+            reason: None,
+            hook: "session-start".into(),
+            harness: "claude-code".into(),
+            workspace_root: Some("/tmp/repo".into()),
+            hook_specific_output: Some(HookSpecificOutput::session_start("hello".into())),
+        };
+        let claude_json: serde_json::Value =
+            serde_json::from_str(&format_hook_output(&claude).unwrap()).unwrap();
+        assert_eq!(claude_json["hook"], "session-start");
+        assert_eq!(
+            claude_json["hookSpecificOutput"]["additionalContext"],
+            "hello"
+        );
     }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Generate/check Claude, Codex, Grok, Gemini, and Muse MCP wrapper scripts
-from one template. The wrapper is harness-agnostic (it just resolves and
+"""Generate/check Claude, Codex, Grok, Antigravity (agy), and Muse MCP wrapper
+scripts from one template. The wrapper is harness-agnostic (it just resolves and
 execs the ironmem binary), so every registered harness's plugin root shares
 the exact same script content.
 """
@@ -15,7 +15,7 @@ TARGETS = [
     ROOT / ".claude-plugin" / "bin" / "ironmem-mcp.sh",
     ROOT / ".codex-plugin" / "bin" / "ironmem-mcp.sh",
     ROOT / ".grok-plugin" / "bin" / "ironmem-mcp.sh",
-    ROOT / ".gemini-plugin" / "bin" / "ironmem-mcp.sh",
+    ROOT / ".agy-plugin" / "bin" / "ironmem-mcp.sh",
     ROOT / ".muse-plugin" / "bin" / "ironmem-mcp.sh",
 ]
 

@@ -1,0 +1,18 @@
+{
+  "name": "ironmem",
+  "version": "0.7.0",
+  "description": "Rust MCP memory backend for Antigravity (agy) with semantic search, knowledge graph, automatic migrate-or-init bootstrap, and incremental workspace mining.",
+  "author": {
+    "name": "Jeffrey Crum"
+  },
+  "license": "Apache-2.0",
+  "repository": "https://github.com/ironrace/ironmem",
+  "keywords": [
+    "memory",
+    "mcp",
+    "semantic-search",
+    "knowledge-graph",
+    "antigravity",
+    "agy"
+  ]
+}

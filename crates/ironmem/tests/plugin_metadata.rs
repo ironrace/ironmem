@@ -604,13 +604,92 @@ fn plugin_versions_match_cargo_toml() {
         ".claude-plugin",
         ".muse-plugin",
         ".grok-plugin",
-        ".gemini-plugin",
+        ".agy-plugin",
     ] {
         let manifest = read_json(&format!("{dir}/plugin.json"));
         let version = manifest["version"].as_str().unwrap_or("");
         assert_eq!(
             version, cargo_version,
             "{dir} plugin.json version ({version}) must match Cargo.toml ({cargo_version})"
+        );
+    }
+}
+
+#[test]
+fn agy_plugin_manifest_and_mcp_config_have_required_fields() {
+    // Native Antigravity plugin shape: `plugin.json` carries metadata only (no
+    // Claude-style top-level `mcpServers` or `interface` keys, which `agy
+    // plugin validate` flags as ignored), and MCP servers live in the sibling
+    // `mcp_config.json`.
+    let manifest = read_json(".agy-plugin/plugin.json");
+    assert_eq!(
+        manifest["name"].as_str().unwrap_or(""),
+        "ironmem",
+        "agy plugin.json: missing name"
+    );
+    assert!(
+        manifest["version"].is_string(),
+        "agy plugin.json: missing version"
+    );
+    assert!(
+        manifest.get("mcpServers").is_none(),
+        "agy plugin.json: MCP servers belong in .agy-plugin/mcp_config.json, not plugin.json"
+    );
+    assert!(
+        manifest.get("interface").is_none(),
+        "agy plugin.json: unknown 'interface' field is ignored by agy plugin validate"
+    );
+
+    let mcp = read_json(".agy-plugin/mcp_config.json");
+    let server = &mcp["mcpServers"]["ironmem"];
+    assert!(
+        server.is_object(),
+        "agy mcp_config.json: missing 'mcpServers.ironmem' object"
+    );
+    assert_eq!(
+        server["command"].as_str(),
+        Some("./bin/ironmem-mcp.sh"),
+        "agy mcp_config.json: command must point at ./bin/ironmem-mcp.sh"
+    );
+    assert!(
+        workspace_root()
+            .join(".agy-plugin/bin/ironmem-mcp.sh")
+            .is_file(),
+        "agy mcp_config.json: referenced wrapper script must exist"
+    );
+    assert_eq!(
+        server["args"],
+        serde_json::json!(["serve"]),
+        "agy mcp_config.json: expected ['serve'] args"
+    );
+
+    // Native Antigravity plugins place hooks.json at the plugin root with
+    // named top-level entries and flat handler arrays for SessionStart,
+    // PreInvocation, and Stop.
+    let hooks = read_json(".agy-plugin/hooks.json");
+    let ironmem = &hooks["ironmem"];
+    assert!(
+        ironmem.is_object(),
+        "agy hooks.json: missing top-level 'ironmem' hook group"
+    );
+    for (event, expected_arg) in [
+        ("SessionStart", "session-start"),
+        ("PreInvocation", "user-prompt-submit"),
+        ("Stop", "stop"),
+    ] {
+        let handlers = ironmem[event]
+            .as_array()
+            .unwrap_or_else(|| panic!("agy hooks.json: missing '{event}' array"));
+        assert!(
+            !handlers.is_empty(),
+            "agy hooks.json: '{event}' must define at least one handler"
+        );
+        let cmd = handlers[0]["command"]
+            .as_str()
+            .unwrap_or_else(|| panic!("agy hooks.json: '{event}'[0] missing command"));
+        assert!(
+            cmd.contains("hooks/ironmem-hook.sh") && cmd.contains(expected_arg),
+            "agy hooks.json: '{event}' command ({cmd}) must invoke hooks/ironmem-hook.sh {expected_arg}"
         );
     }
 }
