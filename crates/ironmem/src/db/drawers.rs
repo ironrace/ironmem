@@ -355,8 +355,9 @@ pub(crate) struct ScopeVector {
 }
 
 impl ScopeVector {
-    /// The decoded embedding, or `None` when the stored blob is missing, not a
-    /// whole number of `f32`s, or holds a non-finite value.
+    /// The decoded embedding, or `None` when the stored value is missing or
+    /// not a blob, or the blob is not a whole number of `f32`s or holds a
+    /// non-finite value.
     pub(crate) fn embedding(&self) -> Option<Vec<f32>> {
         self.embedding_blob.as_deref().and_then(decode_embedding)
     }
@@ -916,24 +917,36 @@ impl Database {
         Ok(best)
     }
 
-    /// Every drawer in `wing` and/or `room`, in no particular order, with the
-    /// columns the search filters read and the stored embedding. One `SELECT`
-    /// (unsorted: sorting would make SQLite sort the embedding blobs), after
-    /// the `PRAGMA table_info` column probe the other drawer reads also make.
-    /// It narrows by scope only; the caller applies the filter rules.
+    /// Hand `f` every drawer in `wing` and/or `room`, one row at a time and in
+    /// no particular order, with the columns the search filters read and the
+    /// stored embedding. One `SELECT` (unsorted: sorting would make SQLite
+    /// sort the embedding blobs), after the `PRAGMA table_info` column probe
+    /// the other drawer reads also make. The rules that do not depend on the
+    /// scope run in the SQL, so the rows they exclude are never read: a collab
+    /// message is left out, and so is a superseded row unless
+    /// `include_superseded` is set. The caller still applies its own filter
+    /// rules to what arrives. Rows are streamed, not collected, so the caller
+    /// decides what to keep.
     pub(crate) fn scope_vectors(
         &self,
         wing: Option<&str>,
         room: Option<&str>,
-    ) -> Result<Vec<ScopeVector>, MemoryError> {
-        let superseded_by = if Self::has_superseded_by_column(&self.conn)? {
+        include_superseded: bool,
+        mut f: impl FnMut(ScopeVector),
+    ) -> Result<(), MemoryError> {
+        let has_superseded_by = Self::has_superseded_by_column(&self.conn)?;
+        let superseded_by = if has_superseded_by {
             "superseded_by"
         } else {
             "NULL"
         };
-        let mut sql =
-            format!("SELECT id, wing, room, {superseded_by}, embedding FROM drawers WHERE 1 = 1");
-        let mut values: Vec<&str> = Vec::new();
+        let mut sql = format!(
+            "SELECT id, wing, room, {superseded_by}, embedding FROM drawers WHERE room <> ?"
+        );
+        let mut values: Vec<&str> = vec![COLLAB_MESSAGE_ROOM];
+        if !include_superseded && has_superseded_by {
+            sql.push_str(" AND superseded_by IS NULL");
+        }
         if let Some(wing) = wing {
             sql.push_str(" AND wing = ?");
             values.push(wing);
@@ -949,10 +962,19 @@ impl Database {
                 wing: row.get(1)?,
                 room: row.get(2)?,
                 superseded_by: row.get(3)?,
-                embedding_blob: row.get(4)?,
+                // A value that is not a blob (a hand edit or a foreign import;
+                // BLOB affinity does not convert it) is malformed, not an
+                // error that fails the whole search.
+                embedding_blob: match row.get_ref(4)? {
+                    rusqlite::types::ValueRef::Blob(blob) => Some(blob.to_vec()),
+                    _ => None,
+                },
             })
         })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        for row in rows {
+            f(row?);
+        }
+        Ok(())
     }
 
     /// Test-only: count the `SELECT` statements this connection prepares from
@@ -3119,6 +3141,35 @@ mod tests {
         db.insert_drawer("g", "the non-plugin hooks", &emb, "other", "r", "", "test")
             .unwrap();
         assert_eq!(bm25_ids(&db, "non-plugin", Some("w")), vec![id]);
+    }
+
+    /// The rules that do not depend on the scope run in the SQL: a collab
+    /// message, and a superseded row unless history is asked for, never reach
+    /// the caller, so their blobs are never read.
+    #[test]
+    fn scope_vectors_leave_out_collab_messages_and_superseded_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        for (id, room) in [
+            ("x-current", "r"),
+            ("x-old", "r"),
+            ("x-collab", COLLAB_MESSAGE_ROOM),
+        ] {
+            db.insert_drawer(id, id, &emb, "x", room, "", "test")
+                .unwrap();
+        }
+        db.exec_raw("UPDATE drawers SET superseded_by = 'x-current' WHERE id = 'x-old'")
+            .unwrap();
+        let read = |wing, room, include_superseded| {
+            let mut ids = Vec::new();
+            db.scope_vectors(wing, room, include_superseded, |row| ids.push(row.id))
+                .unwrap();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(read(Some("x"), None, false), ["x-current"]);
+        assert_eq!(read(Some("x"), None, true), ["x-current", "x-old"]);
+        assert!(read(None, Some(COLLAB_MESSAGE_ROOM), true).is_empty());
     }
 
     /// The supersession filter has to hold in every scoped branch, not just the

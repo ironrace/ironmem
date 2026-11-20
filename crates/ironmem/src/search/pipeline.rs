@@ -469,37 +469,39 @@ fn scoped_vector_candidates(
 ) -> Result<Vec<String>, MemoryError> {
     use crate::db::drawers::EmbeddingNorm;
 
-    let rows = app
-        .db
-        .scope_vectors(filters.wing.as_deref(), filters.room.as_deref())?;
     let mut malformed = 0usize;
     let mut candidates: Vec<ScopeCandidate> = Vec::new();
-    for row in rows {
-        if !row_matches_filters(&row.wing, &row.room, row.superseded_by.is_some(), filters) {
-            continue;
-        }
-        let Some(embedding) = row.embedding() else {
-            malformed += 1;
-            continue;
-        };
-        if embedding.len() != primary.len() {
-            malformed += 1;
-            continue;
-        }
-        let norm = match crate::db::drawers::embedding_norm(&embedding) {
-            EmbeddingNorm::Usable(norm) => norm,
-            EmbeddingNorm::Zero => continue,
-            EmbeddingNorm::Unusable => {
-                malformed += 1;
-                continue;
+    app.db.scope_vectors(
+        filters.wing.as_deref(),
+        filters.room.as_deref(),
+        filters.include_superseded,
+        |row| {
+            if !row_matches_filters(&row.wing, &row.room, row.superseded_by.is_some(), filters) {
+                return;
             }
-        };
-        candidates.push(ScopeCandidate {
-            id: row.id,
-            embedding,
-            norm,
-        });
-    }
+            let Some(embedding) = row.embedding() else {
+                malformed += 1;
+                return;
+            };
+            if embedding.len() != primary.len() {
+                malformed += 1;
+                return;
+            }
+            let norm = match crate::db::drawers::embedding_norm(&embedding) {
+                EmbeddingNorm::Usable(norm) => norm,
+                EmbeddingNorm::Zero => return,
+                EmbeddingNorm::Unusable => {
+                    malformed += 1;
+                    return;
+                }
+            };
+            candidates.push(ScopeCandidate {
+                id: row.id,
+                embedding,
+                norm,
+            });
+        },
+    )?;
     // `union_hnsw` breaks ties by position, so positions must follow id order.
     candidates.sort_unstable_by(|a, b| a.id.cmp(&b.id));
 
@@ -1516,6 +1518,12 @@ mod tests {
         app.db
             .exec_raw("UPDATE drawers SET embedding = x'0102' WHERE id = 'bad-blob'")
             .unwrap();
+        // A value that is not a blob at all (a hand edit or a foreign import):
+        // the column's BLOB affinity does not convert it.
+        add(&app, "text-blob", "s", "r", &at_similarity(0.5, 1.0));
+        app.db
+            .exec_raw("UPDATE drawers SET embedding = 'text' WHERE id = 'text-blob'")
+            .unwrap();
 
         let (ids, log) = with_captured_log(|| {
             vector_candidates(&app, &query_vec(), None, 30, &scope(Some("s"), Some("r"))).unwrap()
@@ -1523,7 +1531,7 @@ mod tests {
         assert_eq!(ids, ["good"]);
         let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
         assert_eq!(warnings.len(), 1, "{log}");
-        assert!(warnings[0].contains("malformed=3"), "{log}");
+        assert!(warnings[0].contains("malformed=4"), "{log}");
         assert!(warnings[0].contains("wing=\"s\""), "{log}");
         assert!(warnings[0].contains("room=\"r\""), "{log}");
 
