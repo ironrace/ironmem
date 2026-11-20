@@ -187,6 +187,101 @@ fn cli_init_mine_serve_and_hook_smoke_test() {
     assert!(reviews[0].source_file.ends_with("transcript.jsonl"));
 }
 
+/// Run `ironmem hook <name> --harness <harness>` with `payload` on stdin.
+fn run_hook_cli(
+    home: &Path,
+    db_path: &Path,
+    name: &str,
+    harness: &str,
+    payload: &serde_json::Value,
+) -> std::process::Output {
+    let mut child = base_command(home, db_path)
+        .arg("hook")
+        .arg(name)
+        .arg("--harness")
+        .arg(harness)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
+/// `--harness gemini` runs as agy (Gemini CLI is a deprecated alias of
+/// Antigravity) with one deprecation line on stderr, and an unknown harness
+/// warns instead of silently becoming Claude.
+#[test]
+fn cli_hook_harness_aliases_warn_on_stderr() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let db_path = temp.path().join("memory.sqlite3");
+
+    let gemini = run_hook_cli(
+        &home,
+        &db_path,
+        "user-prompt-submit",
+        "gemini",
+        &json!({ "invocationNum": 1, "lastUserInput": "anything at all here" }),
+    );
+    assert!(gemini.status.success(), "{gemini:?}");
+    let stdout: serde_json::Value = serde_json::from_slice(&gemini.stdout).unwrap();
+    assert_eq!(stdout, json!({}), "agy protojson, follow-up call: {stdout}");
+    let stderr = String::from_utf8_lossy(&gemini.stderr);
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("deprecated"))
+        .collect();
+    assert_eq!(notices.len(), 1, "one notice per process: {stderr}");
+    assert!(
+        notices[0].contains("\"gemini\"") && notices[0].contains("\"agy\""),
+        "{stderr}"
+    );
+
+    let agy = run_hook_cli(
+        &home,
+        &db_path,
+        "user-prompt-submit",
+        "agy",
+        &json!({ "invocationNum": "2" }),
+    );
+    assert!(agy.status.success(), "{agy:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&agy.stdout).unwrap(),
+        json!({})
+    );
+    assert!(
+        !String::from_utf8_lossy(&agy.stderr).contains("deprecated"),
+        "agy is not deprecated: {agy:?}"
+    );
+
+    let unknown = run_hook_cli(
+        &home,
+        &db_path,
+        "user-prompt-submit",
+        "bogus-harness",
+        &json!({ "prompt": "hi" }),
+    );
+    assert!(unknown.status.success(), "{unknown:?}");
+    let stdout: serde_json::Value = serde_json::from_slice(&unknown.stdout).unwrap();
+    assert_eq!(
+        stdout["harness"], "bogus-harness",
+        "Claude-shaped fallback: {stdout}"
+    );
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(
+        stderr.contains("unknown hook harness \"bogus-harness\""),
+        "{stderr}"
+    );
+}
+
 #[test]
 fn cli_dashboard_rejects_invalid_host() {
     let temp = tempfile::tempdir().unwrap();

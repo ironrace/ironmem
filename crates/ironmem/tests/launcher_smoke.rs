@@ -13,12 +13,13 @@ fn bin() -> &'static str {
 }
 
 /// Create a stub executable named `name` in `dir` that writes its cwd to
-/// `<record>.cwd` and each argv element (one per line) to `<record>.args`,
-/// then exits with `exit_code`.
+/// `<record>.cwd`, each argv element (one per line) to `<record>.args`, and
+/// the argument count to `<record>.argc` (an element holding newlines spans
+/// several `.args` lines), then exits with `exit_code`.
 fn write_stub(dir: &Path, name: &str, record: &Path, exit_code: i32) -> PathBuf {
     let stub = dir.join(name);
     let script = format!(
-        "#!/bin/sh\npwd > \"{rec}.cwd\"\n: > \"{rec}.args\"\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"{rec}.args\"; done\nexit {exit_code}\n",
+        "#!/bin/sh\npwd > \"{rec}.cwd\"\nprintf '%s' \"$#\" > \"{rec}.argc\"\n: > \"{rec}.args\"\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> \"{rec}.args\"; done\nexit {exit_code}\n",
         rec = record.display(),
         exit_code = exit_code
     );
@@ -287,7 +288,7 @@ fn codex_launcher_registers_mcp_server_by_default() {
 
 /// #190 Task 13 acceptance: the grok launcher resolves from the registry
 /// (Task 11's row) and registers the shared-daemon proxy command exactly like
-/// Claude/Gemini's JSON `mcpServers` writer.
+/// the JSON `mcpServers` writer Claude and Antigravity (`agy`) share.
 #[test]
 fn grok_launcher_registers_mcp_server_by_default() {
     let temp = tempfile::tempdir().unwrap();
@@ -386,9 +387,10 @@ fn muse_launcher_registers_mcp_server_by_default() {
     assert_eq!(server["mode"], serde_json::json!("optional"));
 }
 
-/// Same acceptance for the gemini launcher.
+/// Same acceptance for the Antigravity (`agy`) launcher: registers into
+/// `~/.gemini/config/mcp_config.json` (ignoring `XDG_CONFIG_HOME`).
 #[test]
-fn gemini_launcher_registers_mcp_server_by_default() {
+fn agy_launcher_registers_mcp_server_by_default() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
     let db_path = temp.path().join("memory.sqlite3");
@@ -399,17 +401,18 @@ fn gemini_launcher_registers_mcp_server_by_default() {
     std::fs::create_dir_all(&bin_dir).unwrap();
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
-    write_stub(&bin_dir, "gemini", &record, 0);
+    write_stub(&bin_dir, "agy", &record, 0);
 
     let out = launcher_command(&home, &db_path, &bin_dir)
-        .arg("gemini")
+        .env("XDG_CONFIG_HOME", temp.path().join("ignored-xdg"))
+        .arg("agy")
         .arg(&repo)
         .output()
         .unwrap();
-    assert!(out.status.success(), "gemini launcher failed: {out:?}");
+    assert!(out.status.success(), "agy launcher failed: {out:?}");
     assert!(std::fs::metadata(format!("{}.cwd", record.display())).is_ok());
 
-    let cfg_path = home.join(".gemini").join("settings.json");
+    let cfg_path = home.join(".gemini").join("config").join("mcp_config.json");
     let cfg = std::fs::read_to_string(&cfg_path)
         .unwrap_or_else(|e| panic!("launcher should create {}: {e}", cfg_path.display()));
     let v: serde_json::Value = serde_json::from_str(&cfg).unwrap();
@@ -425,6 +428,173 @@ fn gemini_launcher_registers_mcp_server_by_default() {
     assert_eq!(
         server["args"],
         serde_json::json!(["serve", "--connect", expected_socket.display().to_string()])
+    );
+}
+
+#[test]
+fn agy_launcher_passes_prompt_via_interactive_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "agy", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("agy")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--no-context")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "agy launcher failed: {out:?}");
+
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    let lines: Vec<&str> = recorded_args.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["-i", "fix the login bug"],
+        "agy rejects positional prompts and must receive -i <prompt>"
+    );
+}
+
+/// The context-injection path builds agy's argv the same way as a bare
+/// prompt: exactly two arguments, `-i` and the combined prompt, never the
+/// injected block as a separate positional (which agy rejects).
+#[test]
+fn agy_launcher_preinjects_context_through_the_interactive_flag() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::write(repo.join("README.md"), "# repo\ncontent to mine").unwrap();
+    write_stub(&bin_dir, "agy", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("agy")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--area")
+        .arg("core")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "agy launcher failed: {out:?}");
+
+    let argc = std::fs::read_to_string(format!("{}.argc", record.display())).unwrap();
+    assert_eq!(argc, "2", "agy must get exactly -i and one prompt argument");
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    let (flag, prompt) = recorded_args.split_once('\n').unwrap();
+    assert_eq!(flag, "-i");
+    assert!(
+        prompt.contains("untrusted memory"),
+        "missing disclaimer header: {prompt}"
+    );
+    assert!(prompt.contains("core"), "missing requested area: {prompt}");
+    assert!(
+        prompt.contains("fix the login bug"),
+        "user prompt must survive injection: {prompt}"
+    );
+}
+
+/// Re-running the agy launcher against an `mcp_config.json` that already
+/// holds another server keeps that server (and its owner-only mode), adds
+/// ironmem once, and changes nothing on the second run.
+#[test]
+fn agy_launcher_preserves_sibling_servers_and_is_idempotent() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    let cfg_dir = home.join(".gemini").join("config");
+    std::fs::create_dir_all(&cfg_dir).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    write_stub(&bin_dir, "agy", &record, 0);
+    let cfg_path = cfg_dir.join("mcp_config.json");
+    std::fs::write(
+        &cfg_path,
+        r#"{"mcpServers":{"github":{"command":"gh-mcp","env":{"GITHUB_TOKEN":"t"}}}}"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let run = || {
+        let out = launcher_command(&home, &db_path, &bin_dir)
+            .arg("agy")
+            .arg(&repo)
+            .arg("--no-context")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "agy launcher failed: {out:?}");
+        String::from_utf8_lossy(&out.stderr).to_string()
+    };
+    let first = run();
+    assert!(
+        first.contains("registered MCP server for Antigravity"),
+        "{first}"
+    );
+    let after_first = std::fs::read_to_string(&cfg_path).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&after_first).unwrap();
+    assert_eq!(v["mcpServers"]["github"]["command"], "gh-mcp");
+    assert_eq!(v["mcpServers"]["github"]["env"]["GITHUB_TOKEN"], "t");
+    assert!(v["mcpServers"]["ironmem"].is_object(), "{after_first}");
+    let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o600, "registration must not widen the file");
+
+    let second = run();
+    assert!(second.contains("already registered"), "{second}");
+    assert_eq!(std::fs::read_to_string(&cfg_path).unwrap(), after_first);
+}
+
+/// `ironmem gemini` is a hidden, deprecated alias: it prints one notice on
+/// stderr and runs the agy launcher with the same arguments.
+#[test]
+fn gemini_subcommand_runs_the_agy_launcher_with_a_deprecation_notice() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path().join("home");
+    let db_path = temp.path().join("memory.sqlite3");
+    let bin_dir = temp.path().join("bin");
+    let repo = temp.path().join("repo");
+    let record = temp.path().join("rec");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&repo).unwrap();
+    write_stub(&bin_dir, "agy", &record, 0);
+
+    let out = launcher_command(&home, &db_path, &bin_dir)
+        .arg("gemini")
+        .arg(&repo)
+        .arg("fix the login bug")
+        .arg("--no-mcp-setup")
+        .arg("--no-context")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "gemini alias failed: {out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let notices: Vec<&str> = stderr
+        .lines()
+        .filter(|l| l.contains("`ironmem gemini` is deprecated"))
+        .collect();
+    assert_eq!(notices.len(), 1, "{stderr}");
+    assert!(notices[0].contains("ironmem agy"), "{stderr}");
+    let recorded_args = std::fs::read_to_string(format!("{}.args", record.display())).unwrap();
+    assert_eq!(
+        recorded_args.lines().collect::<Vec<_>>(),
+        vec!["-i", "fix the login bug"]
     );
 }
 

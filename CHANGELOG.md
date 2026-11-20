@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Antigravity (`agy`) replaces the Gemini CLI harness (#435).** Gemini CLI
+  is deprecated upstream in favour of Antigravity. `ironmem agy <repo>
+  [prompt]` launches `agy` with ironmem attached and passes the prompt as
+  `-i <prompt>`. The launcher and `doctor` use Antigravity's global MCP
+  config, `~/.gemini/config/mcp_config.json`, which does not move with
+  `XDG_CONFIG_HOME`. `scripts/install-ironmem.sh` wires that file and
+  Antigravity's `~/.gemini/config/hooks.json` (an `ironmem` hook group for
+  `SessionStart`, `PreInvocation` and `Stop`; other hook groups are left
+  alone) only when `agy` resolves on `PATH`; `AGY_BIN` (default `agy`) names
+  the binary it looks for. SessionStart and Stop get a 120 s timeout and
+  PreInvocation keeps agy's 30 s default. The hooks run with the
+  `IRONMEM_MCP_MODE` from the agy MCP entry's `env`, else
+  `${IRONMEM_MCP_MODE:-trusted}` when they run; changing it later needs
+  `--force-wiring`. The `.agy-plugin/` plugin ships the MCP server only, with
+  no hooks, so the installer's hooks never fire twice.
 - **`ironmem autopilot status <owner/repo>` (#420).** A report of a repo's
   gate config (state, gate commands, `manifest_warnings`, `proposed_at`,
   `approved_at`) and of which `agent:*` and `risk:*` labels it has, as text
@@ -39,6 +54,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Breaking: `gemini` is now a deprecated alias of the `agy` harness
+  (#435).** The `doctor` key `harness_gemini` is now `harness_agy`, so a
+  script reading `ironmem doctor --json` must read the new key, and
+  `.gemini-plugin/` is replaced by `.agy-plugin/`. `doctor` gains two keys:
+  `agy_hooks`, which warns when `~/.gemini/config/hooks.json` has no
+  `ironmem` group, a disabled one, or one missing a SessionStart,
+  PreInvocation or Stop hook, and `gemini_cli_legacy`, which warns about an
+  `ironmem` entry the old `ironmem gemini` launcher left in
+  `~/.gemini/settings.json`. `--harness gemini`, `IRONMEM_HARNESS=gemini`
+  and a hidden `ironmem gemini` resolve to `agy` and print a deprecation
+  notice, and an MCP client whose name contains `gemini` is attributed to
+  `agy`. The bare name `agy` is matched only as an exact `--harness` or
+  `IRONMEM_HARNESS` value, not inside a client name.
 - **`/evaluate-issue` reads the gate config with `ironmem autopilot status`
   (#420).** It needs an `ironmem` on `PATH` that has `status`, and reports a
   failed read without one. Its `onboard` and `approve` fix lines carry
@@ -155,6 +183,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/install-ironmem.sh` no longer replaces a symlinked config or
+  changes its mode (#435).** A JSON harness config it rewrites
+  (`~/.claude.json`, Muse's `settings.json`, Antigravity's `mcp_config.json`
+  and `hooks.json`) is written through its symlinks, so the link survives,
+  and keeps its existing mode; before, the rewrite replaced the link with a
+  plain file and left it 0600. A config the installer creates starts 0600,
+  because these files can hold other MCP servers' tokens. A dangling or
+  looping symlinked config gets a warning and that harness is skipped, and a
+  read-only (0400) config is left unchanged with a warning. The launchers'
+  own config writer (`ironmem agy` / `ironmem claude` / `ironmem codex` MCP
+  setup) now does the same: it writes a symlinked config's target in place
+  with its mode kept, and refuses a dangling link instead of creating its
+  target.
 - **A tool that changes its process group while Autopilot enrols it no longer
   fails the invocation (#403).** The process tracker reads a new descendant
   from the kernel twice and refused it if anything differed, the process

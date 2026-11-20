@@ -47,7 +47,7 @@ Muse is one registered harness in the `REGISTRY` constant
   (measured: `muse --help` runs, 1.0.2).
 - **`rules_file`**: `"MUSE.md"` — the target for `ironmem write-rules --harness muse`.
 - **`rules_strategy`**: `"import"` (`@AGENTS.md`) — `MUSE.md` is written with
-  the canonical-block import directive, mirroring Grok/Gemini.
+  the canonical-block import directive, mirroring Claude/Grok.
 - **`client_info_aliases`**: `["tbh"]` — substring matched against
   `initialize.clientInfo.name` to attribute MCP sessions (measured live:
   the wire name is `"tbh"`).
@@ -61,7 +61,7 @@ Muse is one registered harness in the `REGISTRY` constant
   Muse yet (scaffolding default).
 - **`transcript_parser`**: `None` — no transcript format is known for Muse
   yet (scaffolding default).
-- **`write_rules_default`**: `false` — scaffolding, like Grok/Gemini: Muse is
+- **`write_rules_default`**: `false` — scaffolding, like Grok/Antigravity: Muse is
   not yet a default `write-rules` target.
 
 Run `ironmem harnesses --format=json` to inspect the current registry at any

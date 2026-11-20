@@ -1,7 +1,9 @@
 //! Packaging coverage checker for the harness registry.
 //!
 //! Every entry in `REGISTRY` must have a corresponding plugin root directory
-//! at `.<id>-plugin/` in the repo root, containing three required assets.
+//! at `.<id>-plugin/` in the repo root, containing its required assets — and,
+//! for a harness whose hooks the installer wires instead
+//! (`plugin_ships_hooks: false`), no hook wiring at all.
 //! [`check_packaging_coverage`] enforces this invariant and is exercised by
 //! the drift-lint tests below — a registry addition without matching packaging
 //! causes an immediate build-test failure.
@@ -10,7 +12,15 @@ use super::HarnessSpec;
 use std::path::Path;
 
 /// Required assets inside each harness plugin root.
-const REQUIRED_ASSETS: &[&str] = &["bin/ironmem-mcp.sh", "hooks/ironmem-hook.sh", "plugin.json"];
+const REQUIRED_ASSETS: &[&str] = &["bin/ironmem-mcp.sh", "plugin.json"];
+
+/// The plugin's hook wrapper, required when the spec's `plugin_ships_hooks`.
+const HOOK_ASSET: &str = "hooks/ironmem-hook.sh";
+
+/// Hook wiring a plugin must NOT carry when its hooks come from the
+/// installer: the wrapper directory and a native `hooks.json` (the file
+/// Antigravity loads from a plugin root).
+const FORBIDDEN_WHEN_INSTALLER_HOOKS: &[&str] = &["hooks", "hooks.json"];
 
 /// Check that every registered harness has its plugin root with required assets.
 ///
@@ -18,8 +28,11 @@ const REQUIRED_ASSETS: &[&str] = &["bin/ironmem-mcp.sh", "hooks/ironmem-hook.sh"
 /// `.<id>-plugin/` under `repo_root` and verifies that the following paths
 /// exist inside it:
 /// - `bin/ironmem-mcp.sh`
-/// - `hooks/ironmem-hook.sh`
 /// - `plugin.json`
+/// - `hooks/ironmem-hook.sh`, when `spec.plugin_ships_hooks`
+///
+/// When `spec.plugin_ships_hooks` is `false`, `hooks/` and `hooks.json` must
+/// be absent instead, so the plugin and the installer never both fire a hook.
 ///
 /// Returns `Ok(())` when every entry is fully packaged.
 /// Returns `Err(messages)` with one human-readable entry per missing root or
@@ -43,7 +56,8 @@ pub fn check_packaging_coverage(
             continue;
         }
 
-        for asset in REQUIRED_ASSETS {
+        let hook_asset = spec.plugin_ships_hooks.then_some(HOOK_ASSET);
+        for asset in REQUIRED_ASSETS.iter().copied().chain(hook_asset) {
             let asset_path = plugin_root.join(asset);
             if !asset_path.exists() {
                 missing.push(format!(
@@ -51,6 +65,18 @@ pub fn check_packaging_coverage(
                     spec.id,
                     asset_path.display()
                 ));
+            }
+        }
+        if !spec.plugin_ships_hooks {
+            for wiring in FORBIDDEN_WHEN_INSTALLER_HOOKS {
+                let path = plugin_root.join(wiring);
+                if path.exists() {
+                    missing.push(format!(
+                        "harness '{}': {} must not exist (its hooks come from scripts/install-ironmem.sh, so a plugin copy would fire them twice)",
+                        spec.id,
+                        path.display()
+                    ));
+                }
             }
         }
     }
@@ -83,7 +109,8 @@ mod tests {
             .to_path_buf()
     }
 
-    /// Production coverage: claude + codex are fully packaged today.
+    /// Production coverage: every registry harness is fully packaged, and agy
+    /// (installer-wired hooks) ships no hook wiring.
     #[test]
     fn packaging_coverage_passes_for_production_registry() {
         let root = repo_root();
@@ -95,10 +122,46 @@ mod tests {
         });
     }
 
+    /// A plugin root that still carries hook wiring fails for a harness whose
+    /// hooks the installer owns, and passes once the wiring is removed; the
+    /// same root with `plugin_ships_hooks: true` instead requires the wrapper.
+    #[test]
+    fn packaging_forbids_plugin_hooks_when_the_installer_owns_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".zeta-plugin");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        std::fs::write(root.join("bin/ironmem-mcp.sh"), "").unwrap();
+        std::fs::write(root.join("plugin.json"), "{}").unwrap();
+        std::fs::write(root.join("hooks.json"), "{}").unwrap();
+        let mcp_only = HarnessSpec {
+            id: "zeta",
+            plugin_ships_hooks: false,
+            installer_registers: false,
+            ..REGISTRY[0]
+        };
+
+        let errs = check_packaging_coverage(dir.path(), &[mcp_only]).unwrap_err();
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        assert!(errs[0].contains("hooks.json must not exist"), "{errs:?}");
+
+        std::fs::remove_file(root.join("hooks.json")).unwrap();
+        check_packaging_coverage(dir.path(), &[mcp_only]).expect("MCP-only root passes");
+
+        let with_hooks = HarnessSpec {
+            plugin_ships_hooks: true,
+            installer_registers: false,
+            ..mcp_only
+        };
+        let errs = check_packaging_coverage(dir.path(), &[with_hooks]).unwrap_err();
+        assert!(
+            errs.iter().any(|e| e.contains("hooks/ironmem-hook.sh")),
+            "{errs:?}"
+        );
+    }
+
     /// Synthetic-failure: adding an unpackaged harness (one with no matching
     /// `.<id>-plugin/` root) must produce a non-empty Err list naming it.
-    /// Uses a placeholder id rather than "gemini" — gemini is now a REAL
-    /// registered harness with real (if minimal) packaging (#190 Task 11).
+    /// Uses a placeholder id that is guaranteed absent from the repo root.
     #[test]
     fn packaging_coverage_fails_for_unpackaged_synthetic_harness() {
         const UNPACKAGED_SPEC: HarnessSpec = HarnessSpec {
@@ -115,6 +178,11 @@ mod tests {
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: crate::harness::HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         let claude = REGISTRY.iter().find(|s| s.id == "claude").copied().unwrap();

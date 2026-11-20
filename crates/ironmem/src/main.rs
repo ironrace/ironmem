@@ -58,11 +58,11 @@ enum Commands {
         #[arg(long)]
         wing: Option<String>,
     },
-    /// Run a hook (called by Claude Code / Codex)
+    /// Run a hook (called by Claude Code / Codex / Antigravity)
     Hook {
         /// Hook name: stop, precompact, session-start, user-prompt-submit
         name: String,
-        /// Harness: claude-code, codex
+        /// Harness: claude-code, codex, agy
         #[arg(long, default_value = "claude-code")]
         harness: String,
     },
@@ -249,12 +249,35 @@ enum Commands {
         #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
         budget: usize,
     },
-    /// Launch Gemini CLI in a repo with the ironmem MCP server attached
+    /// Launch Antigravity CLI (agy) in a repo with the ironmem MCP server attached
+    Agy {
+        /// Repository path to launch in
+        #[arg(default_value = ".")]
+        path: String,
+        /// Optional initial prompt for the session (passed via `agy -i <prompt>`)
+        prompt: Option<String>,
+        /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
+        #[arg(long)]
+        no_mcp_setup: bool,
+        /// Code-map area to pre-inject context for (repeatable)
+        #[arg(long = "area")]
+        areas: Vec<String>,
+        /// Disable compact context pre-injection into the initial prompt
+        #[arg(long)]
+        no_context: bool,
+        /// Approximate token budget for pre-injected context
+        #[arg(long, default_value_t = ironmem::context::DEFAULT_BUDGET_TOKENS)]
+        budget: usize,
+    },
+    /// Deprecated alias of `agy`: Gemini CLI was replaced by Antigravity.
+    /// Prints a deprecation notice and runs `ironmem agy` with the same
+    /// arguments.
+    #[command(hide = true)]
     Gemini {
         /// Repository path to launch in
         #[arg(default_value = ".")]
         path: String,
-        /// Optional initial prompt for the session
+        /// Optional initial prompt for the session (passed via `agy -i <prompt>`)
         prompt: Option<String>,
         /// Skip ensuring the ironmem MCP server is registered (use existing manual setup)
         #[arg(long)]
@@ -1633,6 +1656,12 @@ fn print_lead_report(report: &ironmem::autopilot::lead::LeadReport) {
 /// repo shows up in that repo's `git status` and in every glob a build script
 /// runs, so Autopilot's checkouts sit beside the database instead, under the
 /// same `~/.ironrace-memory` base directory `Config` already owns.
+/// The one-line stderr notice `ironmem gemini` prints before running
+/// `ironmem agy`.
+fn gemini_subcommand_notice() -> &'static str {
+    "ironmem: warning: `ironmem gemini` is deprecated: Gemini CLI was replaced by Antigravity; running `ironmem agy` instead"
+}
+
 fn default_worktree_root() -> Result<std::path::PathBuf, MemoryError> {
     let home = dirs::home_dir()
         .ok_or_else(|| MemoryError::Config("Cannot determine home directory".into()))?;
@@ -1862,8 +1891,12 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
         }
         Commands::Hook { name, harness } => {
             let cfg = config::Config::load(None)?;
-            let response = ironmem::hook::run_hook(&name, &harness, cfg)?;
-            println!("{}", serde_json::to_string_pretty(&response)?);
+            // A retired name (`gemini`) runs as the harness it now means, so
+            // the diary and metrics record that id, not the old one.
+            let harness =
+                ironmem::harness::replace_deprecated_alias(&harness, ironmem::harness::REGISTRY);
+            let response = ironmem::hook::run_hook(&name, harness, cfg)?;
+            println!("{}", ironmem::hook::format_hook_output(&response)?);
             Ok(())
         }
         Commands::Report {
@@ -1979,7 +2012,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 budget_tokens: budget,
             },
         ),
-        Commands::Gemini {
+        Commands::Agy {
             path,
             prompt,
             no_mcp_setup,
@@ -1987,7 +2020,7 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
             no_context,
             budget,
         } => launcher::run_launcher(
-            launcher::Harness::Gemini,
+            launcher::Harness::Agy,
             &path,
             prompt,
             launcher::LaunchOptions {
@@ -1997,6 +2030,27 @@ async fn run(cli: Cli) -> Result<(), MemoryError> {
                 budget_tokens: budget,
             },
         ),
+        Commands::Gemini {
+            path,
+            prompt,
+            no_mcp_setup,
+            areas,
+            no_context,
+            budget,
+        } => {
+            eprintln!("{}", gemini_subcommand_notice());
+            launcher::run_launcher(
+                launcher::Harness::Agy,
+                &path,
+                prompt,
+                launcher::LaunchOptions {
+                    no_mcp_setup,
+                    no_context,
+                    areas,
+                    budget_tokens: budget,
+                },
+            )
+        }
         Commands::Muse {
             path,
             prompt,
@@ -4784,7 +4838,7 @@ mod tests {
             } else {
                 args.extend(["--repo", "owner/repo=/tmp/repo"]);
             }
-            args.extend(["--implementer", "gemini"]);
+            args.extend(["--implementer", "zeta"]);
             let err = Cli::try_parse_from(args)
                 .err()
                 .expect("unknown implementer must be rejected")
@@ -4793,6 +4847,48 @@ mod tests {
             assert!(err.contains("codex"), "got: {err}");
             assert!(err.contains("muse"), "got: {err}");
         }
+    }
+
+    /// `ironmem gemini` is a hidden, deprecated alias of `ironmem agy`: it
+    /// takes agy's arguments, is absent from `--help`, and its notice names
+    /// the replacement on one line.
+    #[test]
+    fn gemini_subcommand_is_a_hidden_deprecated_alias_of_agy() {
+        use clap::CommandFactory;
+
+        let cli = Cli::try_parse_from([
+            "ironmem",
+            "gemini",
+            "/tmp/repo",
+            "fix it",
+            "--no-mcp-setup",
+            "--no-context",
+        ])
+        .expect("`ironmem gemini` must still parse");
+        match cli.command {
+            Commands::Gemini {
+                path,
+                prompt,
+                no_mcp_setup,
+                no_context,
+                ..
+            } => {
+                assert_eq!(path, "/tmp/repo");
+                assert_eq!(prompt.as_deref(), Some("fix it"));
+                assert!(no_mcp_setup);
+                assert!(no_context);
+            }
+            _ => panic!("expected Commands::Gemini"),
+        }
+        let help = Cli::command().render_help().to_string();
+        assert!(help.contains("agy"), "{help}");
+        assert!(!help.contains("gemini"), "hidden from help: {help}");
+        let notice = gemini_subcommand_notice();
+        assert!(!notice.contains('\n'), "{notice}");
+        assert!(
+            notice.contains("deprecated") && notice.contains("ironmem agy"),
+            "{notice}"
+        );
     }
 
     #[test]

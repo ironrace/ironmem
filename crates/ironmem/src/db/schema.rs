@@ -1712,7 +1712,7 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         assert_eq!(schema_version_of(&db), LATEST_SCHEMA_VERSION);
 
-        for harness in &["gemini", "grok-2", "grok-ai", "grok_ai", "copilot4"] {
+        for harness in &["zeta", "grok-2", "grok-ai", "grok_ai", "copilot4"] {
             db.conn
                 .execute(
                     "INSERT INTO token_usage

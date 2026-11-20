@@ -1,4 +1,4 @@
-//! Validate plugin metadata files for Codex, Claude Code, and Muse.
+//! Validate plugin metadata files for Codex, Claude Code, Antigravity, and Muse.
 //!
 //! Ensures required JSON fields are present and plugin versions stay in sync
 //! with the crate version in Cargo.toml.
@@ -604,7 +604,7 @@ fn plugin_versions_match_cargo_toml() {
         ".claude-plugin",
         ".muse-plugin",
         ".grok-plugin",
-        ".gemini-plugin",
+        ".agy-plugin",
     ] {
         let manifest = read_json(&format!("{dir}/plugin.json"));
         let version = manifest["version"].as_str().unwrap_or("");
@@ -616,11 +616,140 @@ fn plugin_versions_match_cargo_toml() {
 }
 
 #[test]
+fn agy_plugin_manifest_and_mcp_config_have_required_fields() {
+    // Native Antigravity plugin shape: `plugin.json` carries metadata only (no
+    // Claude-style top-level `mcpServers` or `interface` keys, which `agy
+    // plugin validate` flags as ignored), and MCP servers live in the sibling
+    // `mcp_config.json`.
+    let manifest = read_json(".agy-plugin/plugin.json");
+    assert_eq!(
+        manifest["name"].as_str().unwrap_or(""),
+        "ironmem",
+        "agy plugin.json: missing name"
+    );
+    assert!(
+        manifest["version"].is_string(),
+        "agy plugin.json: missing version"
+    );
+    assert!(
+        manifest.get("mcpServers").is_none(),
+        "agy plugin.json: MCP servers belong in .agy-plugin/mcp_config.json, not plugin.json"
+    );
+    assert!(
+        manifest.get("interface").is_none(),
+        "agy plugin.json: unknown 'interface' field is ignored by agy plugin validate"
+    );
+
+    let mcp = read_json(".agy-plugin/mcp_config.json");
+    let server = &mcp["mcpServers"]["ironmem"];
+    assert!(
+        server.is_object(),
+        "agy mcp_config.json: missing 'mcpServers.ironmem' object"
+    );
+    // agy's documented plugin MCP form: `${PLUGIN_ROOT}` (expanded in `args`)
+    // makes the script path absolute, so it can never resolve against the
+    // opened workspace — older agy builds (before 1.1.28, per its changelog)
+    // resolved a relative plugin MCP command against the wrong directory.
+    assert_eq!(
+        server["command"].as_str(),
+        Some("bash"),
+        "agy mcp_config.json: command must be bash"
+    );
+    assert_eq!(
+        server["args"],
+        serde_json::json!(["${PLUGIN_ROOT}/bin/ironmem-mcp.sh", "serve"]),
+        "agy mcp_config.json: expected the ${{PLUGIN_ROOT}} wrapper path and 'serve'"
+    );
+    let wrapper = workspace_root().join(".agy-plugin/bin/ironmem-mcp.sh");
+    assert!(
+        wrapper.is_file(),
+        "agy mcp_config.json: referenced wrapper script must exist"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&wrapper).unwrap().permissions().mode();
+        assert_ne!(mode & 0o111, 0, "agy wrapper must be executable");
+    }
+
+    // agy starts a plugin's MCP server in the plugin's own directory, so the
+    // wrapper's `$PWD`-derived workspace root would be the plugin folder (or
+    // the ironmem checkout when loaded in place), and a trusted `serve` would
+    // mine it. A whitespace-only value is non-empty to the wrapper's
+    // `${IRONMEM_WORKSPACE_ROOT:-...}` (so its fallback never runs) and blank
+    // to `bootstrap::resolve_workspace_root` (which trims it to "no root").
+    let root = server["env"]["IRONMEM_WORKSPACE_ROOT"]
+        .as_str()
+        .expect("agy mcp_config.json: env.IRONMEM_WORKSPACE_ROOT must be set");
+    assert!(
+        !root.is_empty() && root.trim().is_empty(),
+        "agy mcp_config.json: IRONMEM_WORKSPACE_ROOT must be whitespace only, got {root:?}"
+    );
+    assert!(
+        read_text(".agy-plugin/bin/ironmem-mcp.sh")
+            .contains(r#"export IRONMEM_WORKSPACE_ROOT="${IRONMEM_WORKSPACE_ROOT:-"#),
+        "agy wrapper must keep a pre-set IRONMEM_WORKSPACE_ROOT"
+    );
+}
+
+/// Antigravity's hooks have ONE source: `scripts/install-ironmem.sh` writes
+/// the `ironmem` group into the global `~/.gemini/config/hooks.json`. agy
+/// merges hook groups from every plugin and config and runs them all, so a
+/// plugin copy would run every hook twice per event (two Stop-time mines,
+/// two diary rows, the recall block injected twice).
+#[test]
+fn agy_plugin_ships_no_hooks_and_the_installer_wires_them() {
+    let plugin = workspace_root().join(".agy-plugin");
+    for wiring in ["hooks.json", "hooks"] {
+        assert!(
+            !plugin.join(wiring).exists(),
+            ".agy-plugin/{wiring} must not exist: the installer owns agy hooks"
+        );
+    }
+    let manifest = read_json(".agy-plugin/plugin.json");
+    assert!(
+        manifest.get("hooks").is_none(),
+        "agy plugin.json: must not point at a hooks file"
+    );
+    assert!(
+        !workspace_root().join(".gemini-plugin").exists(),
+        ".gemini-plugin was replaced by .agy-plugin"
+    );
+
+    // The group the installer writes, scoped to the function that builds it
+    // (the manual-fallback `echo` elsewhere in the script also spells these
+    // commands, and must not satisfy this check on its own). Each agy event
+    // must run the matching ironmem hook as harness agy.
+    let installer = read_text("scripts/install-ironmem.sh");
+    let group = installer
+        .split("\nagy_hooks_group() {\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("scripts/install-ironmem.sh: missing agy_hooks_group()");
+    for (event, var, hook) in [
+        ("SessionStart", "start", "session-start"),
+        ("PreInvocation", "pre", "user-prompt-submit"),
+        ("Stop", "stop", "stop"),
+    ] {
+        let arg = format!("--arg {var} \"$mode_prefix $target_word hook {hook} --harness agy\"");
+        assert!(
+            group.contains(&arg),
+            "agy_hooks_group must build `{arg}`:\n{group}"
+        );
+        let wiring = format!("{event}: [{{type: \"command\", command: ${var}");
+        assert!(
+            group.contains(&wiring),
+            "agy_hooks_group must wire {event} to ${var}:\n{group}"
+        );
+    }
+}
+
+#[test]
 fn muse_plugin_manifest_has_required_fields() {
     // Structural pin for the muse NATIVE manifest: `schemaVersion` plus a
     // `compat` block and `capabilities` arrays, not the Claude-style
-    // top-level `mcpServers` object the Gemini/Grok stand-in convention
-    // used. The contract is measured, not guessed — it is what
+    // top-level `mcpServers` object the Grok stand-in (and the retired
+    // `.gemini-plugin`) used. The contract is measured, not guessed — it is what
     // `muse plugins validate` accepts (see docs/MUSE.md) — so this test
     // pins that shape: the four iron skills must be declared and present,
     // the MCP server must carry its exact stdio argv, and the retired

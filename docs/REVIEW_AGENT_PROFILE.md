@@ -37,10 +37,10 @@ enforced in each harness's own agent tool-allowlist instead.
 |---|---|---|
 | Claude Code | `tools:` allowlist in `.claude-plugin/agents/*.md` frontmatter | Enforced. Guarded by `crates/ironmem/tests/plugin_metadata.rs::claude_review_agents_advertise_lean_profile`. |
 | Codex | MCP servers are global in `$CODEX_HOME/config.toml`; the installer does not modify agent configs, so per-agent MCP scoping is not ironmem-controllable. | Mitigated: the reviewer brief instructs the agent not to call memory tools; #190's thin proxies make the attached surface cheap (N proxies, not N servers). |
-| Grok / Gemini | Plugin-wide `mcpServers` only; no review agents defined yet. | Deferred: apply this profile when review agents are added; #190 keeps the cost negligible until then. |
+| Grok / Antigravity (`agy`) | Plugin-wide `mcpServers` only; no review agents defined yet. | Deferred: apply this profile when review agents are added; #190 keeps the cost negligible until then. |
 
 ## Related
 
 - #189 — this profile.
 - #190 — shared-daemon mode; removes the process-count motivation and backs the
-  Codex/Grok/Gemini "rely on cheap proxies" fallback.
+  Codex/Grok/Antigravity "rely on cheap proxies" fallback.

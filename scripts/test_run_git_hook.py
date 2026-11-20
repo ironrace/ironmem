@@ -691,7 +691,7 @@ def test_is_inert_config_path_rejects_non_matching_extension_outside_declared_di
 def test_is_gate_covered_plugin_path_matches_known_plugin_roots():
     assert manifest.is_gate_covered_plugin_path(".claude-plugin/plugin.json") is True
     assert manifest.is_gate_covered_plugin_path(".codex-plugin/hooks.json") is True
-    assert manifest.is_gate_covered_plugin_path(".gemini-plugin/plugin.json") is True
+    assert manifest.is_gate_covered_plugin_path(".agy-plugin/plugin.json") is True
     assert manifest.is_gate_covered_plugin_path(".grok-plugin/plugin.json") is True
 
 

@@ -150,7 +150,7 @@ use different config files or plugin layouts.
   registered harness has a corresponding `.<id>-plugin/` root with required
   wrapper assets.
 
-Adding a new harness (e.g. Gemini) starts with one `HarnessSpec` in `REGISTRY`;
+Adding a new harness (e.g. a hypothetical `zeta`) starts with one `HarnessSpec` in `REGISTRY`;
 the generic surfaces above pick up the shared metadata from there. The harness
 still needs its plugin root/assets, and any optional per-harness integration
 strategy such as launcher or doctor detection must be added explicitly.

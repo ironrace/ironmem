@@ -75,7 +75,7 @@ fn concurrent_mixed_harness_burst_all_succeed_on_one_shared_db() {
     const HARNESSES: &[(&str, &str)] = &[
         ("claude-code", "claude"),
         ("codex-cli", "codex"),
-        ("gemini", "gemini"),
+        ("antigravity", "agy"),
         ("some-other-tool", "claude"), // unrecognized -> falls back to claude
     ];
     const CLIENTS_PER_HARNESS: usize = 3;
