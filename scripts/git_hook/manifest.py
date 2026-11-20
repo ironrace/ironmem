@@ -170,7 +170,7 @@ def is_workflow_path(path: str) -> bool:
 
 
 # A harness plugin root -- `.claude-plugin/`, `.codex-plugin/`,
-# `.gemini-plugin/`, `.grok-plugin/`, and any future one -- is NOT an inert
+# `.agy-plugin/`, `.grok-plugin/`, `.muse-plugin/`, and any future one -- is NOT an inert
 # surface, even though its contents are JSON/shell/Markdown, the exact
 # formats `is_inert_config_path`/`is_docs_path` otherwise treat as unread.
 # `cargo test --workspace` reads every one of those formats inside a plugin

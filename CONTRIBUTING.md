@@ -170,7 +170,10 @@ if a registered harness lacks a `.{id}-plugin/` directory at the repo root.
 Create it with at minimum:
 
 - `bin/ironmem-mcp.sh` — wrapper that launches `ironmem serve`.
-- `hooks/ironmem-hook.sh` — wrapper that calls `ironmem hook <name> --harness <id>`.
+- `hooks/ironmem-hook.sh` — wrapper that calls `ironmem hook <name> --harness <id>`,
+  when the spec's `plugin_ships_hooks` is `true`. When it is `false` (the
+  installer writes the harness's hooks, as for Antigravity), the plugin must
+  have no `hooks/` and no `hooks.json`, so no hook fires twice.
 - `plugin.json` — plugin metadata (version must match `crates/ironmem/Cargo.toml`).
 
 Use `.claude-plugin/` and `.codex-plugin/` as reference implementations.

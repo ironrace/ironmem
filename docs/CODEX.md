@@ -30,10 +30,10 @@ Codex is one registered harness in the `REGISTRY` constant
   `codex-final` row per session, cached tokens subtracted from input).
 
 Run `ironmem harnesses --format=json` to inspect the current registry at any
-time. The registry also carries `grok`, `gemini`, and `muse` rows
-(`GROK.md`/`GEMINI.md`/`MUSE.md` via `@AGENTS.md` import,
-`write_rules_default: false`) — scaffolding for the `ironmem grok`/`ironmem
-gemini`/`ironmem muse` launchers, not yet default `write-rules` targets. See
+time. The registry also carries `grok`, `agy` (Antigravity), and `muse` rows
+(`GROK.md`/`MUSE.md` via `@AGENTS.md` import, `AGENTS.md` native for `agy`;
+all `write_rules_default: false`) — backing the `ironmem grok`/`ironmem
+agy`/`ironmem muse` launchers, not yet default `write-rules` targets. See
 [First run: one-command launchers](../README.md#first-run-one-command-launchers)
 in the main README.
 
@@ -124,15 +124,17 @@ The hooks are diff-aware:
   escalating a workflow edit would run cargo gates that cannot parse YAML.
   CI is its own backstop
 - a path under a harness plugin root (`.claude-plugin/`, `.codex-plugin/`,
-  `.gemini-plugin/`, `.grok-plugin/`, or any future `.<name>-plugin/`) is
+  `.agy-plugin/`, `.grok-plugin/`, `.muse-plugin/`, or any future `.<name>-plugin/`) is
   NOT inert, even though its content is JSON/shell/Markdown: `cargo test
   --workspace` reads `plugin.json`/`hooks.json`/`.mcp.json` and asserts
   `plugin.json`'s version matches `Cargo.toml` (`plugin_metadata.rs`),
   parses `hooks/hooks.json`'s `UserPromptSubmit` command (`hook.rs`),
-  requires the plugin's `bin/ironmem-mcp.sh` and `hooks/ironmem-hook.sh` to
-  exist (`packaging.rs`'s `REQUIRED_ASSETS` is a fixed literal list --
-  `bin/ironmem-mcp.sh`, `hooks/ironmem-hook.sh`, `plugin.json` -- identical
-  for every harness, never `<id>`-templated), and parses review-agent Markdown
+  requires the plugin's `bin/ironmem-mcp.sh` and `plugin.json` to exist
+  (`packaging.rs`'s `REQUIRED_ASSETS` is a fixed literal list, identical for
+  every harness, never `<id>`-templated), requires `hooks/ironmem-hook.sh`
+  when the registry's `plugin_ships_hooks` is `true` and forbids `hooks/` and
+  `hooks.json` when it is `false` (Antigravity, whose hooks the installer
+  writes), and parses review-agent Markdown
   frontmatter (`plugin_metadata.rs`'s lean-profile guard) -- so these paths
   escalate to running every gate declared for the phase, the same as any
   other gate-covered change
@@ -244,13 +246,14 @@ shape) and returns one of:
 `is_gate_covered_plugin_path` (checked first inside both `is_docs_path` and
 `is_inert_config_path`) matches any path whose leading `/`-split segment has
 the shape `.<name>-plugin` — `.claude-plugin`, `.codex-plugin`,
-`.gemini-plugin`, `.grok-plugin`, and any future one. Every one of those
+`.agy-plugin`, `.grok-plugin`, `.muse-plugin`, and any future one. Every one of those
 directories' JSON, shell assets, and agent Markdown is read by `cargo test
 --workspace` (`plugin_metadata.rs`'s `read_json`/
 `plugin_versions_match_cargo_toml`/`claude_review_agents_advertise_lean_
 profile`, `hook.rs`'s `hooks.json` parse, `packaging.rs`'s `REQUIRED_ASSETS`
-existence check for the literal `bin/ironmem-mcp.sh`,
-`hooks/ironmem-hook.sh`, and `plugin.json`), so a path inside one is
+existence check for the literal `bin/ironmem-mcp.sh` and `plugin.json`, plus
+`hooks/ironmem-hook.sh` when `plugin_ships_hooks` is `true` and the absence
+of `hooks/` and `hooks.json` when it is `false`), so a path inside one is
 gate-covered, not inert, and must classify
 `UNKNOWN` (escalate) instead. A look-alike segment like
 `.claude-plugin-backup` does not match — the check is a whole-segment

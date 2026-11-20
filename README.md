@@ -147,7 +147,7 @@ ironmem's core tools — `search`, `status`, the knowledge-graph tools (`kg_quer
 
 Some clients want only the inner object (the value under `"ironmem"`) rather than the full `mcpServers` wrapper — adapt to your client's config format. Use an absolute path to the installed binary (`~/.ironrace/bin/ironmem`), and keep `IRONMEM_MCP_MODE` set to `trusted` if you want the write tools.
 
-**Not available to generic clients.** The harness-driven automation listed under [Shared Memory Across Harnesses](#shared-memory-across-harnesses) — session-start memory injection, Stop/PreCompact mining, and UserPromptSubmit FTS injection — is wired into Claude Code and Codex specifically. A generic MCP client still gets the full read/search/write toolset on the shared store; it just won't fire those hooks automatically, which requires first-class harness support.
+**Not available to generic clients.** The harness-driven automation listed under [Shared Memory Across Harnesses](#shared-memory-across-harnesses) — session-start memory injection, Stop/PreCompact mining, and UserPromptSubmit FTS injection — is wired into Claude Code, Codex and Antigravity (`agy`, through the hooks `scripts/install-ironmem.sh` writes) specifically. A generic MCP client still gets the full read/search/write toolset on the shared store; it just won't fire those hooks automatically, which requires first-class harness support.
 
 Prebuilt macOS (arm64) and Linux (x86_64) binaries, with SHA-256 checksums, are attached to every [tagged release](https://github.com/ironrace/ironmem/releases).
 
@@ -206,30 +206,62 @@ ironmem claude .                       # launch Claude Code in the current repo
 ironmem codex .                        # launch Codex in the current repo
 ironmem claude . "fix the login bug"   # launch with an initial prompt
 ironmem codex /path/to/repo "add tests"
-ironmem gemini .                       # launch Gemini CLI in the current repo
+ironmem agy .                          # launch Antigravity CLI (`agy`) in the current repo
 ironmem grok .                         # launch Grok in the current repo (early scaffolding)
 ironmem muse .                         # launch Muse Code in the current repo (early scaffolding)
 ```
 
-`gemini`/`grok`/`muse` onboard from the same harness registry as
+`agy`/`grok`/`muse` onboard from the same harness registry as
 `claude`/`codex` (see [Current Status](#current-status)) but are newer and
-less battle-tested: Gemini CLI's config convention
-(`~/.gemini/settings.json`) is confirmed from its own docs, while Grok's
-(`~/.grok/settings.json`) is a best-effort default pending a single
-confirmed "the" Grok CLI MCP config convention. Muse Code shares Claude's
-object-shaped `mcpServers` in `$XDG_CONFIG_HOME/muse/settings.json` (else
-`~/.config/muse/settings.json`) — proven live on Muse Code 1.0.2, not the
+less battle-tested: Antigravity (`agy`)'s global MCP config
+(`~/.gemini/config/mcp_config.json`, Claude-shaped `mcpServers`) and
+interactive prompt flag (`agy -i <prompt>`) are verified live against `agy`
+(and `scripts/install-ironmem.sh` registers it alongside Claude, Codex, and
+Muse), while Grok's (`~/.grok/settings.json`) is a best-effort default pending
+a single confirmed "the" Grok CLI MCP config convention. Muse Code shares
+Claude's object-shaped `mcpServers` in `$XDG_CONFIG_HOME/muse/settings.json`
+(else `~/.config/muse/settings.json`) — proven live on Muse Code 1.0.2, not the
 array shape from the binary's embedded plugin-manifest docs (see
 [docs/MUSE.md](docs/MUSE.md)). None of the three is a default `write-rules`
-target yet.
+target yet (`agy` natively reads `AGENTS.md`).
+
+Antigravity's lifecycle hooks (`SessionStart`, `PreInvocation`, `Stop`) come
+from `scripts/install-ironmem.sh`, not from the plugin. When `agy` resolves
+on `PATH` (set `AGY_BIN` to look for a different name; default `agy`; it is
+only looked up, never run), the installer writes the `ironmem` MCP entry to
+`~/.gemini/config/mcp_config.json` and an `ironmem` hook group to
+`~/.gemini/config/hooks.json`, leaving other hook groups untouched. Without
+`agy` it writes neither file. SessionStart and Stop get a 120 s timeout,
+because a first bootstrap or a Stop-time mine of a large repo can outlast
+agy's 30 s default; PreInvocation keeps that default. Each hook runs with the
+`IRONMEM_MCP_MODE` set in the agy MCP entry's `env`, or, when the entry sets
+none, `${IRONMEM_MCP_MODE:-trusted}` expanded when the hook runs. The mode is
+written into the hook commands, so after changing it re-run the installer with
+`--force-wiring`. `--skip-wiring` skips both files. A re-run without
+`--force-wiring` only fills in missing events or timeouts; `--force-wiring`
+replaces the three `ironmem` events when they differ from the bundled ones,
+keeping the group's other keys, such as `"enabled": false`. The `.agy-plugin`
+plugin ships the MCP server only, with no hooks, so hooks never fire twice.
+When the installer rewrites a JSON harness config (`~/.claude.json`, Muse's
+`settings.json`, Antigravity's `mcp_config.json` and `hooks.json`), it writes
+through any symlinks, so a dotfile linked into another repo stays a link, and
+keeps the file's mode. A config it creates starts 0600, because these files
+can hold other MCP servers' tokens. A dangling or looping symlink gets a
+warning and that harness is skipped; a read-only (0400) config is left
+unchanged with a warning. The launchers' MCP setup writes configs the same
+way, and refuses a dangling symlink rather than creating its target.
+`agy` does not discover `.agy-plugin/` from the repo root, so install the
+plugin from that subdirectory: `agy plugin install <checkout>/.agy-plugin`.
+`gemini` is a deprecated alias of `agy`.
 
 Each launcher:
 
 1. Canonicalizes the repo path and validates that it exists.
-2. Validates that the target assistant (`claude` / `codex`) is on your `PATH`,
-   and prints a clear error if it is not.
+2. Validates that the target assistant (`claude`, `codex`, `agy`, `grok` or
+   `muse`) is on your `PATH`, and prints a clear error if it is not.
 3. Ensures the ironmem MCP server is registered for that assistant
-   (idempotent — existing manual setup is preserved untouched).
+   (idempotent — existing manual setup is preserved untouched). `ironmem agy`
+   registers the MCP server only; Antigravity's hooks come from the installer.
 4. Warms the repo into memory on a best-effort basis (a warm failure is logged
    but does not block launch — the assistant's own MCP server bootstraps on
    `serve`).
@@ -473,8 +505,8 @@ args = ["serve", "--connect", "/absolute/path/to/.ironrace-memory/hook_state/dae
 IRONMEM_MCP_MODE = "trusted"
 ```
 
-`ironmem claude`, `ironmem codex`, `ironmem gemini`, `ironmem grok`, and
-`ironmem muse` (the last three are early scaffolding — see
+`ironmem claude`, `ironmem codex`, `ironmem agy`, `ironmem grok`, and
+`ironmem muse` (the last three are newer/scaffolding — see
 [Current Status](#current-status))
 already write this for you idempotently. A pre-existing bare `["serve"]`
 entry from before this feature is upgraded in place the next time you run the
@@ -609,10 +641,19 @@ the first `[FAIL]`:
 - **`database` schema behind** (a `[WARN]`) → harmless; migrations apply
   automatically the next time the server starts.
 - **`harness_*` not registered** (a `[WARN]`) → run `scripts/install-ironmem.sh`
-  to register the MCP server with Claude Code, Codex and/or Muse Code. If a
+  to register the MCP server with Claude Code, Codex, Muse Code and/or
+  Antigravity (`agy`, only when it is on `PATH`). If a
   harness config is reported **unreadable** or **malformed** (also a `[WARN]`),
   fix the file by hand (permissions/encoding, or the JSON/TOML syntax) before
   re-registering.
+- **`agy_hooks`** (a `[WARN]` when `~/.gemini/config/hooks.json` has no
+  `ironmem` group, a disabled one, or one missing a SessionStart,
+  PreInvocation or Stop hook) → re-run `scripts/install-ironmem.sh` with `agy`
+  on `PATH`; for a disabled group, remove `"enabled": false` from it.
+- **`gemini_cli_legacy`** (a `[WARN]`) → an `ironmem` MCP entry the old
+  `ironmem gemini` launcher left in `~/.gemini/settings.json`. Register for
+  Antigravity with `ironmem agy` or the installer, then delete
+  `mcpServers.ironmem` from that file.
 - **`hooks` warning** (a `[WARN]`) → the plugin's four hooks (SessionStart,
   UserPromptSubmit, Stop, PreCompact) are not all wired and working. The line
   says which case it is, and the hint on the line beneath says what to do for
@@ -767,8 +808,10 @@ Codex's config location honors `CODEX_HOME` (default `~/.codex/config.toml`);
 Claude Code's is `~/.claude.json`; Muse Code's is `$XDG_CONFIG_HOME/muse/settings.json`,
 falling back to `~/.config/muse/settings.json` when that variable is unset or
 empty. Muse's entry is registered as `"mode": "optional"` so an ironmem binary
-that later moves cannot abort a Muse session at startup. `doctor` reports each
-harness independently, so you do **not** need all three installed.
+that later moves cannot abort a Muse session at startup. Antigravity's is
+`~/.gemini/config/mcp_config.json`, which ignores `XDG_CONFIG_HOME`. `doctor`
+reports each harness independently, so you do **not** need all of them
+installed.
 
 ### `ironmem context`
 
@@ -937,7 +980,8 @@ AI agents can query the graph without a shell.
 - `~/.ironrace/bin/ironmem` is the preferred installed binary location; plugin launch scripts check there first
 - Bounded Claude↔Codex collaboration protocol (v1 planning + v3 coding) is available via the `collab_*` MCP tools. Long-poll `wait_my_turn` wakes on actionable state changes and returns compact `{"unchanged": true}` only after an idle timeout — see [docs/COLLAB.md](docs/COLLAB.md)
 - **Shared daemon mode** (`serve --listen`/`--connect`) lets many clients share one `App`/DB/embedding-model behind a Unix socket, with automatic single-flight spawn-on-demand and idle self-shutdown — see [Shared Daemon Mode](#shared-daemon-mode). Bare `serve` is unchanged and remains the always-available fallback.
-- **Grok and Gemini CLI** are registered harnesses (`ironmem grok`/`ironmem gemini`, `harness_grok`/`harness_gemini` in `doctor`) but are scaffolding: neither is a default `write-rules` target yet, and Grok's MCP config convention is a best-effort default rather than a confirmed one — see [First run: one-command launchers](#first-run-one-command-launchers)
+- **Antigravity (`agy`)** is a registered harness (`ironmem agy`, `harness_agy` in `doctor`, native `.agy-plugin/` manifest + `mcp_config.json`, MCP server only, no hooks) with verified-live MCP wiring in `~/.gemini/config/mcp_config.json`, lifecycle hooks (`SessionStart`, `PreInvocation`, `Stop`) wired into `~/.gemini/config/hooks.json` by `scripts/install-ironmem.sh` when `agy` is on `PATH` (emitting Antigravity protojson `injectSteps` / `Stop` payloads), `-i <prompt>` launch arg support, and `AGENTS.md` native rules strategy — not yet a default `write-rules` target
+- **Grok** is a registered harness (`ironmem grok`, `harness_grok` in `doctor`) as early scaffolding: not a default `write-rules` target yet, and its MCP config convention (`~/.grok/settings.json`) is a best-effort default rather than a confirmed one — see [First run: one-command launchers](#first-run-one-command-launchers)
 - **Muse Code** is a registered harness (`ironmem muse`, `harness_muse` in `doctor`) with a proven-live config path (`$XDG_CONFIG_HOME`-aware) and object-shaped `mcpServers` writer, plus the four `iron-*` skills installed into its managed skills store — but the rest is scaffolding: it is not a default `write-rules` target, the packaged hook script is inert (nothing invokes it), and installing the repo as a plugin is unsupported — see [docs/MUSE.md](docs/MUSE.md)
 
 ## Shared Memory Across Harnesses
@@ -1245,7 +1289,7 @@ session.
 | `IRONMEM_METRICS` | (unset, on) | Global kill switch. Set to `0`, `false`, `no`, or `off` to disable all metric writes. Any other value (including `1`) leaves metrics enabled. |
 | `IRONMEM_CONTEXT_WINDOW` | `200000` | Occupancy denominator (tokens). Non-positive/unparseable values fall back to the default. Set to the harness's effective window for accurate `occupancy_pct`. |
 | `IRONMEM_SESSION_ID` | (unset) | Override seam that pins the harness session id for `session_summary` co-keying when the MCP `initialize` request does not carry one. Primarily for testing. |
-| `IRONMEM_HARNESS` | (unset) | Override seam pinning metrics harness attribution to `claude` or `codex` (otherwise learned from `initialize.clientInfo`). Primarily for testing. |
+| `IRONMEM_HARNESS` | (unset) | Override seam pinning metrics harness attribution to a registered harness such as `claude`, `codex` or `agy` (`antigravity` also resolves to `agy`; `gemini` is a deprecated alias of `agy` and prints a deprecation notice), otherwise learned from `initialize.clientInfo` (a client name containing `antigravity` or `gemini` counts as `agy`). Primarily for testing. |
 
 ### MCP response compaction (off by default)
 

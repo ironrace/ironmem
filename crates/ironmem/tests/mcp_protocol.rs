@@ -2273,7 +2273,7 @@ fn collab_start_rejects_invalid_implementer() {
             "repo_path": "/repo",
             "branch": "main",
             "initiator": "claude",
-            "implementer": "gemini"
+            "implementer": "zeta"
         }),
     );
     assert!(
@@ -2496,11 +2496,11 @@ fn collab_start_rejects_invalid_pilot_and_creates_no_session_row() {
             "repo_path": "/repo",
             "branch": "main",
             "initiator": "claude",
-            "pilot": "gemini"
+            "pilot": "zeta"
         }),
     );
     assert!(
-        err.contains("pilot") && err.contains("gemini"),
+        err.contains("pilot") && err.contains("zeta"),
         "expected an error naming both the field and the bad value, got: {err}"
     );
 

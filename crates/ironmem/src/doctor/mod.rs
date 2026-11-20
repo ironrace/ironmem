@@ -122,6 +122,14 @@ fn run_doctor_in(cfg: &Config, home: Option<&Path>, process_mode: Option<&str>) 
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         crate::harness::REGISTRY,
     ));
+    checks.push(agy_hooks_check(home));
+    checks.push(gemini_cli_legacy_check(home));
+    note_agy_installer_overrides(
+        &mut checks,
+        home,
+        std::env::var_os("AGY_CONFIG_JSON").as_deref(),
+        std::env::var_os("AGY_HOOKS_JSON").as_deref(),
+    );
     checks.extend(hooks::claude_hook_checks(home, process_mode));
     checks.push(mined::check_mined_rows(
         &cfg.db_path,
@@ -215,14 +223,15 @@ fn autospawn_check(cfg: &Config) -> Check {
 ///
 /// Detection strategy is dispatched per harness `id`:
 /// - `"codex"` → line-match TOML via `codex_config_path`.
-/// - `"claude"`, `"gemini"`, `"grok"`, `"muse"` → one shared JSON parse
+/// - `"claude"`, `"agy"`, `"grok"`, `"muse"` → one shared JSON parse
 ///   ([`detect_json_mcpservers`]) of the file
 ///   [`crate::launcher::json_mcpservers_config_path_for`] resolves for the
 ///   id — the same table the launcher writes through — matching the
 ///   `mcpServers` OBJECT for an `"ironmem"` entry. Muse's object shape is
 ///   proven live on Muse Code 1.0.2 (`muse exec` completes `initialize` +
 ///   `tools/list` on it, while an array-shaped `mcpServers` is silently
-///   ignored); Gemini's is documented; Grok's is best-effort (see the
+///   ignored); Antigravity's (`~/.gemini/config/mcp_config.json`) is verified
+///   live via `agy mcp add`/`agy mcp list`; Grok's is best-effort (see the
 ///   resolver). ironmem reads and writes only the `mcpServers` key.
 /// - Any other id → an `Info` check noting detection is not yet implemented.
 ///
@@ -252,7 +261,7 @@ fn harness_checks(
                 "claude" => "harness_claude",
                 "codex" => "harness_codex",
                 "grok" => "harness_grok",
-                "gemini" => "harness_gemini",
+                "agy" => "harness_agy",
                 "muse" => "harness_muse",
                 other => Box::leak(format!("harness_{other}").into_boxed_str()),
             };
@@ -277,7 +286,7 @@ fn harness_checks(
                     }
                     None => skipped(),
                 },
-                "claude" | "gemini" | "grok" | "muse" => {
+                "claude" | "agy" | "grok" | "muse" => {
                     let path = crate::launcher::json_mcpservers_config_path_for(
                         spec.id,
                         home.map(Path::to_path_buf),
@@ -287,22 +296,8 @@ fn harness_checks(
                         Some(path) => {
                             let (state, wired) = detect_json_mcpservers(&path);
                             let check = harness_check(key, spec.display_name, &path, state.clone());
-                            // scripts/install-ironmem.sh wires Claude, Codex
-                            // and Muse. Muse therefore has two ways back to a
-                            // registration and the script is the one that also
-                            // refreshes the binary, so it leads. Gemini and Grok
-                            // have no script coverage at all and point at their
-                            // launcher, which is their only route.
-                            let check = if state == HarnessState::NotRegistered && spec.id != "claude"
-                            {
-                                check.with_hint(if spec.id == "muse" {
-                                    "re-run scripts/install-ironmem.sh to register it (`ironmem muse` also registers, but needs the muse binary on PATH and then launches a session)".to_string()
-                                } else {
-                                    format!(
-                                        "run `ironmem {}` to register it (scripts/install-ironmem.sh covers Claude, Codex and Muse)",
-                                        spec.id
-                                    )
-                                })
+                            let check = if state == HarnessState::NotRegistered {
+                                check.with_hint(registration_hint(spec, registry))
                             } else {
                                 check
                             };
@@ -322,6 +317,256 @@ fn harness_checks(
             }
         })
         .collect()
+}
+
+/// The hint for a JSON-config harness whose config does not register
+/// ironmem, from the registry's `installer_registers`. A harness the
+/// installer covers is pointed at the installer first, since it also
+/// refreshes the binary; its launcher is the second way back. Any other
+/// harness's launcher is its only route, and the hint names the harnesses the
+/// installer does cover.
+fn registration_hint(
+    spec: &crate::harness::HarnessSpec,
+    registry: &[crate::harness::HarnessSpec],
+) -> String {
+    if spec.installer_registers {
+        return format!(
+            "re-run scripts/install-ironmem.sh to register it (`ironmem {}` also registers, but needs the {} binary on PATH and then launches a session)",
+            spec.id, spec.binary
+        );
+    }
+    let covered: Vec<&str> = registry
+        .iter()
+        .filter(|s| s.installer_registers)
+        .map(|s| s.display_name)
+        .collect();
+    let covered = match covered.split_last() {
+        Some((last, [])) => last.to_string(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+        None => "no harness".to_string(),
+    };
+    format!(
+        "run `ironmem {}` to register it (scripts/install-ironmem.sh covers {covered})",
+        spec.id
+    )
+}
+
+/// The lifecycle hooks `scripts/install-ironmem.sh` writes into the `ironmem`
+/// group of Antigravity's global `hooks.json`, as `(agy event, ironmem
+/// hook)` pairs. The installer is the only source of agy hooks: the
+/// `.agy-plugin` ships its MCP server alone.
+const AGY_HOOK_EVENTS: &[(&str, &str)] = &[
+    ("SessionStart", "session-start"),
+    ("PreInvocation", "user-prompt-submit"),
+    ("Stop", "stop"),
+];
+
+/// Whether `command` runs `ironmem hook <hook> --harness agy`, matched on
+/// whitespace-separated words so the installer's mode prefix and quoting of
+/// the binary path don't matter.
+fn runs_agy_hook(command: &str, hook: &str) -> bool {
+    let words: Vec<&str> = command.split_whitespace().collect();
+    words.windows(2).any(|w| w == ["hook", hook])
+        && words.windows(2).any(|w| w == ["--harness", "agy"])
+}
+
+/// Check that Antigravity's global `~/.gemini/config/hooks.json` carries the
+/// `ironmem` hook group with all three lifecycle hooks, enabled. Without it
+/// agy still reaches the MCP server (`harness_agy`) but gets no session
+/// context, prompt recall or Stop-time mining, with no other sign of it.
+fn agy_hooks_check(home: Option<&Path>) -> Check {
+    const KEY: &str = "agy_hooks";
+    const HINT: &str = "re-run scripts/install-ironmem.sh with agy on PATH; it writes the `ironmem` SessionStart, PreInvocation and Stop hooks";
+    let Some(home) = home else {
+        return Check::new(
+            KEY,
+            CheckStatus::Info,
+            "Antigravity hooks: home directory unknown, skipped",
+        );
+    };
+    let path = home.join(".gemini").join("config").join("hooks.json");
+    let shown = path.display();
+    let warn = |summary: String| Check::new(KEY, CheckStatus::Warn, summary).with_hint(HINT);
+    let raw = match read_harness_config(&path) {
+        Ok(raw) => raw,
+        Err(HarnessState::Absent) => {
+            return Check::new(
+                KEY,
+                CheckStatus::Info,
+                format!("Antigravity hooks: no hooks file at {shown}"),
+            )
+            .with_hint(HINT)
+        }
+        Err(HarnessState::Unreadable(e)) => {
+            return warn(format!(
+                "Antigravity hooks: {shown} present but unreadable: {e}"
+            ))
+        }
+        Err(other) => {
+            return warn(format!(
+                "Antigravity hooks: {shown} could not be read ({other:?})"
+            ))
+        }
+    };
+    // agy creates its config files empty; that is "no group", not a parse error.
+    let root: serde_json::Value = if raw.trim().is_empty() {
+        serde_json::json!({})
+    } else {
+        match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => {
+                return warn(format!(
+                    "Antigravity hooks: {shown} could not be parsed: {e}"
+                ))
+            }
+        }
+    };
+    let Some(group) = root.get("ironmem") else {
+        return warn(format!(
+            "Antigravity hooks: no 'ironmem' hook group in {shown}"
+        ));
+    };
+    let Some(group) = group.as_object() else {
+        return warn(format!(
+            "Antigravity hooks: 'ironmem' in {shown} is not a hook group object"
+        ));
+    };
+    if group.get("enabled").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Check::new(
+            KEY,
+            CheckStatus::Warn,
+            format!("Antigravity hooks: the 'ironmem' hook group in {shown} is disabled"),
+        )
+        .with_hint(
+            "remove `\"enabled\": false` from the 'ironmem' group to turn the hooks back on",
+        );
+    }
+    let missing: Vec<&str> = AGY_HOOK_EVENTS
+        .iter()
+        .filter(|(event, hook)| {
+            let wired = group
+                .get(*event)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|handlers| {
+                    handlers.iter().any(|handler| {
+                        handler
+                            .get("command")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|cmd| runs_agy_hook(cmd, hook))
+                    })
+                });
+            !wired
+        })
+        .map(|(event, _)| *event)
+        .collect();
+    if missing.is_empty() {
+        Check::new(
+            KEY,
+            CheckStatus::Ok,
+            format!("Antigravity hooks: SessionStart, PreInvocation and Stop wired in {shown}"),
+        )
+    } else {
+        warn(format!(
+            "Antigravity hooks: the 'ironmem' group in {shown} does not run ironmem's {} hook{}",
+            missing.join(", "),
+            if missing.len() == 1 { "" } else { "s" }
+        ))
+    }
+}
+
+/// Add a hint to `harness_agy` / `agy_hooks` when the installer's
+/// `AGY_CONFIG_JSON` / `AGY_HOOKS_JSON` override is set in doctor's
+/// environment and points away from the file agy reads.
+///
+/// Those variables only choose where `scripts/install-ironmem.sh` WRITES.
+/// agy reads its global config from `~/.gemini/config/` (its embedded docs
+/// name `~/.gemini/config/mcp_config.json` as the global MCP file), and no
+/// agy setting moving that directory is known, so doctor keeps checking
+/// agy's own paths and says why a file written elsewhere does not count.
+fn note_agy_installer_overrides(
+    checks: &mut [Check],
+    home: Option<&Path>,
+    config_override: Option<&OsStr>,
+    hooks_override: Option<&OsStr>,
+) {
+    let Some(home) = home else { return };
+    let agy_dir = home.join(".gemini").join("config");
+    for (check_name, var, value, file) in [
+        (
+            "harness_agy",
+            "AGY_CONFIG_JSON",
+            config_override,
+            "mcp_config.json",
+        ),
+        ("agy_hooks", "AGY_HOOKS_JSON", hooks_override, "hooks.json"),
+    ] {
+        let Some(value) = value.filter(|v| !v.is_empty()) else {
+            continue;
+        };
+        let read = agy_dir.join(file);
+        let set = Path::new(value);
+        let same = |a: &Path, b: &Path| {
+            a == b
+                || matches!(
+                    (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        };
+        if same(set, &read) {
+            continue;
+        }
+        let note = format!(
+            "{var} is set to {}: the installer writes there, but agy reads only {}",
+            set.display(),
+            read.display()
+        );
+        if let Some(check) = checks.iter_mut().find(|c| c.name == check_name) {
+            check.hint = Some(match check.hint.take() {
+                Some(hint) => format!("{hint}; {note}"),
+                None => note,
+            });
+        }
+    }
+}
+
+/// Flag the `mcpServers.ironmem` entry the old `ironmem gemini` launcher
+/// wrote into Gemini CLI's `~/.gemini/settings.json`. Gemini CLI is
+/// deprecated upstream in favour of Antigravity, and ironmem no longer
+/// registers or upgrades that entry, so a leftover one is stale wiring the
+/// user should move to `ironmem agy`.
+fn gemini_cli_legacy_check(home: Option<&Path>) -> Check {
+    const KEY: &str = "gemini_cli_legacy";
+    let Some(home) = home else {
+        return Check::new(
+            KEY,
+            CheckStatus::Info,
+            "Gemini CLI (deprecated): home directory unknown, skipped",
+        );
+    };
+    let path = home.join(".gemini").join("settings.json");
+    let shown = path.display();
+    match detect_json_mcpservers(&path).0 {
+        HarnessState::Registered => Check::new(
+            KEY,
+            CheckStatus::Warn,
+            format!(
+                "Gemini CLI (deprecated): leftover ironmem MCP entry in {shown}, written by the old `ironmem gemini` launcher"
+            ),
+        )
+        .with_hint(format!(
+            "Gemini CLI was replaced by Antigravity: run `ironmem agy` (or scripts/install-ironmem.sh) to register ironmem for agy, then delete `mcpServers.ironmem` from {shown}"
+        )),
+        HarnessState::Absent | HarnessState::NotRegistered => Check::new(
+            KEY,
+            CheckStatus::Info,
+            "Gemini CLI (deprecated): no leftover ironmem registration",
+        ),
+        HarnessState::Unreadable(e) | HarnessState::Malformed(e) => Check::new(
+            KEY,
+            CheckStatus::Info,
+            format!("Gemini CLI (deprecated): could not check {shown} for a leftover ironmem entry: {e}"),
+        ),
+    }
 }
 
 /// Append a "wired with the shared-daemon proxy command?" note (#190 Task 14)
@@ -561,7 +806,8 @@ fn read_harness_config(path: &Path) -> Result<String, HarnessState> {
 }
 
 /// Resolve registration in a Claude-shaped `mcpServers` JSON config
-/// (`~/.claude.json`, Gemini/Grok `settings.json`, Muse `settings.json`)
+/// (`~/.claude.json`, Antigravity `~/.gemini/config/mcp_config.json`, Grok
+/// `settings.json`, Muse `settings.json`)
 /// with ONE read + parse, returning the state and — when `Registered` —
 /// whether the `ironmem` entry is wired with the shared-daemon proxy command
 /// (`args[1] == "--connect"`; `None` when `args` is absent or not an array).
@@ -580,6 +826,12 @@ fn detect_json_mcpservers(path: &Path) -> (HarnessState, Option<bool>) {
         Ok(raw) => raw,
         Err(state) => return (state, None),
     };
+    // Antigravity creates `mcp_config.json` as a 0-byte file on first run,
+    // and the launcher registers into an empty or blank file as if it were
+    // missing; a config with nothing in it registers nothing.
+    if raw.trim().is_empty() {
+        return (HarnessState::NotRegistered, None);
+    }
     let v: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => return (HarnessState::Malformed(e.to_string()), None),
@@ -914,6 +1166,16 @@ mod tests {
             detect_json_mcpservers(&path),
             (HarnessState::NotRegistered, None)
         );
+        // An empty or blank file (agy creates mcp_config.json at 0 bytes) is
+        // "not registered", not malformed.
+        for blank in ["", " \n\t\n"] {
+            std::fs::write(&path, blank).unwrap();
+            assert_eq!(
+                detect_json_mcpservers(&path),
+                (HarnessState::NotRegistered, None),
+                "{blank:?}"
+            );
+        }
         // Shapes the writer refuses are Malformed, never a silent verdict:
         // the plugin-manifest ARRAY shape (which Muse ignores in settings),
         // a scalar, a non-object ironmem entry, and a non-object root.
@@ -1025,18 +1287,18 @@ mod tests {
 
     #[test]
     fn json_harnesses_not_registered_hint_points_at_their_launcher() {
-        // scripts/install-ironmem.sh wires Claude, Codex and Muse; the JSON
-        // harnesses it does NOT cover (Gemini, Grok) must send the user to
-        // `ironmem <id>` instead.
+        // scripts/install-ironmem.sh wires Claude, Codex, Muse and Antigravity
+        // (`installer_registers`); the JSON harness it does NOT cover (Grok)
+        // must send the user to `ironmem grok` instead.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         std::fs::create_dir_all(home.join(".config").join("muse")).unwrap();
-        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::fs::create_dir_all(home.join(".gemini").join("config")).unwrap();
         std::fs::create_dir_all(home.join(".grok")).unwrap();
         for rel in [
             ".claude.json",
             ".config/muse/settings.json",
-            ".gemini/settings.json",
+            ".gemini/config/mcp_config.json",
             ".grok/settings.json",
         ] {
             std::fs::write(home.join(rel), r#"{"mcpServers":{}}"#).unwrap();
@@ -1051,30 +1313,82 @@ mod tests {
                 .clone()
                 .unwrap_or_default()
         };
-        assert!(hint("harness_claude").contains("install-ironmem.sh"));
-        // Muse is script-covered now, so its hint leads with the script rather
-        // than sending the user to a launcher the script already runs past.
-        let muse = hint("harness_muse");
-        assert!(muse.contains("install-ironmem.sh"), "harness_muse: {muse}");
-        assert!(muse.contains("ironmem muse"), "harness_muse: {muse}");
-        assert!(!muse.contains("covers"), "harness_muse: {muse}");
-        for (name, id) in [("harness_gemini", "gemini"), ("harness_grok", "grok")] {
+        // Claude, Muse and Antigravity are script-covered
+        // (`installer_registers`), so their hints lead with the script rather
+        // than sending the user to a launcher the script already covers.
+        for (name, id) in [
+            ("harness_claude", "claude"),
+            ("harness_muse", "muse"),
+            ("harness_agy", "agy"),
+        ] {
             let h = hint(name);
+            assert!(h.contains("install-ironmem.sh"), "{name}: {h}");
             assert!(h.contains(&format!("ironmem {id}")), "{name}: {h}");
-            assert!(h.contains("covers Claude, Codex and Muse"), "{name}: {h}");
+            assert!(!h.contains("covers"), "{name}: {h}");
         }
+        let grok = hint("harness_grok");
+        assert!(grok.contains("ironmem grok"), "harness_grok: {grok}");
+        // The covered list is the registry's, in registry order.
+        assert!(
+            grok.contains("covers Claude Code, Codex, Antigravity and Muse Code"),
+            "harness_grok: {grok}"
+        );
+    }
+
+    /// The hint follows the spec's `installer_registers`, not its id: the
+    /// same Grok row flagged as installer-covered gets the installer hint.
+    #[test]
+    fn registration_hint_is_driven_by_installer_registers() {
+        let grok = *crate::harness::by_id("grok", crate::harness::REGISTRY).unwrap();
+        let covered = crate::harness::HarnessSpec {
+            installer_registers: true,
+            ..grok
+        };
+        let h = registration_hint(&covered, crate::harness::REGISTRY);
+        assert!(h.starts_with("re-run scripts/install-ironmem.sh"), "{h}");
+        assert!(h.contains("`ironmem grok`"), "{h}");
+
+        let only = [grok, covered];
+        let h = registration_hint(&grok, &only);
+        assert!(h.ends_with("covers Grok)"), "single covered harness: {h}");
+        let h = registration_hint(&grok, &[grok]);
+        assert!(h.ends_with("covers no harness)"), "{h}");
+    }
+
+    /// The 0-byte `mcp_config.json` agy creates on first run reports as
+    /// "not registered", with the installer hint, not as a malformed config.
+    #[test]
+    fn harness_agy_reports_the_empty_file_agy_creates_as_not_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let config_dir = home.join(".gemini").join("config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("mcp_config.json"), "").unwrap();
+        let checks = harness_checks(Some(home), None, crate::harness::REGISTRY);
+        let agy = checks.iter().find(|c| c.name == "harness_agy").unwrap();
+        assert_eq!(agy.status, CheckStatus::Warn, "{agy:?}");
+        assert!(agy.summary.contains("not registered"), "{agy:?}");
+        assert!(!agy.summary.contains("parse"), "{agy:?}");
+        assert!(
+            agy.hint
+                .as_deref()
+                .unwrap_or("")
+                .contains("install-ironmem.sh"),
+            "{agy:?}"
+        );
     }
 
     #[test]
-    fn harness_checks_detect_grok_and_gemini_through_the_shared_table() {
-        // The launcher writes ~/.gemini/settings.json and ~/.grok/settings.json
-        // in Claude's shape; doctor must read them back from the same table.
+    fn harness_checks_detect_grok_and_agy_through_the_shared_table() {
+        // The launcher writes ~/.gemini/config/mcp_config.json and
+        // ~/.grok/settings.json in Claude's shape; doctor must read them back
+        // from the same table.
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
-        std::fs::create_dir_all(home.join(".gemini")).unwrap();
+        std::fs::create_dir_all(home.join(".gemini").join("config")).unwrap();
         std::fs::create_dir_all(home.join(".grok")).unwrap();
         std::fs::write(
-            home.join(".gemini").join("settings.json"),
+            home.join(".gemini").join("config").join("mcp_config.json"),
             r#"{"mcpServers":{"ironmem":{"command":"ironmem","args":["serve","--connect","/tmp/d.sock"]}}}"#,
         )
         .unwrap();
@@ -1090,13 +1404,12 @@ mod tests {
                 .find(|c| c.name == name)
                 .unwrap_or_else(|| panic!("{name} must exist"))
         };
-        let gemini = by_name("harness_gemini");
-        assert_eq!(gemini.status, CheckStatus::Ok, "{gemini:?}");
+        let agy = by_name("harness_agy");
+        assert_eq!(agy.status, CheckStatus::Ok, "{agy:?}");
         assert!(
-            gemini
-                .summary
+            agy.summary
                 .contains("wired with the shared-daemon proxy command"),
-            "{gemini:?}"
+            "{agy:?}"
         );
         let grok = by_name("harness_grok");
         assert_eq!(grok.status, CheckStatus::Ok, "{grok:?}");
@@ -1105,6 +1418,198 @@ mod tests {
                 .contains("upgrade available via `ironmem grok`"),
             "{grok:?}"
         );
+    }
+
+    /// The `ironmem` group `scripts/install-ironmem.sh` writes, with the
+    /// mode prefix and a quoted binary path it really uses.
+    fn installer_agy_hooks() -> serde_json::Value {
+        let cmd = |hook: &str| {
+            format!(
+                "IRONMEM_MCP_MODE=\"${{IRONMEM_MCP_MODE:-trusted}}\" '/home/u/.ironrace/bin/ironmem' hook {hook} --harness agy"
+            )
+        };
+        serde_json::json!({
+            "other-plugin": { "Stop": [{ "type": "command", "command": "true" }] },
+            "ironmem": {
+                "SessionStart": [{ "type": "command", "command": cmd("session-start"), "timeout": 60 }],
+                "PreInvocation": [{ "type": "command", "command": cmd("user-prompt-submit") }],
+                "Stop": [{ "type": "command", "command": cmd("stop"), "timeout": 120 }]
+            }
+        })
+    }
+
+    #[test]
+    fn agy_hooks_check_reports_each_wiring_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let config_dir = home.join(".gemini").join("config");
+        let hooks = config_dir.join("hooks.json");
+        let check = || agy_hooks_check(Some(home));
+
+        let absent = check();
+        assert_eq!(absent.name, "agy_hooks");
+        assert_eq!(absent.status, CheckStatus::Info, "{absent:?}");
+
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let write = |v: &serde_json::Value| std::fs::write(&hooks, v.to_string()).unwrap();
+
+        std::fs::write(&hooks, "").unwrap();
+        let empty = check();
+        assert_eq!(empty.status, CheckStatus::Warn, "{empty:?}");
+        assert!(
+            empty.summary.contains("no 'ironmem' hook group"),
+            "{empty:?}"
+        );
+        assert!(empty
+            .hint
+            .as_deref()
+            .unwrap_or("")
+            .contains("install-ironmem.sh"));
+
+        write(&installer_agy_hooks());
+        let ok = check();
+        assert_eq!(ok.status, CheckStatus::Ok, "{ok:?}");
+
+        let mut disabled = installer_agy_hooks();
+        disabled["ironmem"]["enabled"] = serde_json::json!(false);
+        write(&disabled);
+        let off = check();
+        assert_eq!(off.status, CheckStatus::Warn, "{off:?}");
+        assert!(off.summary.contains("disabled"), "{off:?}");
+
+        let mut partial = installer_agy_hooks();
+        partial["ironmem"].as_object_mut().unwrap().remove("Stop");
+        partial["ironmem"]["PreInvocation"][0]["command"] =
+            serde_json::json!("ironmem hook user-prompt-submit --harness claude-code");
+        write(&partial);
+        let gaps = check();
+        assert_eq!(gaps.status, CheckStatus::Warn, "{gaps:?}");
+        assert!(
+            gaps.summary.contains("PreInvocation, Stop hooks"),
+            "{gaps:?}"
+        );
+
+        std::fs::write(&hooks, "{not json").unwrap();
+        assert_eq!(check().status, CheckStatus::Warn);
+
+        assert_eq!(agy_hooks_check(None).status, CheckStatus::Info);
+    }
+
+    /// An installer override pointing away from agy's own file is named in
+    /// the hint, and the check still reports the file agy reads. An override
+    /// naming agy's own path, or none at all, adds nothing.
+    #[test]
+    fn agy_checks_explain_an_installer_override_agy_does_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        // The installer wrote a complete group, but to the override path.
+        std::fs::write(
+            elsewhere.join("hooks.json"),
+            installer_agy_hooks().to_string(),
+        )
+        .unwrap();
+        let fresh = || {
+            vec![
+                harness_checks(Some(&home), None, crate::harness::REGISTRY)
+                    .into_iter()
+                    .find(|c| c.name == "harness_agy")
+                    .unwrap(),
+                agy_hooks_check(Some(&home)),
+            ]
+        };
+        let by =
+            |checks: &[Check], name: &str| checks.iter().find(|c| c.name == name).unwrap().clone();
+
+        let mut checks = fresh();
+        note_agy_installer_overrides(
+            &mut checks,
+            Some(&home),
+            Some(elsewhere.join("mcp_config.json").as_os_str()),
+            Some(elsewhere.join("hooks.json").as_os_str()),
+        );
+        let hooks = by(&checks, "agy_hooks");
+        assert_eq!(
+            hooks.status,
+            CheckStatus::Info,
+            "still agy's own (absent) file: {hooks:?}"
+        );
+        let hint = hooks.hint.unwrap_or_default();
+        assert!(hint.contains("AGY_HOOKS_JSON is set to"), "{hint}");
+        assert!(
+            hint.contains(&format!(
+                "agy reads only {}",
+                home.join(".gemini/config/hooks.json").display()
+            )),
+            "{hint}"
+        );
+        assert!(
+            hint.contains("install-ironmem.sh"),
+            "keeps the original hint: {hint}"
+        );
+        let mcp = by(&checks, "harness_agy").hint.unwrap_or_default();
+        assert!(mcp.contains("AGY_CONFIG_JSON is set to"), "{mcp}");
+        assert!(mcp.contains("mcp_config.json"), "{mcp}");
+
+        for (config, hooks) in [
+            (None, None),
+            (
+                Some(home.join(".gemini/config/mcp_config.json")),
+                Some(home.join(".gemini/config/hooks.json")),
+            ),
+        ] {
+            let mut checks = fresh();
+            let before: Vec<Option<String>> = checks.iter().map(|c| c.hint.clone()).collect();
+            note_agy_installer_overrides(
+                &mut checks,
+                Some(&home),
+                config.as_deref().map(Path::as_os_str),
+                hooks.as_deref().map(Path::as_os_str),
+            );
+            let after: Vec<Option<String>> = checks.iter().map(|c| c.hint.clone()).collect();
+            assert_eq!(before, after, "{config:?} {hooks:?}");
+        }
+    }
+
+    #[test]
+    fn runs_agy_hook_matches_words_not_substrings() {
+        assert!(runs_agy_hook("x hook stop --harness agy", "stop"));
+        assert!(!runs_agy_hook("x hook stop-all --harness agy", "stop"));
+        assert!(!runs_agy_hook("x hook stop --harness agy-old", "stop"));
+        assert!(!runs_agy_hook("x hook stop --harness gemini", "stop"));
+    }
+
+    /// The old `ironmem gemini` launcher's `mcpServers.ironmem` entry in
+    /// `~/.gemini/settings.json` is flagged with a hint to move to agy.
+    #[test]
+    fn gemini_cli_legacy_check_flags_a_leftover_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let settings = home.join(".gemini").join("settings.json");
+
+        let none = gemini_cli_legacy_check(Some(home));
+        assert_eq!(none.name, "gemini_cli_legacy");
+        assert_eq!(none.status, CheckStatus::Info, "{none:?}");
+
+        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        std::fs::write(&settings, r#"{"mcpServers":{"other":{"command":"x"}}}"#).unwrap();
+        assert_eq!(
+            gemini_cli_legacy_check(Some(home)).status,
+            CheckStatus::Info
+        );
+
+        std::fs::write(
+            &settings,
+            r#"{"mcpServers":{"ironmem":{"command":"ironmem","args":["serve","--connect","/tmp/d.sock"]}}}"#,
+        )
+        .unwrap();
+        let leftover = gemini_cli_legacy_check(Some(home));
+        assert_eq!(leftover.status, CheckStatus::Warn, "{leftover:?}");
+        assert!(!leftover.status.is_blocking());
+        let hint = leftover.hint.unwrap_or_default();
+        assert!(hint.contains("ironmem agy"), "{hint}");
+        assert!(hint.contains("mcpServers.ironmem"), "{hint}");
     }
 
     #[test]
@@ -1146,6 +1651,11 @@ mod tests {
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: crate::harness::HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         let dir = tempfile::tempdir().unwrap();
@@ -1201,11 +1711,15 @@ mod tests {
                 "warmup",
                 "harness_claude",
                 "harness_codex",
-                // grok + gemini (#190 Task 11) and muse all resolve through
+                // grok, agy, and muse all resolve through
                 // the shared JSON-mcpServers detector (object shape).
                 "harness_grok",
-                "harness_gemini",
+                "harness_agy",
                 "harness_muse",
+                // agy's installer-wired hooks, then the deprecated Gemini
+                // CLI leftover (`harness_gemini` was renamed `harness_agy`).
+                "agy_hooks",
+                "gemini_cli_legacy",
                 "hooks",
                 "hook_mining",
                 "mined_rows",
@@ -1504,8 +2018,10 @@ mod tests {
                 "harness_claude",
                 "harness_codex",
                 "harness_grok",
-                "harness_gemini",
+                "harness_agy",
                 "harness_muse",
+                "agy_hooks",
+                "gemini_cli_legacy",
                 "hooks",
                 "hook_mining",
                 "mined_rows",
