@@ -508,13 +508,13 @@ fn scoped_vector_candidates(
     // A row either query cannot score counts once, however many queries
     // drop it.
     let mut unscorable = vec![false; candidates.len()];
-    let primary_top = exact_top_k(&candidates, primary, overfetch, &mut unscorable);
+    let mut ranked = |query: &[f32]| match query_scoring(query) {
+        Some(scoring) => exact_top_k(&candidates, query, scoring, overfetch, &mut unscorable),
+        None => Vec::new(),
+    };
+    let primary_top = ranked(primary);
     let top = match content {
-        Some(cv) => union_hnsw(
-            primary_top,
-            exact_top_k(&candidates, cv, overfetch, &mut unscorable),
-            overfetch,
-        ),
+        Some(cv) => union_hnsw(primary_top, ranked(cv), overfetch),
         None => primary_top,
     };
     malformed += unscorable.iter().filter(|dropped| **dropped).count();
@@ -540,28 +540,63 @@ struct ScopeCandidate {
     norm: f32,
 }
 
-/// The top `k` of `candidates` by cosine similarity with `query`, as
-/// (position, score), highest first, ties broken by drawer id whatever order
+/// How the scoped leg scores rows against one query vector, decided once
+/// per query by [`query_scoring`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QueryScoring {
+    /// Cosine similarity, with the query's (finite, non-zero) norm.
+    Cosine(f32),
+    /// An all-zero query (the noop embedder's): every row scores 0, so the
+    /// id tie-break alone decides. Issue #430 tracks giving it no vector
+    /// candidates instead.
+    AllZero,
+}
+
+/// Classify `query` by its norm with the rule that classifies stored rows
+/// (`crate::db::drawers::embedding_norm`). A query with no usable norm that
+/// is not all-zero (a NaN or infinite component, or a norm that overflows or
+/// underflows) has no direction to rank by: it gets `None`, after a warning,
+/// and so no vector candidates.
+fn query_scoring(query: &[f32]) -> Option<QueryScoring> {
+    use crate::db::drawers::EmbeddingNorm;
+
+    match crate::db::drawers::embedding_norm(query) {
+        EmbeddingNorm::Usable(norm) => Some(QueryScoring::Cosine(norm)),
+        EmbeddingNorm::Zero => Some(QueryScoring::AllZero),
+        EmbeddingNorm::Unusable => {
+            tracing::warn!(
+                "query embedding has no usable norm (a non-finite value, or a norm that \
+                 overflows or underflows); its vector candidates are skipped"
+            );
+            None
+        }
+    }
+}
+
+/// The top `k` of `candidates` by `scoring` against `query`, as (position,
+/// score), highest first, ties broken by drawer id whatever order
 /// `candidates` is in. A candidate of another length than `query` is skipped
 /// (the scoped leg has already dropped, and counted, rows of another length
 /// than the primary query). A candidate whose score is not finite is skipped
 /// and marked in `unscorable` (indexed by position, the same length as
 /// `candidates`); marks are only ever set, so one slice can collect them
-/// over several queries. A zero-norm query scores every candidate 0.
+/// over several queries. An all-zero query ([`QueryScoring::AllZero`])
+/// scores every candidate 0, so ids decide the order; a query with any other
+/// unusable norm never gets here ([`query_scoring`] gives it no scoring).
 fn exact_top_k(
     candidates: &[ScopeCandidate],
     query: &[f32],
+    scoring: QueryScoring,
     k: usize,
     unscorable: &mut [bool],
 ) -> Vec<(usize, f32)> {
-    let query_norm = crate::db::drawers::vector_norm(query);
     let mut scored: Vec<(usize, f32)> = candidates
         .iter()
         .enumerate()
         .filter(|(_, candidate)| candidate.embedding.len() == query.len())
         .filter_map(|(pos, candidate)| {
-            let score = match query_norm {
-                Some(query_norm) => {
+            let score = match scoring {
+                QueryScoring::Cosine(query_norm) => {
                     let score = crate::db::drawers::cosine(
                         query,
                         query_norm,
@@ -573,7 +608,7 @@ fn exact_top_k(
                     }
                     score?
                 }
-                None => 0.0,
+                QueryScoring::AllZero => 0.0,
             };
             Some((pos, score))
         })
@@ -1358,6 +1393,38 @@ mod tests {
         );
     }
 
+    /// A query with no usable norm that is not all-zero (a NaN or infinite
+    /// component, or a norm that overflows) has no direction to rank by. It
+    /// gets no vector candidates and one warning, rather than every row
+    /// scoring 0 and the ids deciding. The content-word variant is judged on
+    /// its own.
+    #[test]
+    fn scoped_candidates_skip_a_query_with_no_usable_norm() {
+        let app = App::open_for_test().unwrap();
+        add(&app, "u0", "u", "r", &at_similarity(0.5, 1.0));
+        add(&app, "u1", "u", "r", &at_similarity(0.9, 1.0));
+        let wing_u = scope(Some("u"), None);
+        let mut nan = query_vec();
+        nan[1] = f32::NAN;
+        let overflow = vec![1e20; DIM];
+        for bad in [nan, overflow] {
+            let (ids, log) =
+                with_captured_log(|| vector_candidates(&app, &bad, None, 30, &wing_u).unwrap());
+            assert!(ids.is_empty(), "{ids:?}");
+            let warnings: Vec<&str> = log.lines().filter(|l| l.contains("WARN")).collect();
+            assert_eq!(warnings.len(), 1, "{log}");
+            assert!(
+                warnings[0].contains("query embedding has no usable norm"),
+                "{log}"
+            );
+            let cv = query_vec();
+            let (ids, _) = with_captured_log(|| {
+                vector_candidates(&app, &bad, Some(&cv), 30, &wing_u).unwrap()
+            });
+            assert_eq!(ids, ["u1", "u0"]);
+        }
+    }
+
     /// Rows reach the scoped leg in whatever order SQLite returns them
     /// (here insertion order, the reverse of id order). Equal scores still
     /// come out in id order, for the primary query and for the union with
@@ -1399,11 +1466,16 @@ mod tests {
             candidate_of("plain", at_similarity(0.5, 1.0), 1.0),
         ];
         let mut unscorable = [false; 2];
-        let top = exact_top_k(&candidates, &query, 10, &mut unscorable);
+        let top = exact_top_k(&candidates, &query, scoring_of(&query), 10, &mut unscorable);
         assert_eq!(top.len(), 1, "{top:?}");
         assert_eq!(candidates[top[0].0].id, "plain");
         // The dropped candidate is reported, so the scoped leg can count it.
         assert_eq!(unscorable, [true, false]);
+    }
+
+    /// The scoring a usable or all-zero test query gets.
+    fn scoring_of(query: &[f32]) -> QueryScoring {
+        query_scoring(query).expect("a usable or all-zero query")
     }
 
     fn candidate_of(id: &str, embedding: Vec<f32>, norm: f32) -> ScopeCandidate {
@@ -1425,17 +1497,24 @@ mod tests {
             candidate_of("b", v, 1.0),
         ];
         let mut unscorable = [false; 4];
-        let order: Vec<&str> = exact_top_k(&candidates, &query_vec(), 10, &mut unscorable)
-            .into_iter()
-            .map(|(pos, _)| candidates[pos].id.as_str())
-            .collect();
+        let order: Vec<&str> = exact_top_k(
+            &candidates,
+            &query_vec(),
+            scoring_of(&query_vec()),
+            10,
+            &mut unscorable,
+        )
+        .into_iter()
+        .map(|(pos, _)| candidates[pos].id.as_str())
+        .collect();
         assert_eq!(order, ["top", "a", "b", "c"]);
         // With a zero query every score is 0 and the id order alone decides.
         let zero = vec![0.0; DIM];
-        let order: Vec<&str> = exact_top_k(&candidates, &zero, 2, &mut unscorable)
-            .into_iter()
-            .map(|(pos, _)| candidates[pos].id.as_str())
-            .collect();
+        let order: Vec<&str> =
+            exact_top_k(&candidates, &zero, scoring_of(&zero), 2, &mut unscorable)
+                .into_iter()
+                .map(|(pos, _)| candidates[pos].id.as_str())
+                .collect();
         assert_eq!(order, ["a", "b"]);
         assert_eq!(unscorable, [false; 4]);
     }

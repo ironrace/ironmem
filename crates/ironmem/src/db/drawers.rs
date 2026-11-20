@@ -1511,7 +1511,7 @@ fn decode_embedding(blob: &[u8]) -> Option<Vec<f32>> {
         .then_some(embedding)
 }
 
-pub(crate) fn vector_norm(embedding: &[f32]) -> Option<f32> {
+fn vector_norm(embedding: &[f32]) -> Option<f32> {
     let squared_sum: f32 = embedding.iter().map(|value| value * value).sum();
     let norm = squared_sum.sqrt();
     (norm.is_finite() && norm > 0.0).then_some(norm)
@@ -1547,10 +1547,13 @@ pub(crate) fn embedding_norm(embedding: &[f32]) -> EmbeddingNorm {
     }
 }
 
-/// Cosine similarity of `a` and `b`, given their norms (from [`vector_norm`]),
-/// or `None` when the result is not finite. The caller must check that the
-/// lengths match: the dot product stops at the shorter of the two.
+/// Cosine similarity of `a` and `b`, given their norms (from [`vector_norm`]
+/// or [`EmbeddingNorm::Usable`]), or `None` when the lengths differ or the
+/// result is not finite.
 pub(crate) fn cosine(a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
     let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
     let score = dot / (a_norm * b_norm);
     score.is_finite().then_some(score)
@@ -3141,6 +3144,14 @@ mod tests {
         db.insert_drawer("g", "the non-plugin hooks", &emb, "other", "r", "", "test")
             .unwrap();
         assert_eq!(bm25_ids(&db, "non-plugin", Some("w")), vec![id]);
+    }
+
+    /// The length precondition is checked, not only documented: a dot
+    /// product over the shorter vector is not a cosine.
+    #[test]
+    fn cosine_refuses_vectors_of_different_lengths() {
+        assert_eq!(cosine(&[1.0, 0.0], 1.0, &[1.0], 1.0), None);
+        assert_eq!(cosine(&[1.0, 0.0], 1.0, &[1.0, 0.0], 1.0), Some(1.0));
     }
 
     /// The rules that do not depend on the scope run in the SQL: a collab
