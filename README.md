@@ -656,7 +656,8 @@ the first `[FAIL]`:
     run either: Claude Code sets that variable only for plugin hooks
     (measured on 2.1.329), and the line says `uses ${CLAUDE_PLUGIN_ROOT}, a
     variable Claude Code sets only for plugin hooks`. A shell command that
-    gives the variable a default (`${CLAUDE_PLUGIN_ROOT:-/path}`) runs the
+    gives the variable a default (`${CLAUDE_PLUGIN_ROOT:-/path}`) that the
+    shell expands (not in single quotes or after a backslash) runs the
     default, so doctor and the installer read it as running. A Stop or
     PreCompact that fails to start is reported on `hook_mining` instead.
   - The enabled plugin and a hand-wired entry both supply a hook, so it runs

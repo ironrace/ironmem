@@ -583,6 +583,121 @@
       "command": "\"${CLAUDE_PLUGIN_ROOT:-/my dir}/${CLAUDE_PLUGIN_ROOT}/ironmem\" hook stop",
       "wired": false,
       "note": "a use with a default, then one without, in one quoted word"
+    },
+    {
+      "command": "'${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem' hook stop",
+      "wired": false,
+      "note": "a default in single quotes: the shell does not expand it, so the path holds the text"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:-\"\"}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a default of empty double quotes is empty"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:-''}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a default of empty single quotes is empty"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:-\"\"''}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a default of two empty quote pairs is empty"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT-\"\"}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a - default of empty quotes is empty"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:=\"\"}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a := default of empty quotes is empty"
+    },
+    {
+      "command": "\"${CLAUDE_PLUGIN_ROOT:-\"\"}/bin/ironmem\" hook stop",
+      "wired": false,
+      "note": "inside double quotes, a default of empty double quotes is empty"
+    },
+    {
+      "command": "\"${CLAUDE_PLUGIN_ROOT:-''}/bin/ironmem\" hook stop",
+      "wired": true,
+      "note": "inside double quotes, single quotes in a default are two characters, so it is not empty"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:-\"/opt/ironmem\"}/bin/ironmem hook stop",
+      "wired": true,
+      "note": "a quoted default that is not empty"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:-\"\"/opt/ironmem}/bin/ironmem hook stop",
+      "wired": true,
+      "note": "empty quotes, then a path: the default is not empty"
+    },
+    {
+      "command": "\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a backslash before the $: the shell does not expand it, so the path holds the text"
+    },
+    {
+      "command": "\"\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem\" hook stop",
+      "wired": false,
+      "note": "a backslash before the $ inside double quotes: not expanded either"
+    },
+    {
+      "command": "bash -c \"\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop\"",
+      "wired": true,
+      "note": "a backslash before the $ in a double-quoted bash -c string: the inner shell gets the $ and runs the default"
+    },
+    {
+      "command": "bash -c '\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop'",
+      "wired": false,
+      "note": "the same string in single quotes: the inner shell gets the backslash and does not expand it"
+    },
+    {
+      "command": "bash -c \"\\${CLAUDE_PLUGIN_ROOT}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "a backslash before the $ in a double-quoted bash -c string, no default: the inner shell expands it to nothing"
+    },
+    {
+      "command": "'${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}'\"$UNSET\"/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a use in single quotes beside an expanded $ in the same word: the use is still not expanded"
+    },
+    {
+      "command": "\"${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}\"'/a$b'/bin/ironmem hook stop",
+      "wired": true,
+      "note": "an expanded default beside a $ in single quotes in the same word: the default still runs"
+    },
+    {
+      "command": "bash -c \"'${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem' hook stop\"",
+      "wired": true,
+      "note": "single quotes inside a double-quoted bash -c string: the outer shell expands the use before the inner shell reads the quotes"
+    },
+    {
+      "command": "bash -c \"'\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem' hook stop\"",
+      "wired": false,
+      "note": "a backslash before the $ in single quotes inside a double-quoted bash -c string: the inner shell gets the $ in single quotes and does not expand it"
+    },
+    {
+      "command": "bash -c \"\\\\\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "three backslashes before the $ in a double-quoted bash -c string: the inner shell gets a backslash before the $ and does not expand it"
+    },
+    {
+      "command": "bash -c \"true; \\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop\"",
+      "wired": true,
+      "note": "a backslash before the $ in the second command of a double-quoted bash -c string: the inner shell runs the default"
+    },
+    {
+      "command": "bash -c \"true; \\${CLAUDE_PLUGIN_ROOT}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "the same with no default: the inner shell expands it to nothing"
+    },
+    {
+      "command": "bash -c \"true; \\\\\\${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "three backslashes before the $ in the second command of a double-quoted bash -c string: not expanded"
     }
   ],
   "env_rows": [

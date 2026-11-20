@@ -723,7 +723,8 @@ register_json_mcpservers() {
 # ${CLAUDE_PLUGIN_ROOT} does not count: Claude Code leaves that variable unset
 # for a settings.json hook (measured on 2.1.329), so the run finds no script.
 # (A shell command that gives the variable a default, as in
-# ${CLAUDE_PLUGIN_ROOT:-/path}, runs the default and does count.)
+# ${CLAUDE_PLUGIN_ROOT:-/path}, runs the default and does count, when a shell
+# expands that use: not in single quotes or after a backslash.)
 # When an event holds such an entry and nothing else that runs the hook, the
 # hook is added beside it and, once the file is written, a WARN names the
 # event and says that entry does not run outside the plugin and can be
@@ -880,14 +881,33 @@ _wire_claude_hooks_warn() {
 # (`2>/dev/null ironmem hook stop` counts there), and this does not. A program
 # or script word that uses ${CLAUDE_PLUGIN_ROOT} (or $CLAUDE_PLUGIN_ROOT)
 # does not match: Claude Code leaves it unset for a settings.json hook, so
-# the run finds no script. In a word a shell reads (re_plugin_root), a use
-# with a default that is not empty (${CLAUDE_PLUGIN_ROOT:-/path}, also `-`,
-# `:=` and `=`) still matches, because the shell runs the default (measured
-# with /bin/sh and bash); any other expansion of the unset variable is empty
-# and does not. No shell reads an exec-form element, so there every use is
-# refused (plugin_root); what Claude Code does with a default in one was not
-# measured. unroot puts a path where each use was, to ask whether the entry
-# would run the hook but for the variable.
+# the run finds no script. In a word a shell reads (re_plugin_root), each use
+# is judged where it stands in the word, as /bin/sh, bash and dash were
+# measured to read it with the variable unset. A use the shell expands still
+# matches when it is braced with a default that is not empty
+# (${CLAUDE_PLUGIN_ROOT:-/path}, also `-`, `:=` and `=`), because the shell
+# runs the default; any other expansion of the unset variable is empty and
+# does not match. A default of only empty quote pairs is empty: `""` and `''`
+# in an unquoted use, but only `""` in a double-quoted one, where `''` is two
+# characters. A use the shell does not expand (in single quotes, or with a
+# backslash before its `$`, unquoted or in double quotes) is a literal path
+# that holds the text, so it does not match, default or not. Inside a
+# double-quoted `bash -c` or `sh -c` string ($dq), in its first command or
+# one after a `;` `&` `|` `(` `)` or line break (re_dq_later), two shells read
+# the use. The outer one expands a `$` with no backslash before it, single
+# quotes or not, and takes one backslash off a `\$`; the inner one then
+# expands that `$` unless it gets it in single quotes or after a backslash of
+# its own. So there a use is not expanded when it is `\$` in single quotes
+# (any odd number of backslashes) or `\\\$` outside them (three, seven, ...),
+# and does not match, default or not; every other use is expanded and only
+# its default decides (`""` and `''` both empty). Not told apart: a default
+# that is empty for another reason (${CLAUDE_PLUGIN_ROOT:-$UNSET} matches),
+# and a -c string nested in a double-quoted -c string, which is read as the
+# outer string is. No shell reads
+# an exec-form element, so there every use is refused (plugin_root); what
+# Claude Code does with a default in one was not measured. unroot puts a path
+# where each use was, to ask whether the entry would run the hook but for the
+# variable.
 _CLAUDE_HOOK_JQ_DEFS='
 def base: sub("^.*/"; "");
 def is_one_of(words): . as $w | any(words; . == $w);
@@ -911,22 +931,43 @@ def re_head: "(?:" + re_assign + "\\s+)*" + re_wrappers;
 def re_shell:
   re_named("(?:bash|sh)")
   + "(?:\\s+(?:[-+][oO]\\s+" + re_word + "|\\+" + re_seg + "*|--" + re_seg + "*|-[^\\sc\"\u0027;&|()<>]*))*";
-def re_bash_c: re_shell + "\\s+-(?!-)[^\\s\"\u0027;&|()<>]*c[^\\s\"\u0027;&|()<>]*\\s+[\"\u0027]\\s*";
-def re_lead: re_start + re_head + "(?:" + re_bash_c + re_head + ")*";
-def re_plugin_root:
-  re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*|\u0027[^\u0027]*)?"
-  + "\\$(?:CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])|\\{CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_]|:?[-=][^}]))";
-def plugin_root: test("\\$\\{?CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])");
-def re_program($b):
-  "(?<p>(?!" + re_plugin_root + ")(?:" + re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*/|\u0027[^\u0027]*/|/))?" + re_q + $b + re_q + ")";
+def re_bash_c($q): re_shell + "\\s+-(?!-)[^\\s\"\u0027;&|()<>]*c[^\\s\"\u0027;&|()<>]*\\s+" + $q + "\\s*";
+def re_c_strings($q): "(?:" + re_bash_c($q) + re_head + ")*";
+def re_dq_later: "(?:(?:[^\"\\\\]|\\\\.)*(?:[;&|)\\n]|(?<!\\$)\\()\\s*)?";
+def re_lead($dq):
+  re_start + re_head
+  + (if $dq then
+       re_c_strings("[\"\u0027]") + re_bash_c("\"") + re_dq_later + re_head + re_c_strings("[\"\u0027]")
+     else re_c_strings("\u0027") end);
+def re_root: "\\$\\{?CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])";
+def re_root_empty($pairs):
+  "\\$(?:CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])|\\{CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_]|:?[-=](?>(?:" + $pairs + ")*)[^}]))";
+def re_in_dq: "\"(?:[^\"\\\\]|\\\\.)*";
+def re_plugin_root($dq):
+  re_seg + "*(?:"
+  + (if $dq then
+       "(?:" + re_in_dq + "|\u0027[^\u0027]*)?\\\\?" + re_root_empty("\"\"|\u0027\u0027")
+       + "|(?<!\\\\)(?:\\\\{4})*\\\\{3}" + re_root
+       + "|\u0027[^\u0027]*(?<!\\\\)(?:\\\\{2})*\\\\" + re_root
+     else
+       re_root_empty("\"\"|\u0027\u0027")
+       + "|" + re_in_dq + re_root_empty("\"\"")
+       + "|(?:" + re_in_dq + ")?\\\\" + re_root
+       + "|\u0027[^\u0027]*" + re_root
+     end)
+  + ")";
+def plugin_root: test(re_root);
+def re_program($b; $dq):
+  "(?<p>(?!" + re_plugin_root($dq) + ")(?:" + re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*/|\u0027[^\u0027]*/|/))?" + re_q + $b + re_q + ")";
 def re_name($name): "\\s+" + re_q + $name + re_q + "(?=[\\s;&|)<>]|$)";
 def re_hook($name):
   "\\s+" + re_q + "hook" + re_q + "(?:\\s+--harness\\s+" + re_word + "|\\s+--harness=" + re_seg + "*)?"
   + re_name($name);
-def shell_runs($name):
-  test(re_lead + re_program("ironmem(?:-mcp\\.sh)?") + re_hook($name))
-  or test(re_lead + "(?:" + re_shell + "\\s+)?" + re_program("ironmem-hook\\.sh") + re_name($name))
-  or test(re_lead + re_shell + "\\s+" + re_program("ironmem-mcp\\.sh") + re_hook($name));
+def shell_runs($name; $dq):
+  test(re_lead($dq) + re_program("ironmem(?:-mcp\\.sh)?"; $dq) + re_hook($name))
+  or test(re_lead($dq) + "(?:" + re_shell + "\\s+)?" + re_program("ironmem-hook\\.sh"; $dq) + re_name($name))
+  or test(re_lead($dq) + re_shell + "\\s+" + re_program("ironmem-mcp\\.sh"; $dq) + re_hook($name));
+def shell_runs($name): shell_runs($name; false) or shell_runs($name; true);
 def env_args:
   if length == 0 then .
   elif (.[0] | is_one_of("-u", "--unset", "-C", "--chdir")) then .[2:] | env_args
@@ -987,8 +1028,9 @@ def unquote:
      dynamic: any($s[]; ((startswith("\u0027") or startswith("\\")) | not) and test("[$`]")),
      tilde: (($s[0] // "") | startswith("~/"))};
 def shell_programs($name):
-  [(match(re_lead + re_program("ironmem(?:-mcp\\.sh)?") + re_hook($name); "g"),
-    match(re_lead + re_program("ironmem-hook\\.sh") + re_name($name); "g"))
+  [(false, true) as $dq
+   | (match(re_lead($dq) + re_program("ironmem(?:-mcp\\.sh)?"; $dq) + re_hook($name); "g"),
+      match(re_lead($dq) + re_program("ironmem-hook\\.sh"; $dq) + re_name($name); "g"))
    | .captures[] | select(.name == "p") | .string | unquote];
 def c_string:
   if length == 0 then empty
@@ -1431,7 +1473,7 @@ _wire_claude_hooks_into() {
     fi
     echo "==> Wired Claude hooks in $settings: ${added% }"
     for event in $root_copies; do
-      echo "    WARN: $event in $settings already has an ironmem hook entry that runs through \${CLAUDE_PLUGIN_ROOT}, which Claude Code sets only for plugin hooks, so that entry does not run outside the plugin. This install added its own $event hook beside it; you can delete the old entry." >&2
+      echo "    WARN: $event in $settings already has an ironmem hook entry that uses \${CLAUDE_PLUGIN_ROOT}, a variable Claude Code sets only for plugin hooks, so that entry does not run outside the plugin. This install added its own $event hook beside it; you can delete the old entry." >&2
     done
     if [[ -n "$mining" && "$disabled" -eq 0 ]]; then
       _print_mining_line "$work" "$settings" "${mining% }"

@@ -2105,8 +2105,8 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
     def plugin_root_warning(self, settings: pathlib.Path, event: str) -> str:
         return (
-            f"    WARN: {event} in {settings} already has an ironmem hook entry that runs through "
-            "${CLAUDE_PLUGIN_ROOT}, which Claude Code sets only for plugin hooks, so that entry does not run "
+            f"    WARN: {event} in {settings} already has an ironmem hook entry that uses "
+            "${CLAUDE_PLUGIN_ROOT}, a variable Claude Code sets only for plugin hooks, so that entry does not run "
             f"outside the plugin. This install added its own {event} hook beside it; you can delete the old entry.\n"
         )
 

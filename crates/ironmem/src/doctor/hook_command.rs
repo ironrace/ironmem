@@ -285,7 +285,7 @@ impl HookCommand {
 
     fn invocations(&self) -> Vec<Invocation> {
         match self {
-            Self::Shell(command) => invocations(command, None),
+            Self::Shell(command) => invocations(command, None, &[]),
             Self::Exec { program, args } => {
                 let words: Vec<Word> = std::iter::once(program)
                     .chain(args)
@@ -305,6 +305,14 @@ impl HookCommand {
 struct Word {
     text: String,
     origin: Origin,
+    /// The byte offset in `text` of each `$` that a shell expands. In a
+    /// shell-form word that is a `$` outside single quotes with no backslash
+    /// before it, any `$` in a `$( .. )` or backtick body (the body is not
+    /// read), and a `$` that a shell which read the string earlier had
+    /// already expanded: one from a double-quoted part of the word that
+    /// held this `-c` string. No shell reads an exec-form element, so it has
+    /// none.
+    expanded: Vec<usize>,
 }
 
 /// Where a [`Word`] came from, with what only that kind of word has.
@@ -337,6 +345,7 @@ impl Word {
             origin: Origin::Exec {
                 placeholder: text.contains("${"),
             },
+            expanded: Vec::new(),
         }
     }
 
@@ -380,7 +389,7 @@ impl Word {
 
 /// Accumulates the words and simple commands of [`split_commands`].
 #[derive(Default)]
-struct Splitter {
+struct Splitter<'a> {
     commands: Vec<Vec<Word>>,
     words: Vec<Word>,
     cur: String,
@@ -389,12 +398,18 @@ struct Splitter {
     quoted: bool,
     /// See [`Origin::Shell`].
     first_quoted: Option<usize>,
+    /// See [`Word::expanded`].
+    expanded: Vec<usize>,
+    /// The byte offset in the input of each `$` that a shell which read the
+    /// string earlier had already expanded.
+    expanded_before: &'a [usize],
     /// The next word is a redirection target and is dropped.
     skip_next: bool,
 }
 
-impl Splitter {
+impl Splitter<'_> {
     fn end_word(&mut self) {
+        let expanded = std::mem::take(&mut self.expanded);
         if self.in_word {
             let word = Word {
                 text: std::mem::take(&mut self.cur),
@@ -402,6 +417,7 @@ impl Splitter {
                     dynamic: self.dynamic,
                     first_quoted: self.first_quoted,
                 },
+                expanded,
             };
             if self.skip_next {
                 self.skip_next = false;
@@ -418,6 +434,31 @@ impl Splitter {
     /// Note that the next character pushed to `cur` is quoted or escaped.
     fn mark_quoted(&mut self) {
         self.first_quoted.get_or_insert(self.cur.len());
+    }
+
+    /// Push `c`, which this shell does not expand (it is in single quotes or
+    /// after a backslash), read at byte `at` of the input. An earlier shell
+    /// may still have expanded it.
+    fn push_literal(&mut self, at: usize, c: char) {
+        if c == '$' && self.expanded_before.contains(&at) {
+            self.expanded.push(self.cur.len());
+        }
+        self.cur.push(c);
+    }
+
+    /// Push `c`, which this shell expands when it is a `$`.
+    fn push_expanding(&mut self, c: char) {
+        if c == '$' {
+            self.expanded.push(self.cur.len());
+        }
+        self.cur.push(c);
+    }
+
+    /// Count every `$` in `cur` from byte `from` on as expanded: the body of
+    /// a substitution, which is not read.
+    fn expand_all_from(&mut self, from: usize) {
+        let body = self.cur[from..].match_indices('$');
+        self.expanded.extend(body.map(|(at, _)| from + at));
     }
 
     fn end_command(&mut self) {
@@ -445,27 +486,30 @@ impl Splitter {
 /// here-strings, `$(..)` inside double quotes when the body itself holds a
 /// `"`, brace groups, `if` and `case`; those shapes are documented limits,
 /// not bugs.
-fn split_commands(input: &str) -> Vec<Vec<Word>> {
-    let mut sp = Splitter::default();
-    let mut chars = input.chars().peekable();
-    while let Some(c) = chars.next() {
+fn split_commands(input: &str, expanded_before: &[usize]) -> Vec<Vec<Word>> {
+    let mut sp = Splitter {
+        expanded_before,
+        ..Splitter::default()
+    };
+    let mut chars = input.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
         match c {
             '\'' => {
                 sp.in_word = true;
                 sp.quoted = true;
                 sp.mark_quoted();
-                for q in chars.by_ref() {
+                for (at, q) in chars.by_ref() {
                     if q == '\'' {
                         break;
                     }
-                    sp.cur.push(q);
+                    sp.push_literal(at, q);
                 }
             }
             '"' => {
                 sp.in_word = true;
                 sp.quoted = true;
                 sp.mark_quoted();
-                while let Some(q) = chars.next() {
+                while let Some((_, q)) = chars.next() {
                     match q {
                         '"' => break,
                         // POSIX: inside double quotes a backslash escapes
@@ -473,40 +517,45 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
                         // line continuation, removed); before anything else
                         // it stays.
                         '\\' => match chars.peek() {
-                            Some('$' | '`' | '"' | '\\') => sp.cur.extend(chars.next()),
-                            Some('\n') => {
+                            Some(&(at, n @ ('$' | '`' | '"' | '\\'))) => {
+                                chars.next();
+                                sp.push_literal(at, n);
+                            }
+                            Some((_, '\n')) => {
                                 chars.next();
                             }
                             _ => sp.cur.push('\\'),
                         },
                         '$' | '`' => {
                             sp.dynamic = true;
-                            sp.cur.push(q);
+                            sp.push_expanding(q);
                         }
                         _ => sp.cur.push(q),
                     }
                 }
             }
             '\\' => match chars.next() {
-                Some('\n') | None => {}
-                Some(n) => {
+                Some((_, '\n')) | None => {}
+                Some((at, n)) => {
                     sp.in_word = true;
                     sp.mark_quoted();
-                    sp.cur.push(n);
+                    sp.push_literal(at, n);
                 }
             },
             '$' | '`' => {
                 sp.in_word = true;
                 sp.dynamic = true;
-                sp.cur.push(c);
+                sp.push_expanding(c);
+                let body = sp.cur.len();
                 if c == '`' {
                     read_backticks(&mut chars, &mut sp.cur);
-                } else if chars.peek() == Some(&'(') {
+                } else if chars.peek().is_some_and(|&(_, n)| n == '(') {
                     read_parens(&mut chars, &mut sp.cur);
                 }
+                sp.expand_all_from(body);
             }
             '#' if !sp.in_word => {
-                for n in chars.by_ref() {
+                for (_, n) in chars.by_ref() {
                     if n == '\n' {
                         break;
                     }
@@ -524,7 +573,10 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
                 } else {
                     sp.end_word();
                 }
-                if chars.peek() == Some(&c) || (c == '>' && chars.peek() == Some(&'&')) {
+                if chars
+                    .peek()
+                    .is_some_and(|&(_, n)| n == c || (c == '>' && n == '&'))
+                {
                     chars.next();
                 }
                 sp.skip_next = true;
@@ -540,15 +592,16 @@ fn split_commands(input: &str) -> Vec<Vec<Word>> {
     sp.commands
 }
 
-type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
+/// The characters of a command string, each with its byte offset.
+type Chars<'a> = std::iter::Peekable<std::str::CharIndices<'a>>;
 
 /// Copy a backtick substitution body and its closing backtick into `cur`.
 fn read_backticks(chars: &mut Chars<'_>, cur: &mut String) {
-    while let Some(c) = chars.next() {
+    while let Some((_, c)) = chars.next() {
         cur.push(c);
         match c {
             '`' => return,
-            '\\' => cur.extend(chars.next()),
+            '\\' => cur.extend(chars.next().map(|(_, n)| n)),
             _ => {}
         }
     }
@@ -558,7 +611,7 @@ fn read_backticks(chars: &mut Chars<'_>, cur: &mut String) {
 /// paren that closes the first one. Quoted parens don't count.
 fn read_parens(chars: &mut Chars<'_>, cur: &mut String) {
     let mut depth = 0usize;
-    while let Some(c) = chars.next() {
+    while let Some((_, c)) = chars.next() {
         cur.push(c);
         match c {
             '(' => depth += 1,
@@ -568,15 +621,15 @@ fn read_parens(chars: &mut Chars<'_>, cur: &mut String) {
                     return;
                 }
             }
-            '\\' => cur.extend(chars.next()),
+            '\\' => cur.extend(chars.next().map(|(_, n)| n)),
             '\'' | '"' => {
-                while let Some(q) = chars.next() {
+                while let Some((_, q)) = chars.next() {
                     cur.push(q);
                     if q == c {
                         break;
                     }
                     if q == '\\' && c == '"' {
-                        cur.extend(chars.next());
+                        cur.extend(chars.next().map(|(_, n)| n));
                     }
                 }
             }
@@ -743,20 +796,24 @@ struct Invocation {
 /// The name of the variable Claude Code sets to a plugin's directory.
 const PLUGIN_ROOT_VAR: &str = "CLAUDE_PLUGIN_ROOT";
 
-/// True when `text` uses `$CLAUDE_PLUGIN_ROOT` or `${CLAUDE_PLUGIN_ROOT...}`
-/// (the name not running on into a longer one) in a way that leaves nothing
-/// when the variable is unset, as scripts/install-ironmem.sh reads it
-/// (`re_plugin_root` for a word a shell reads, `plugin_root` for an
+/// True when `word` uses `$CLAUDE_PLUGIN_ROOT` or `${CLAUDE_PLUGIN_ROOT...}`
+/// (the name not running on into a longer one) in a way that does not run a
+/// path when the variable is unset, as scripts/install-ironmem.sh reads it
+/// (`re_plugin_root($dq)` for a word a shell reads, `plugin_root` for an
 /// exec-form element).
 ///
-/// In a word a shell reads (`by_shell`), a braced use with a default that is
-/// not empty (`:-`, `-`, `:=` or `=`) does not count: measured with /bin/sh
-/// and bash, the variable unset, the shell runs the default's path. Any
-/// other expansion of an unset variable (`%`, `#`, `:+`, an empty default) is
-/// still empty. No shell reads an exec-form element to apply a default, so
-/// there every use counts; what Claude Code does with a default in one was
-/// not measured.
-fn uses_plugin_root(text: &str, by_shell: bool) -> bool {
+/// A use whose `$` a shell expands ([`Word::expanded`]) does not count when
+/// it is braced with a default that is not empty (`:-`, `-`, `:=` or `=`):
+/// measured with /bin/sh, bash and dash, the variable unset, the shell runs
+/// the default's path. Any other expansion of an unset variable (`%`, `#`,
+/// `:+`, an empty default) is still empty. A use whose `$` no shell expands
+/// counts, default or not, because the path then holds the text of the use:
+/// one in single quotes or after a backslash, each use on its own (so
+/// `'${CLAUDE_PLUGIN_ROOT:-/x}'"$HOME"/ironmem` counts), and every use in an
+/// exec-form element; what Claude Code does with a default in one of those
+/// was not measured.
+fn uses_plugin_root(word: &Word) -> bool {
+    let text = word.text.as_str();
     text.match_indices('$').any(|(at, _)| {
         let rest = &text[at + 1..];
         let (braced, rest) = match rest.strip_prefix('{') {
@@ -769,7 +826,7 @@ fn uses_plugin_root(text: &str, by_shell: bool) -> bool {
         if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
             return false;
         }
-        !(by_shell && braced && starts_with_a_default(after))
+        !(braced && word.expanded.contains(&at) && starts_with_a_default(after))
     })
 }
 
@@ -804,7 +861,7 @@ fn literal_path(word: &Word) -> Option<String> {
 
 /// What doctor can tell about a run's program from its program word.
 fn program_of(word: &Word) -> Program {
-    if uses_plugin_root(&word.text, !word.is_exec()) {
+    if uses_plugin_root(word) {
         Program::PluginRoot(word.text.clone())
     } else if word.is_exec() && word.text.starts_with("~/") {
         Program::ExecTilde(word.text.clone())
@@ -849,11 +906,18 @@ fn take_assignments(rest: &mut &[Word], inline: &mut Option<ModeValue>, env: boo
 
 /// The `ironmem hook` runs in shell-form `command`, run by a shell whose
 /// environment holds `inherited`; see [`HookCommand::runs_hook`] and
-/// [`HookCommand::hook_modes`] for the model.
-fn invocations(command: &str, inherited: Option<ModeSet>) -> Vec<Invocation> {
+/// [`HookCommand::hook_modes`] for the model. `expanded_before` is the byte
+/// offset in `command` of each `$` that a shell which read the string
+/// earlier had already expanded ([`Word::expanded`] of the word it came
+/// from).
+fn invocations(
+    command: &str,
+    inherited: Option<ModeSet>,
+    expanded_before: &[usize],
+) -> Vec<Invocation> {
     let mut var = ShellVar::starting_with(inherited);
     let mut found = Vec::new();
-    for words in split_commands(command) {
+    for words in split_commands(command, expanded_before) {
         let mut inline = None;
         let mut rest: &[Word] = &words;
         take_assignments(&mut rest, &mut inline, false);
@@ -976,7 +1040,7 @@ fn shell_args(args: &[Word], mode: Option<ModeSet>, found: &mut Vec<Invocation>)
         // `-ce`) as `-c`.
         if text.starts_with('-') && !text.starts_with("--") && text.contains('c') {
             if let Some(script) = args.get(i + 1) {
-                let runs = invocations(&script.text, mode);
+                let runs = invocations(&script.text, mode, &script.expanded);
                 // A string from an exec-form entry's args: a fix edits it.
                 found.extend(runs.into_iter().map(|mut run| {
                     if script.is_exec() {
@@ -1004,7 +1068,7 @@ fn shell_args(args: &[Word], mode: Option<ModeSet>, found: &mut Vec<Invocation>)
         if let Some(hook) = hook {
             // The program is the shell, found on PATH; the script it runs
             // is not checked, except for a `${CLAUDE_PLUGIN_ROOT}` in it.
-            let program = if uses_plugin_root(text, !arg.is_exec()) {
+            let program = if uses_plugin_root(arg) {
                 Program::PluginRoot(text.to_owned())
             } else {
                 Program::Unchecked
@@ -1822,19 +1886,24 @@ mod tests {
             program("bash /p/hooks/ironmem-hook.sh stop"),
             Program::Unchecked
         );
+        // `text` as the one word of a shell-form command, or as an
+        // exec-form element.
+        let uses = |text: &str, by_shell: bool| {
+            let word = if by_shell {
+                split_commands(text, &[]).remove(0).remove(0)
+            } else {
+                Word::exec(text)
+            };
+            assert_eq!(word.text, text);
+            uses_plugin_root(&word)
+        };
         for by_shell in [true, false] {
-            assert!(!uses_plugin_root("CLAUDE_PLUGIN_ROOT/hooks", by_shell));
-            assert!(!uses_plugin_root(
-                "${CLAUDE_PLUGIN_ROOTS:-/x}/hooks",
-                by_shell
-            ));
-            assert!(uses_plugin_root(
-                "${CLAUDE_PLUGIN_ROOT:+/x}/hooks",
-                by_shell
-            ));
+            assert!(!uses("CLAUDE_PLUGIN_ROOT/hooks", by_shell));
+            assert!(!uses("${CLAUDE_PLUGIN_ROOTS:-/x}/hooks", by_shell));
+            assert!(uses("${CLAUDE_PLUGIN_ROOT:+/x}/hooks", by_shell));
         }
-        assert!(!uses_plugin_root("${CLAUDE_PLUGIN_ROOT:-/x}/hooks", true));
-        assert!(uses_plugin_root("${CLAUDE_PLUGIN_ROOT:-/x}/hooks", false));
+        assert!(!uses("${CLAUDE_PLUGIN_ROOT:-/x}/hooks", true));
+        assert!(uses("${CLAUDE_PLUGIN_ROOT:-/x}/hooks", false));
     }
 
     #[test]
@@ -1914,5 +1983,61 @@ mod tests {
             exec_string.hook_modes("stop", ModeEnv::default())[0].program,
             Program::Unchecked
         );
+    }
+
+    #[test]
+    fn a_default_counts_only_where_a_shell_expands_its_use() {
+        let root = |w: &str| Program::PluginRoot(w.to_owned());
+        // Measured with /bin/sh, bash and dash, the variable unset: none of
+        // these runs the default's path, because no shell expands the use.
+        for (command, word) in [
+            (
+                "'${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem' hook stop",
+                "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem",
+            ),
+            (
+                r"\${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem hook stop",
+                "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem",
+            ),
+            (
+                r#""\${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem" hook stop"#,
+                "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem",
+            ),
+            // Another `$` in the word, which the shell does expand, does
+            // not make this use an expanded one.
+            (
+                r#"'${CLAUDE_PLUGIN_ROOT:-/x}'"$HOME"/bin/ironmem hook stop"#,
+                "${CLAUDE_PLUGIN_ROOT:-/x}$HOME/bin/ironmem",
+            ),
+            (
+                r"bash -c '\${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem hook stop'",
+                "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem",
+            ),
+            // In a double-quoted -c string the outer shell leaves a `\$` as
+            // `$` for the inner one, which does not expand it in single
+            // quotes or after a backslash of its own.
+            (
+                r#"bash -c "'\${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem' hook stop""#,
+                "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem",
+            ),
+            (
+                r#"bash -c "\\\${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem hook stop""#,
+                "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem",
+            ),
+        ] {
+            assert_eq!(program(command), root(word), "{command}");
+        }
+        // And each of these does run it: some shell expands the use.
+        for defaulted in [
+            r#""${CLAUDE_PLUGIN_ROOT:-/x}"'/a$b'/bin/ironmem hook stop"#,
+            r#"bash -c "\${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem hook stop""#,
+            r#"bash -c "true; \${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem hook stop""#,
+            // The outer shell expands it before the inner one reads the
+            // single quotes.
+            r#"bash -c "'${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem' hook stop""#,
+            r#"sh -c "bash -c \"'${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem' hook stop\"""#,
+        ] {
+            assert_eq!(program(defaulted), Program::Unchecked, "{defaulted}");
+        }
     }
 }
