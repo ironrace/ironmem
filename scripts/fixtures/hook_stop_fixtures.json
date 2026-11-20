@@ -360,6 +360,99 @@
       "command": "command exec ironmem hook stop",
       "wired": true,
       "note": "command runs the exec builtin, which runs ironmem"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop; true",
+      "wired": true,
+      "note": "a ; after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop && true",
+      "wired": true,
+      "note": "an && after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop || true",
+      "wired": true,
+      "note": "an || after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop | cat",
+      "wired": true,
+      "note": "a pipe after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop &",
+      "wired": true,
+      "note": "an & after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop)",
+      "wired": true,
+      "note": "a ) after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop\"",
+      "wired": true,
+      "note": "a \" right after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop'",
+      "wired": true,
+      "note": "a ' right after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop>/dev/null",
+      "wired": true,
+      "note": "a > redirection right after the name ends it"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop</dev/null",
+      "wired": true,
+      "note": "a < redirection right after the name ends it"
+    },
+    {
+      "command": "bash /p/hooks/ironmem-hook.sh stop; true",
+      "wired": true,
+      "note": "the plugin's hook script, then a ;"
+    },
+    {
+      "command": "/p/hooks/ironmem-hook.sh stop",
+      "wired": true,
+      "note": "the plugin's hook script named directly as the program"
+    },
+    {
+      "command": "/p/hooks/ironmem-hook.sh",
+      "args": [
+        "stop"
+      ],
+      "wired": true,
+      "note": "exec form, the plugin's hook script as the program"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stopx --harness claude-code",
+      "wired": false,
+      "note": "a longer hook name"
+    },
+    {
+      "command": "~/.ironrace/bin/ironmem hook stop-foo --harness claude-code",
+      "wired": false,
+      "note": "a hyphenated longer hook name"
+    },
+    {
+      "command": "notironmem hook stop",
+      "wired": false,
+      "note": "a program whose name ends in ironmem"
+    },
+    {
+      "command": "my-ironmem hook stop",
+      "wired": false,
+      "note": "a hyphenated program whose name ends in ironmem"
+    },
+    {
+      "command": "bash /x/notironmem-hook.sh stop",
+      "wired": false,
+      "note": "a script whose name ends in ironmem-hook.sh"
     }
   ]
 }

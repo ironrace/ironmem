@@ -4,9 +4,11 @@
 # Why this script exists: plain `cp` overwrites bytes in place, same inode.
 # macOS lets that happen even while an `ironmem serve` process is actively
 # executing the file; the write corrupts the running code page and any new
-# invocation loading the same inode silently hangs or exits. Using install(1)
-# unlinks the old file and creates a new one, so running processes keep their
-# old copy and new invocations get a clean binary.
+# invocation loading the same inode silently hangs or exits. This script
+# install(1)s the new binary under a temporary name in the same directory and
+# renames it over the old one, so running processes keep their old copy, and a
+# new invocation (a hook that starts mid-install, say) finds either the old or
+# the new whole file, never a missing or partial one.
 #
 # The script builds release (unless --skip-build), atomically replaces
 # ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies
@@ -19,6 +21,13 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 INSTALL_DIR="${IRONMEM_INSTALL_DIR:-$HOME/.ironrace/bin}"
+# Made absolute: the MCP registrations and the Claude Code hooks name $TARGET,
+# and a relative path there would resolve against whatever directory the
+# client or hook happens to start in.
+case "$INSTALL_DIR" in
+  /*) ;;
+  *) INSTALL_DIR="$PWD/$INSTALL_DIR" ;;
+esac
 TARGET="$INSTALL_DIR/ironmem"
 SOURCE="$REPO_ROOT/target/release/ironmem"
 
@@ -128,13 +137,14 @@ REQUIRED_CODEX_PROMPTS=(
 SKIP_BUILD=0
 SKIP_SKILLS=0
 SKIP_WIRING=0
+SKIP_HOOKS=0
 FORCE_SKILLS=0
 FORCE_WIRING=0
 
 usage() {
   cat <<'EOF'
 Usage: scripts/install-ironmem.sh [--skip-build] [--skip-skills] [--skip-wiring]
-                                  [--force-skills] [--force-wiring]
+                                  [--skip-hooks] [--force-skills] [--force-wiring]
 
 Options:
   --skip-build     Install the existing target/release/ironmem binary.
@@ -143,6 +153,12 @@ Options:
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse
                    config, and do not wire the Claude Code hooks into
                    $CLAUDE_HOME/settings.json.
+  --skip-hooks     Do not wire the Claude Code hooks; still register the MCP
+                   server. Without it, hooks are wired by default, and a
+                   re-run adds back any of the four you deleted. No hook is
+                   wired when the ironmem plugin is enabled in settings.json,
+                   and without jq the entries are printed instead.
+                   CLAUDE_SETTINGS_JSON overrides the settings path.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
                    files update by default (three-way merged for Codex/Claude,
                    overwritten in the Muse managed store); use --skip-skills
@@ -164,6 +180,9 @@ for arg in "$@"; do
       ;;
     --skip-wiring)
       SKIP_WIRING=1
+      ;;
+    --skip-hooks)
+      SKIP_HOOKS=1
       ;;
     --force-skills)
       FORCE_SKILLS=1
@@ -700,20 +719,31 @@ register_json_mcpservers() {
 #
 # The merge only appends. An event that already runs `ironmem hook <name>`
 # (from any path, or through the plugin's ironmem-hook.sh) is left alone, and
-# so is every other hook and key. If a run of it names a program by a literal
-# path (absolute or ~/) that is not the same file as this install's program,
-# and no run names that program, a WARN names what it runs. A PATH lookup, a
-# path the shell builds and the wrapper scripts get no WARN. An exec-form
-# entry whose program starts with ~/ gets a WARN too, even when ~/ would
-# expand to this install's program: doctor reads it as not expanded. The result is
-# built in temp files and written to settings.json once, after every event is
-# decided. A failure before that write (unreadable, unparseable or read-only
-# file, dangling symlink, a jq error, a temp-file step) prints a WARN, leaves
-# settings.json untouched and lets the install go on. The write is `cat >`
-# rather than a move, so a settings.json symlinked into a dotfiles repo stays a
-# symlink; `cat >` truncates first, so if that one write fails partway (a full
-# disk) the file can be left incomplete, and its WARN says so and names the
-# file. Every outcome returns 0.
+# so is every other hook and key. A run whose program or script word uses
+# ${CLAUDE_PLUGIN_ROOT} does not count: Claude Code leaves that variable unset
+# for a settings.json hook (measured on 2.1.329), so the run finds no script.
+# If a run of an event names a program by a literal path (absolute or ~/) that
+# is not the same file as this install's program, and no run names that
+# program, a WARN names the event and that path (never the whole entry, which
+# can carry a token). A PATH lookup, a path the shell builds and a wrapper
+# script run as `bash <script>` get no WARN; a wrapper named directly as the
+# program does, as doctor checks it. An exec-form entry whose program starts
+# with ~/ gets a WARN too, even when ~/ would expand to this install's
+# program: doctor reads it as not expanded. With disableAllHooks true the
+# hooks are still wired (a project's settings can turn them back on) and a
+# WARN says none run; with the ironmem plugin enabled none are wired, and a
+# WARN names any hand-wired copies. The result is built in temp files and
+# written to settings.json once, after every event is decided. A failure
+# before or during that write (an unreadable, unparseable, read-only or
+# several-valued file, a dangling symlink, a directory that cannot take a new
+# file, a jq error, a temp-file step, a file another program changed since it
+# was read) prints a WARN, leaves settings.json untouched and lets the install
+# go on. The write goes to a temp file in the directory of the file a symlink
+# chain ends at, which is then renamed onto that file: the links stay links,
+# a reader sees the old or the new whole file, and a write that fails partway
+# (a full disk) leaves the old one. That costs a hard link to the file (a
+# rename gives a new inode), and a new settings.json is created mode 0600. An
+# interrupt removes the temp files. Every outcome returns 0.
 #
 # A hook entry is shell form (no `args`: a shell runs the `command` string) or
 # exec form (`args` an array of strings: `command` is the program and the args
@@ -763,9 +793,12 @@ _shell_word() {
 HOOK_PROGRAM="$(_shell_word "$TARGET")"
 
 # Prints $1 escaped for the inside of a JSON string: \ and " get a backslash,
-# and newline, carriage return and tab become \n, \r and \t. One pass over
-# the characters, so no escape is escaped again.
+# newline, carriage return and tab become \n, \r and \t, and every other
+# character below U+0020 (and DEL) becomes \u00XX. One pass over the bytes
+# (LC_ALL=C, so the range is bytewise and a multibyte character passes through
+# whole), so no escape is escaped again.
 _json_string_body() {
+  local LC_ALL=C
   local rest="$1" out="" c i
   for ((i = 0; i < ${#rest}; i++)); do
     c="${rest:i:1}"
@@ -775,6 +808,10 @@ _json_string_body() {
       $'\n') out+='\n' ;;
       $'\r') out+='\r' ;;
       $'\t') out+='\t' ;;
+      [$'\x01'-$'\x1f'$'\x7f'])
+        printf -v c '\\u%04x' "'$c"
+        out+="$c"
+        ;;
       *) out+="$c" ;;
     esac
   done
@@ -784,9 +821,20 @@ _json_string_body() {
 # The path `ironmem doctor` reads for its hooks and hook_mining lines.
 _DOCTOR_SETTINGS="$HOME/.claude/settings.json"
 
-# Is $1 the settings file `ironmem doctor` reads?
+# Is $1 the settings file `ironmem doctor` reads? Another spelling of the path
+# counts (`-ef`), and so does one whose directory is doctor's while the file
+# does not exist yet (`-ef` is false for a missing file).
 _doctor_reads() {
-  [[ "$1" == "$_DOCTOR_SETTINGS" || "$1" -ef "$_DOCTOR_SETTINGS" ]]
+  [[ "$1" == "$_DOCTOR_SETTINGS" || "$1" -ef "$_DOCTOR_SETTINGS" ]] \
+    || [[ "${1##*/}" == settings.json && "${1%/*}" -ef "${_DOCTOR_SETTINGS%/*}" ]]
+}
+
+# Prints the first line of file $1 (nothing when it is missing or empty). A
+# builtin read, so a stubbed `cat` or `head` in a test never runs here.
+_first_line() {
+  local line=""
+  IFS= read -r line < "$1" 2>/dev/null
+  printf '%s' "$line"
 }
 
 # Prints the WARN for a wiring attempt that wrote nothing. $1 says what failed,
@@ -823,7 +871,10 @@ _wire_claude_hooks_warn() {
 # Where the two still differ: here a `;` `&` `|` `(` `)` or line break inside
 # quotes or a comment starts a command (`echo "x; ironmem hook stop"` counts),
 # and in doctor it does not; doctor drops a redirection before the program
-# (`2>/dev/null ironmem hook stop` counts there), and this does not.
+# (`2>/dev/null ironmem hook stop` counts there), and this does not. A program
+# or script word that uses ${CLAUDE_PLUGIN_ROOT} (or $CLAUDE_PLUGIN_ROOT)
+# never matches, in either form (re_plugin_root, plugin_root): Claude Code
+# leaves it unset for a settings.json hook, so the run finds no script.
 _CLAUDE_HOOK_JQ_DEFS='
 def base: sub("^.*/"; "");
 def is_one_of(words): . as $w | any(words; . == $w);
@@ -849,8 +900,10 @@ def re_shell:
   + "(?:\\s+(?:[-+][oO]\\s+" + re_word + "|\\+" + re_seg + "*|--" + re_seg + "*|-[^\\sc\"\u0027;&|()<>]*))*";
 def re_bash_c: re_shell + "\\s+-(?!-)[^\\s\"\u0027;&|()<>]*c[^\\s\"\u0027;&|()<>]*\\s+[\"\u0027]\\s*";
 def re_lead: re_start + re_head + "(?:" + re_bash_c + re_head + ")*";
+def re_plugin_root: "[^\\s;&|()<>]*\\$\\{?CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])";
+def plugin_root: test("\\$\\{?CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])");
 def re_program($b):
-  "(?<p>(?:" + re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*/|\u0027[^\u0027]*/|/))?" + re_q + $b + re_q + ")";
+  "(?<p>(?!" + re_plugin_root + ")(?:" + re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*/|\u0027[^\u0027]*/|/))?" + re_q + $b + re_q + ")";
 def re_name($name): "\\s+" + re_q + $name + re_q + "(?=[\\s;&|)<>]|$)";
 def re_hook($name):
   "\\s+" + re_q + "hook" + re_q + "(?:\\s+--harness\\s+" + re_word + "|\\s+--harness=" + re_seg + "*)?"
@@ -876,7 +929,8 @@ def after_hook($name):
        else .[1] end) == $name;
 def shell_script($name):
   (.[0] | base) as $b
-  | if $b == "ironmem-hook.sh" then .[1] == $name
+  | if (.[0] | plugin_root) then false
+    elif $b == "ironmem-hook.sh" then .[1] == $name
     elif $b == "ironmem-mcp.sh" then .[1:] | after_hook($name)
     else false end;
 def shell_args($name):
@@ -888,7 +942,8 @@ def shell_args($name):
 def exec_runs($name):
   peel
   | ((.[0] // "") | base) as $b
-  | if $b == "ironmem" or $b == "ironmem-mcp.sh" then .[1:] | after_hook($name)
+  | if ((.[0] // "") | plugin_root) then false
+    elif $b == "ironmem" or $b == "ironmem-mcp.sh" then .[1:] | after_hook($name)
     elif $b == "ironmem-hook.sh" then .[1] == $name
     elif $b == "bash" or $b == "sh" then .[1:] | shell_args($name)
     else false end;
@@ -911,7 +966,8 @@ def unquote:
      dynamic: any($s[]; ((startswith("\u0027") or startswith("\\")) | not) and test("[$`]")),
      tilde: (($s[0] // "") | startswith("~/"))};
 def shell_programs($name):
-  [match(re_lead + re_program("ironmem") + re_hook($name); "g")
+  [(match(re_lead + re_program("ironmem(?:-mcp\\.sh)?") + re_hook($name); "g"),
+    match(re_lead + re_program("ironmem-hook\\.sh") + re_name($name); "g"))
    | .captures[] | select(.name == "p") | .string | unquote];
 def c_string:
   if length == 0 then empty
@@ -922,7 +978,8 @@ def c_string:
 def exec_programs($name):
   peel
   | ((.[0] // "") | base) as $b
-  | if $b == "ironmem" and (.[1:] | after_hook($name)) then
+  | if (($b == "ironmem" or $b == "ironmem-mcp.sh") and (.[1:] | after_hook($name)))
+       or ($b == "ironmem-hook.sh" and .[1] == $name) then
       [{text: .[0], dynamic: (.[0] | contains("${")), tilde: (.[0] | startswith("~/")),
         exec_tilde: (.[0] | startswith("~/"))}]
     elif $b == "bash" or $b == "sh" then [.[1:] | c_string | shell_programs($name)[]]
@@ -934,8 +991,8 @@ def program_paths($name; $home):
   (if shell_form then .command | shell_programs($name)
    elif exec_form then [.command] + .args | exec_programs($name)
    else [] end)
-  | .[] | if .exec_tilde then "~" else literal_path($home) end;
-def shown: if shell_form then .command else "\(.command) with args \(.args | tojson)" end;
+  | .[] | if .exec_tilde then ["~", .text] else (literal_path($home) as $p | ["path", $p]) end;
+def visible: explode | map(if . < 32 or . == 127 then 63 else . end) | implode;
 '
 
 # Does hooks.<event> already run `ironmem hook <name>`? Exit 0 yes, 1 no, 2+ a
@@ -949,20 +1006,23 @@ _claude_hook_is_wired() {
 
 # For hooks.<event> ($2) in work file $1, one line for each run of `ironmem
 # hook <name>` ($3) whose program word is a literal path: absolute, or an
-# unquoted ~/ (read as under $HOME). Each line is that path, a tab, and the
-# entry as a WARN shows it, both with \ written as \\ and a line break or tab
-# as \n or \t, so `printf %b` reads them back. The program word may be single-
-# or double-quoted, and the run may sit in a bash/sh -c string of an exec-form
+# unquoted ~/ (read as under $HOME). The program may be ironmem, or the
+# plugin's ironmem-mcp.sh or ironmem-hook.sh named directly as the program,
+# since doctor checks each of those. Each line is a kind (`path`), a tab, the
+# path, a tab, and the path as a WARN shows it (each control character as
+# `?`), both with \ written as \\ and a line break or tab as \n or \t, so
+# `printf %b` reads them back. The program word may be single- or
+# double-quoted, and the run may sit in a bash/sh -c string of an exec-form
 # entry. A PATH lookup (a bare `ironmem`), a path the shell builds (`$HOME`,
-# `${HOME}`, a glob) and the plugin's wrapper scripts give no line, as
-# doctor's missing-program check skips them. An exec-form program that starts
-# with ~/ gives the path `~` instead: doctor reads it as not expanded (no
-# shell reads an exec-form command), so it does not run whatever ~/ would
-# expand to. A jq error exits non-zero.
+# `${HOME}`, a glob) and a wrapper script run as `bash <script>` give no
+# line, as doctor's missing-program check skips them. An exec-form program
+# that starts with ~/ gives the kind `~` and the program word as written:
+# doctor reads it as not expanded (no shell reads an exec-form command), so it
+# does not run whatever ~/ would expand to. A jq error exits non-zero.
 _claude_hook_program_paths() {
   jq -r --arg ev "$2" --arg name "$3" --arg home "$HOME" "$_CLAUDE_HOOK_JQ_DEFS"'
-      entries($ev) | select(runs_hook($name)) | shown as $shown
-      | program_paths($name; $home) | "\(esc_line)\t\($shown | esc_line)"' \
+      entries($ev) | select(runs_hook($name)) | program_paths($name; $home)
+      | "\(.[0])\t\(.[1] | esc_line)\t\(.[1] | visible | esc_line)"' \
     "$1"
 }
 
@@ -974,20 +1034,23 @@ _claude_hook_program_paths() {
 # $TARGET. Such an entry is still counted as wired, as doctor counts it (its
 # hooks line names it as wired to a program that does not run, not missing),
 # and appending a copy would run the hook twice if Claude Code did expand ~.
-# Never changes the entry; a jq error here is a WARN too.
+# Never changes the entry; a jq error here is a WARN too. A WARN names only
+# the event and the program path, never the whole entry, which can carry a
+# token in a NAME=value word or an argument.
 _warn_other_program() {
-  local work="$1" settings="$2" event="$3" name="$4" records epath eshown path shown doctor_line
+  local work="$1" settings="$2" event="$3" name="$4" err_file="${1%/*}/program-paths.err"
+  local records kind epath eshown path shown doctor_line
   local -a others=() tildes=()
-  if ! records="$(_claude_hook_program_paths "$work" "$event" "$name" 2>&1)"; then
+  if ! records="$(_claude_hook_program_paths "$work" "$event" "$name" 2>"$err_file")"; then
     echo "    WARN: jq failed checking which program the $event hook in $settings runs; left it as it is." >&2
-    echo "          jq said: ${records%%$'\n'*}" >&2
+    echo "          jq said: $(_first_line "$err_file")" >&2
     return 0
   fi
   [[ -z "$records" ]] && return 0
-  while IFS=$'\t' read -r epath eshown; do
+  while IFS=$'\t' read -r kind epath eshown; do
     printf -v path '%b' "$epath"
     printf -v shown '%b' "$eshown"
-    if [[ "$path" == "~" ]]; then
+    if [[ "$kind" == "~" ]]; then
       _in_list "$shown" "${tildes[@]+"${tildes[@]}"}" || tildes+=("$shown")
       continue
     fi
@@ -998,16 +1061,16 @@ _warn_other_program() {
   done <<< "$records"
   case "$event" in Stop | PreCompact) doctor_line="hook_mining" ;; *) doctor_line="hooks" ;; esac
   if (( ${#others[@]} > 0 )); then
-    echo "    WARN: $event in $settings is already wired, so this install left it as it is, but the program it names by path is not $TARGET, the program this install put in place. It runs:" >&2
+    echo "    WARN: $event in $settings is already wired, so this install left it as it is, but the program it names by path is not $TARGET, the program this install put in place. It names:" >&2
     _print_indented "${others[@]}"
     if _doctor_reads "$settings"; then
-      echo "          If that program is not an executable file, \`ironmem doctor\` warns on its $doctor_line line." >&2
+      echo "          If no other command for $event starts and that program is not an executable file, \`ironmem doctor\` warns on its $doctor_line line." >&2
     else
       echo "          \`ironmem doctor\` reads only $_DOCTOR_SETTINGS, not this file." >&2
     fi
   fi
   if (( ${#tildes[@]} > 0 )); then
-    echo "    WARN: $event in $settings is already wired, so this install left it as it is, but its exec-form entry (args set) starts its program with ~/, which doctor reads as not expanded, as no shell reads an exec-form command. It runs:" >&2
+    echo "    WARN: $event in $settings is already wired, so this install left it as it is, but its exec-form entry (args set) starts its program with ~/, which doctor reads as not expanded, as no shell reads an exec-form command. It names:" >&2
     _print_indented "${tildes[@]}"
     if _doctor_reads "$settings"; then
       echo "          Write the program's full path in that entry, or remove the entry and re-run this script. If no other command for $event starts, \`ironmem doctor\` reports it as not running on its $doctor_line line." >&2
@@ -1043,17 +1106,19 @@ _print_indented() {
 # any case, as McpAccessMode::parse reads it) reaches them, and any other
 # string there beats the environment, so they do not mine. With no string
 # there, the environment Claude Code is launched with decides, which this
-# script cannot see, so the line names it. A jq error prints no line, since
-# none would be known true.
+# script cannot see, so the line names it. A jq error prints a WARN saying the
+# script cannot tell, with jq's first line.
 _print_mining_line() {
-  local work="$1" settings="$2" mining="$3" see="" mode
+  local work="$1" settings="$2" mining="$3" see="" mode err_file="${1%/*}/mining.err"
   if _doctor_reads "$settings"; then
     see=" (see \`ironmem doctor\`)"
   fi
   if ! mode="$(jq -r '[.env | objects | .IRONMEM_MCP_MODE | strings]
         | if length == 0 then "unset"
           elif (.[0] | sub("^\\s+"; "") | sub("\\s+$"; "") | ascii_downcase) == "trusted" then "trusted"
-          else "other" end' "$work" 2>/dev/null)"; then
+          else "other" end' "$work" 2>"$err_file")"; then
+    echo "    WARN: jq failed reading env.IRONMEM_MCP_MODE in $settings, so this script cannot say whether $mining mine$see." >&2
+    echo "          jq said: $(_first_line "$err_file")" >&2
     return 0
   fi
   case "$mode" in
@@ -1063,19 +1128,73 @@ _print_mining_line() {
   esac
 }
 
+# Prints the WARN for a settings.json that sets disableAllHooks to true.
+_print_all_hooks_disabled() {
+  echo "    WARN: $1 sets disableAllHooks to true, so Claude Code runs none of these hooks unless a project's settings set it back to false. To turn them on, remove disableAllHooks from settings.json or set it to false." >&2
+}
+
+# Prints the file symlink $1 finally points at, or $1 itself when it is not a
+# symlink. A relative link target is read against the link's own directory.
+# Follows at most 40 links; exit 1 past that or on a readlink error.
+_resolve_link() {
+  local path="$1" link hops=0
+  while [[ -L "$path" ]]; do
+    if (( hops >= 40 )); then
+      return 1
+    fi
+    hops=$((hops + 1))
+    link="$(readlink "$path")" || return 1
+    case "$link" in
+      /*) path="$link" ;;
+      *)
+        if [[ "$path" == */* ]]; then
+          path="${path%/*}/$link"
+        else
+          path="$link"
+        fi
+        ;;
+    esac
+  done
+  printf '%s' "$path"
+}
+
+# The temp directory and the temp file next to settings.json that a wiring
+# run has open, global so the signal traps in wire_claude_hooks can remove
+# them after the functions that made them have returned.
+_HOOKS_TMP_DIR=""
+_HOOKS_SETTINGS_TMP=""
+
+_wire_claude_hooks_cleanup() {
+  if [[ -n "$_HOOKS_SETTINGS_TMP" ]]; then
+    rm -f "$_HOOKS_SETTINGS_TMP"
+  fi
+  if [[ -n "$_HOOKS_TMP_DIR" ]]; then
+    rm -rf "$_HOOKS_TMP_DIR"
+  fi
+}
+
 # Appends the plugin hooks missing from settings file $1, skipping entries it
 # cannot read (only a file that is not a JSON object, or whose hooks or an
 # event's value has the wrong type, gets a WARN). Never fails the install:
 # every problem prints a WARN and returns 0. The temp files live in a private
-# mktemp -d directory, so no other user can plant a file at their names.
+# mktemp -d directory, so no other user can plant a file at their names. An
+# interrupt, TERM or HUP removes them (and the temp file next to settings.json)
+# and ends the install, as the signal would have.
 wire_claude_hooks() {
-  local settings="$1" tmp_dir
-  tmp_dir="$(mktemp -d "${TMPDIR:-/tmp}/ironmem-hooks.XXXXXX")" || {
+  local settings="$1"
+  trap '_wire_claude_hooks_cleanup; exit 130' INT
+  trap '_wire_claude_hooks_cleanup; exit 143' TERM
+  trap '_wire_claude_hooks_cleanup; exit 129' HUP
+  if ! _HOOKS_TMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ironmem-hooks.XXXXXX")"; then
+    _HOOKS_TMP_DIR=""
+    trap - INT TERM HUP
     _wire_claude_hooks_warn "could not create a temp directory" "$settings"
     return 0
-  }
-  _wire_claude_hooks_into "$settings" "$tmp_dir/settings.json" "$tmp_dir/next.json" || true
-  rm -rf "$tmp_dir" 2>/dev/null || echo "    WARN: could not remove the temp directory $tmp_dir" >&2
+  fi
+  _wire_claude_hooks_into "$settings" "$_HOOKS_TMP_DIR/settings.json" "$_HOOKS_TMP_DIR/next.json" || true
+  rm -rf "$_HOOKS_TMP_DIR" 2>/dev/null || echo "    WARN: could not remove the temp directory $_HOOKS_TMP_DIR" >&2
+  _HOOKS_TMP_DIR=""
+  trap - INT TERM HUP
   return 0
 }
 
@@ -1087,7 +1206,9 @@ wire_claude_hooks() {
 # command does not stop it, so check the status of every command that can
 # fail, and on failure WARN and return 0.
 _wire_claude_hooks_into() {
-  local settings="$1" work="$2" next="$3" dir pair event name rc err added="" kept="" mining=""
+  local settings="$1" work="$2" next="$3" err_file="${2%/*}/jq.err"
+  local dir real real_dir before now pair event name rc err shape
+  local added="" kept="" mining="" wired_too="" disabled=0
 
   if [[ -L "$settings" && ! -e "$settings" ]]; then
     _wire_claude_hooks_warn "$settings is a dangling symlink" "$settings"
@@ -1098,31 +1219,71 @@ _wire_claude_hooks_into() {
       _wire_claude_hooks_warn "$settings is not a readable, writable file" "$settings"
       return 0
     fi
+    # The new file is renamed onto the file a symlink chain ends at, so the
+    # links stay links and that file's directory must take a new name.
+    if ! real="$(_resolve_link "$settings")" || [[ -z "$real" ]]; then
+      _wire_claude_hooks_warn "could not follow the symlinks from $settings" "$settings"
+      return 0
+    fi
+    if ! real_dir="$(dirname "$real")" || [[ ! -w "$real_dir" ]]; then
+      _wire_claude_hooks_warn "cannot write a new file in $real_dir, the directory holding $real" "$settings"
+      return 0
+    fi
     cp "$settings" "$work" 2>/dev/null || { _wire_claude_hooks_warn "could not read $settings" "$settings"; return 0; }
+    if ! before="$(cksum < "$work")"; then
+      _wire_claude_hooks_warn "could not checksum $settings" "$settings"
+      return 0
+    fi
   else
     if ! dir="$(dirname "$settings")" || ! mkdir -p "$dir" 2>/dev/null || [[ ! -w "$dir" ]]; then
       _wire_claude_hooks_warn "cannot create $settings" "$settings"
       return 0
     fi
+    real="$settings"
+    real_dir="$dir"
+    before="missing"
     if ! printf '{}\n' > "$work"; then
       _wire_claude_hooks_warn "could not write a temp file for $settings" "$settings"
       return 0
     fi
   fi
 
-  # Not `.hooks // {}`: `//` reads false as absent, and the matcher below
-  # then fails on `"hooks": false`; doctor reports that as not an object.
-  err="$(jq -e 'type == "object" and ((if .hooks == null then {} else .hooks end)
-                | type == "object" and all(.[]; type == "array"))' "$work" 2>&1 >/dev/null)" && rc=0 || rc=$?
-  if [[ "$rc" -eq 1 ]]; then
-    _wire_claude_hooks_warn "$settings is not a JSON object with array-valued hooks" "$settings"
+  # One pass over every JSON value in the file (-s), so a file holding two
+  # values is refused rather than read as two objects and rewritten as two.
+  # Not `.hooks // {}`: `//` reads false as absent, and the matcher below then
+  # fails on `"hooks": false`; doctor reports that as not an object.
+  shape="$(jq -r -s 'if length == 0 then "empty"
+        elif length > 1 then "many"
+        elif (.[0] | type == "object" and ((if .hooks == null then {} else .hooks end)
+              | type == "object" and all(.[]; type == "array"))) then "ok"
+        else "shape" end' "$work" 2>"$err_file")" && rc=0 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    _wire_claude_hooks_warn "jq could not read $settings as JSON" "$settings" "$(_first_line "$err_file")"
     return 0
-  elif [[ "$rc" -eq 4 && -z "$err" ]]; then
-    # jq -e exits 4 when its input holds no JSON value at all.
-    _wire_claude_hooks_warn "$settings holds no JSON value (it is empty or only whitespace)" "$settings"
-    return 0
-  elif [[ "$rc" -ne 0 ]]; then
-    _wire_claude_hooks_warn "jq could not read $settings as JSON" "$settings" "$err"
+  fi
+  case "$shape" in
+    ok) ;;
+    empty)
+      _wire_claude_hooks_warn "$settings holds no JSON value (it is empty or only whitespace)" "$settings"
+      return 0
+      ;;
+    many)
+      _wire_claude_hooks_warn "$settings holds more than one JSON value" "$settings"
+      return 0
+      ;;
+    *)
+      _wire_claude_hooks_warn "$settings is not a JSON object with array-valued hooks" "$settings"
+      return 0
+      ;;
+  esac
+
+  # Exit 0 when disableAllHooks is true. The hooks are still wired: a
+  # project's settings can set it back to false, and then these run.
+  jq -e '.disableAllHooks == true' "$work" >/dev/null 2>"$err_file" && rc=0 || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    disabled=1
+  elif [[ "$rc" -ne 1 ]]; then
+    _wire_claude_hooks_warn "jq failed reading disableAllHooks in $settings" "$settings" "$(_first_line "$err_file")"
     return 0
   fi
 
@@ -1133,6 +1294,29 @@ _wire_claude_hooks_into() {
          | length > 0' "$work" 2>&1 >/dev/null)" && rc=0 || rc=$?
   if [[ "$rc" -eq 0 ]]; then
     echo "    Claude hooks come from the enabled ironmem plugin; wired none in $settings"
+    # Hand-wired copies run beside the plugin's where both start; this cannot
+    # tell whether they do, so the WARN is hedged and doctor says which.
+    for pair in "${CLAUDE_HOOK_EVENTS[@]}"; do
+      event="${pair%%:*}"
+      name="${pair#*:}"
+      err="$(_claude_hook_is_wired "$work" "$event" "$name" 2>&1)" && rc=0 || rc=$?
+      if [[ "$rc" -eq 0 ]]; then
+        wired_too+="$event "
+      elif [[ "$rc" -ne 1 ]]; then
+        _wire_claude_hooks_warn "jq failed reading the $event hooks in $settings" "$settings" "$err"
+        return 0
+      fi
+    done
+    if [[ -n "$wired_too" ]]; then
+      if _doctor_reads "$settings"; then
+        echo "    WARN: $settings also hand-wires ${wired_too% }, which the enabled ironmem plugin supplies; where both copies start, the hook runs twice. Remove the hand-wired ironmem entries from settings.json. \`ironmem doctor\` says which." >&2
+      else
+        echo "    WARN: $settings also hand-wires ${wired_too% }, which the enabled ironmem plugin supplies; where both copies start, the hook runs twice. Remove the hand-wired ironmem entries from settings.json." >&2
+      fi
+    fi
+    if [[ "$disabled" -eq 1 ]]; then
+      _print_all_hooks_disabled "$settings"
+    fi
     return 0
   elif [[ "$rc" -ne 1 ]]; then
     _wire_claude_hooks_warn "jq failed reading enabledPlugins in $settings" "$settings" "$err"
@@ -1170,20 +1354,51 @@ _wire_claude_hooks_into() {
       _wire_claude_hooks_warn "the merged $settings was not a JSON object" "$settings" "$err"
       return 0
     fi
-    # In place, not mv: a settings.json symlinked into a dotfiles repo stays one.
-    # `cat >` truncates before writing, so a failure here can cut the file short.
-    # Some bytes may have landed, so this WARN does not say "wired no Claude hooks".
-    if ! cat "$work" > "$settings" 2>/dev/null; then
-      echo "    WARN: the write to $settings did not finish, so it may be incomplete. Check it, then re-run this script." >&2
+    # Another program may have written the file since it was read; writing
+    # now would drop that change. Not a lock: a write between this check and
+    # the rename below is still lost.
+    if [[ "$before" == "missing" ]]; then
+      if [[ -e "$settings" || -L "$settings" ]]; then
+        now="present"
+      else
+        now="missing"
+      fi
+    elif ! now="$(cksum < "$settings" 2>/dev/null)"; then
+      now=""
+    fi
+    if [[ "$now" != "$before" ]]; then
+      _wire_claude_hooks_warn "$settings changed while this script ran" "$settings"
+      return 0
+    fi
+    # A temp file in the target's own directory, renamed onto it: a reader
+    # sees the old or the new whole file, and a failed write leaves the file
+    # as it was. cp -p first carries the old file's mode (and, as far as cp
+    # preserves them, owner and ACLs) onto it; a new file keeps mktemp's 0600.
+    if ! _HOOKS_SETTINGS_TMP="$(mktemp "$real_dir/.settings.json.XXXXXX" 2>/dev/null)"; then
+      _HOOKS_SETTINGS_TMP=""
+      _wire_claude_hooks_warn "could not create a temp file in $real_dir" "$settings"
+      return 0
+    fi
+    if { [[ ! -e "$real" ]] || cp -p "$real" "$_HOOKS_SETTINGS_TMP" 2>/dev/null; } \
+      && cat "$work" > "$_HOOKS_SETTINGS_TMP" 2>/dev/null \
+      && mv -f "$_HOOKS_SETTINGS_TMP" "$real" 2>/dev/null; then
+      _HOOKS_SETTINGS_TMP=""
+    else
+      rm -f "$_HOOKS_SETTINGS_TMP" 2>/dev/null
+      _HOOKS_SETTINGS_TMP=""
+      _wire_claude_hooks_warn "could not write $settings" "$settings"
       return 0
     fi
     echo "==> Wired Claude hooks in $settings: ${added% }"
-    if [[ -n "$mining" ]]; then
+    if [[ -n "$mining" && "$disabled" -eq 0 ]]; then
       _print_mining_line "$work" "$settings" "${mining% }"
     fi
   fi
   if [[ -n "$kept" ]]; then
     echo "    Claude hooks already wired, left as they are: ${kept% }"
+  fi
+  if [[ "$disabled" -eq 1 ]]; then
+    _print_all_hooks_disabled "$settings"
   fi
 }
 
@@ -1201,9 +1416,18 @@ fi
 mkdir -p "$INSTALL_DIR"
 
 echo "==> Installing $SOURCE → $TARGET (atomic)"
-# install(1) unlinks the target and creates a fresh inode, safe for running
-# processes. `-m 755` sets executable bits; `-C` is a no-op copy if identical.
-install -m 755 "$SOURCE" "$TARGET"
+# install(1) writes a fresh inode under a temporary name in $INSTALL_DIR
+# (`-m 755` sets the executable bits), and the rename onto $TARGET is atomic
+# because both names are in one directory: a process already running the old
+# file keeps it, and one starting now execs the old or the new whole binary.
+# How install(1) itself replaces an existing file differs between BSD and GNU,
+# so it is never pointed at $TARGET directly.
+TARGET_NEW="$TARGET.new.$$"
+if ! install -m 755 "$SOURCE" "$TARGET_NEW" || ! mv -f "$TARGET_NEW" "$TARGET"; then
+  rm -f "$TARGET_NEW"
+  echo "ERROR: could not install $SOURCE as $TARGET" >&2
+  exit 1
+fi
 
 echo "==> Verifying installed binary"
 if ! VERSION_OUTPUT=$("$TARGET" --version 2>&1); then
@@ -1304,14 +1528,21 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
     echo "          the ironmem entry so a stale command cannot abort a Muse session, and" >&2
     echo "          \"schema_version\": 1 alongside \"mcpServers\" if you are creating that file:" >&2
     echo "          { \"schema_version\": 1, \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" }, \"mode\": \"optional\" } } }" >&2
-    echo "          Claude Code hooks were not wired either. Add these four to $CLAUDE_SETTINGS_JSON (skip this if the ironmem Claude Code plugin is enabled)" >&2
-    echo "          under \"hooks\", one key each for SessionStart, UserPromptSubmit, Stop and PreCompact, shaped as" >&2
-    echo "          \"<Event>\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"$(_json_string_body "$HOOK_PROGRAM") hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] } ]" >&2
+    if [[ "$SKIP_HOOKS" -eq 0 ]]; then
+      echo "          Claude Code hooks were not wired either. Add these four to $CLAUDE_SETTINGS_JSON (skip this if the ironmem Claude Code plugin is enabled)" >&2
+      echo "          under \"hooks\", one key each for SessionStart, UserPromptSubmit, Stop and PreCompact, shaped as" >&2
+      echo "          \"<Event>\": [ { \"hooks\": [ { \"type\": \"command\", \"command\": \"$(_json_string_body "$HOOK_PROGRAM") hook <session-start|user-prompt-submit|stop|precompact> --harness claude-code\" } ] } ]" >&2
+    fi
   else
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \
       '{"schema_version": 1}' '{"mode": "optional"}'
-    wire_claude_hooks "$CLAUDE_SETTINGS_JSON"
+    if [[ "$SKIP_HOOKS" -eq 0 ]]; then
+      wire_claude_hooks "$CLAUDE_SETTINGS_JSON"
+    fi
+  fi
+  if [[ "$SKIP_HOOKS" -eq 1 ]]; then
+    echo "==> Skipping Claude Code hook wiring (--skip-hooks)"
   fi
 
   # ---- Codex: ~/.codex/config.toml [mcp_servers.ironmem] --------------------

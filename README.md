@@ -663,9 +663,17 @@ the first `[FAIL]`:
 
   Re-running `scripts/install-ironmem.sh` appends only the missing hooks and
   leaves every hook that is already wired alone, so it fixes a missing hook or
-  a missing `settings.json`. It does not fix a hook that fails to start or runs
-  twice, a mis-shaped `hooks` block, `disableAllHooks`, or an unreadable
-  `settings.json`, which you fix by hand. The hooks it adds bring back session
+  a missing `settings.json`, and it adds back any of the four hooks you
+  deleted unless you pass `--skip-hooks`, which skips the hooks and still
+  registers the MCP server (`--skip-wiring` skips both). It does not fix a
+  hook that fails to start or runs twice, a mis-shaped `hooks` block,
+  `disableAllHooks` (it wires the hooks anyway and warns that none run), or an
+  unreadable `settings.json`, which you fix by hand. A command that reaches
+  the hook through `${CLAUDE_PLUGIN_ROOT}` does not count as wired: Claude
+  Code leaves that variable unset for a `settings.json` hook, so the
+  installer adds its own, and you can delete the copied plugin command. With
+  the plugin enabled it wires nothing and warns when `settings.json` also
+  hand-wires any of the four. The hooks it adds bring back session
   context and prompt recall. They set no `IRONMEM_MCP_MODE`, so they mine only
   once `IRONMEM_MCP_MODE=trusted` reaches them: from their commands, from
   `settings.json`'s `env`, or from the environment Claude Code is launched
@@ -675,12 +683,17 @@ the first `[FAIL]`:
   launched with decides. When a
   hook it leaves alone names a program by a full path (or `~/...`) that is not
   the same file as the one it installed, and no command of that hook names
-  the installed program, it prints a WARN naming what that hook runs; a bare
-  `ironmem` found on `PATH`, a path built with `$HOME` and the plugin's
-  wrapper scripts get no WARN. An exec-form entry whose program starts with
+  the installed program, it prints a WARN naming the event and that program
+  path; a bare `ironmem` found on `PATH`, a path built with `$HOME` and a
+  wrapper script run as `bash <script>` get no WARN, while the plugin's
+  `ironmem-hook.sh` or `ironmem-mcp.sh` named directly as the program gets
+  one. An exec-form entry whose program starts with
   `~/` gets a WARN too, even when it would expand to the installed program,
   since doctor reports it as not running; the installer still counts it as
-  wired and leaves it.
+  wired and leaves it. It writes `settings.json` once, through a temp file
+  beside the file a symlink chain ends at, renamed onto it, so a symlink
+  stays a symlink and a failed write leaves the old file; a hard link to the
+  file is not kept.
 - **`hook_mining` not mining** (a `[WARN]`) → a Stop or PreCompact hook does not
   mine, or neither is wired. A wired hook does not mine when its
   `IRONMEM_MCP_MODE` is `read-only` or `restricted`, or is invalid (the hook

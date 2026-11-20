@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import shlex
 import shutil
 import stat
@@ -80,8 +81,10 @@ class InstallIronmemSelfTest(unittest.TestCase):
         *,
         skip_skills: bool = True,
         skip_wiring: bool = False,
+        skip_hooks: bool = False,
         extra_env: dict[str, str] | None = None,
         expected_returncode: int = 0,
+        cwd: pathlib.Path = ROOT,
     ) -> subprocess.CompletedProcess[str]:
         codex_home = home / ".codex"
         install_dir = home / ".ironrace" / "bin"
@@ -90,6 +93,8 @@ class InstallIronmemSelfTest(unittest.TestCase):
             command.append("--skip-skills")
         if skip_wiring:
             command.append("--skip-wiring")
+        if skip_hooks:
+            command.append("--skip-hooks")
         env = {
             **os.environ,
             "HOME": str(home),
@@ -119,7 +124,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
             env.pop("CLAUDE_SETTINGS_JSON", None)
         result = subprocess.run(
             command,
-            cwd=ROOT,
+            cwd=cwd,
             env=env,
             capture_output=True,
             text=True,
@@ -898,6 +903,9 @@ class InstallIronmemSelfTest(unittest.TestCase):
                     self.assertEqual(record.read_text(encoding="utf-8").splitlines(), expected)
 
             second = self.run_installer(home, home / ".claude.json", extra_env=env)
+            # Nothing in the path was run as code, by the installer or the hooks.
+            self.assertEqual(list(home.rglob("PWNED")), [])
+            self.assertFalse((ROOT / "PWNED").exists())
             self.assertEqual(self.claude_settings(home), settings, "a re-run adds nothing")
             self.assertNotIn("Wired Claude hooks", second.stdout)
             # Its own commands name this install's program: no other-program WARN.
@@ -919,10 +927,61 @@ class InstallIronmemSelfTest(unittest.TestCase):
     def test_hooks_run_from_an_install_dir_with_regex_characters(self) -> None:
         self.assert_hooks_run_from_an_unsafe_install_dir("a+b(c)")
 
+    def test_hooks_run_from_an_install_dir_with_shell_characters(self) -> None:
+        for dir_name in ("a$(touch PWNED)b", "a`touch PWNED`b", "a\\b", 'a"b', "a;b", "a*b", "a!b", "a{x,y}b", "a&b"):
+            with self.subTest(dir_name=dir_name):
+                self.assert_hooks_run_from_an_unsafe_install_dir(dir_name)
+
+    def test_a_relative_install_dir_is_made_absolute(self) -> None:
+        # A hook or MCP client starts in a directory of its own choosing, so a
+        # relative program path would not find the installed binary.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            work = home / "work"
+            work.mkdir()
+
+            self.run_installer(home, home / ".claude.json", extra_env={"IRONMEM_INSTALL_DIR": "relbin"}, cwd=work)
+
+            # The shell's $PWD spells the directory physically (/private/var on macOS).
+            target = work.resolve() / "relbin" / "ironmem"
+            self.assertTrue(target.is_file())
+            self.assertEqual(self.read_claude_server(home / ".claude.json")["command"], str(target))
+            self.assertEqual(
+                self.ironmem_hook_commands(self.claude_settings(home), "Stop"),
+                [f"{target} hook stop --harness claude-code"],
+            )
+
+    def test_the_binary_is_renamed_into_place_from_a_temp_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            install_dir = home / ".ironrace" / "bin"
+            install_dir.mkdir(parents=True)
+            target = install_dir / "ironmem"
+            target.write_text("old", encoding="utf-8")
+            old_inode = target.stat().st_ino
+
+            self.run_installer(home, home / ".claude.json", skip_wiring=True)
+
+            self.assertEqual(sorted(p.name for p in install_dir.iterdir()), ["ironmem"])
+            self.assertNotEqual(target.stat().st_ino, old_inode, "a new inode, not the old file rewritten")
+            self.assertEqual(target.read_bytes(), RELEASE_BINARY.read_bytes())
+            self.assertTrue(os.access(target, os.X_OK))
+
+    def test_a_failed_rename_of_the_binary_fails_and_leaves_no_temp_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            install_dir = home / ".ironrace" / "bin"
+            env = self.command_stub(home, "mv", "ironmem.new.", 'echo "stub mv failure" >&2; exit 1')
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env, expected_returncode=1)
+
+            self.assertIn(f"ERROR: could not install {RELEASE_BINARY} as {install_dir / 'ironmem'}", result.stderr)
+            self.assertEqual(list(install_dir.iterdir()), [])
+
     def test_without_jq_the_printed_hook_command_is_quoted(self) -> None:
-        # A space needs shell quoting; a `"`, `\`, newline or tab also needs
-        # JSON escaping.
-        for dir_name in ("Jo Smith", 'Jo "JJ" \\ Smith', "Jo\nnew\tline"):
+        # A space needs shell quoting; a `"`, `\`, newline, tab or other
+        # control character also needs JSON escaping.
+        for dir_name in ("Jo Smith", 'Jo "JJ" \\ Smith', "Jo\nnew\tline", "Jo\x01\x1bctl\x7f é"):
             with self.subTest(dir_name=dir_name), tempfile.TemporaryDirectory() as directory:
                 home = pathlib.Path(directory)
                 path = self.path_without_jq(home / "no-jq-bin")
@@ -1026,6 +1085,43 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.run_installer(home, home / ".claude.json", skip_wiring=True)
             self.assertFalse((home / ".claude" / "settings.json").exists())
 
+    def test_skip_hooks_registers_mcp_but_wires_no_hooks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            result = self.run_installer(home, home / ".claude.json", skip_hooks=True)
+
+            self.assertFalse((home / ".claude" / "settings.json").exists())
+            self.assertEqual(self.read_claude_server(home / ".claude.json")["command"], str(home / ".ironrace" / "bin" / "ironmem"))
+            self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
+            self.assertIn("==> Skipping Claude Code hook wiring (--skip-hooks)", result.stdout)
+            self.assertNotIn("Wired Claude hooks", result.stdout)
+
+    def test_skip_hooks_leaves_a_settings_file_with_hooks_removed_as_it_is(self) -> None:
+        # Without --skip-hooks a re-run adds back a deleted hook; with it, not.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_text(encoding="utf-8")
+
+            self.run_installer(home, home / ".claude.json", skip_hooks=True)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+
+            self.run_installer(home, home / ".claude.json")
+
+            self.assertEqual(len(self.ironmem_hook_commands(self.claude_settings(home), "Stop")), 1)
+
+    def test_skip_hooks_without_jq_prints_no_hook_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.path_without_jq(home / "no-jq-bin")
+
+            result = self.run_installer(home, home / ".claude.json", skip_hooks=True, extra_env={"PATH": path})
+
+            self.assertIn("jq not installed", result.stderr)
+            self.assertNotIn("Claude Code hooks were not wired", result.stderr)
+            self.assertNotIn('"<Event>"', result.stderr)
+
     def stop_commands_after_install(self, existing: str) -> list[str]:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
@@ -1052,26 +1148,6 @@ class InstallIronmemSelfTest(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertEqual(self.stop_commands_after_install(command), [command])
-
-    def test_shell_terminator_after_the_hook_name_counts_as_wired(self) -> None:
-        for tail in ("; true", " && true", " || true", " | cat", " &", ")", '"', "'", ">/dev/null", "</dev/null"):
-            command = f"~/.ironrace/bin/ironmem hook stop{tail}"
-            with self.subTest(command=command):
-                self.assertEqual(self.stop_commands_after_install(command), [command])
-        wrapper = "bash /p/hooks/ironmem-hook.sh stop; true"
-        self.assertEqual(self.stop_commands_after_install(wrapper), [wrapper])
-
-    def test_a_longer_hook_name_does_not_count_as_wired(self) -> None:
-        for command in (
-            "~/.ironrace/bin/ironmem hook stopx --harness claude-code",
-            "~/.ironrace/bin/ironmem hook stop-foo --harness claude-code",
-            "notironmem hook stop",
-            "my-ironmem hook stop",
-            "bash /x/notironmem-hook.sh stop",
-        ):
-            with self.subTest(command=command):
-                own = "<target> hook stop --harness claude-code"
-                self.assertEqual(self.stop_commands_after_install(command), [command, own])
 
     def test_shared_stop_fixtures_are_matched_as_doctor_reads_them(self) -> None:
         rows = json.loads(HOOK_STOP_FIXTURES.read_text(encoding="utf-8"))["rows"]
@@ -1105,6 +1181,34 @@ class InstallIronmemSelfTest(unittest.TestCase):
                     self.assertEqual(len(stop), 2, stop)
                     self.assertIn("hook stop --harness claude-code", json.dumps(stop[1]))
                     self.assertNotIn("already wired", result.stdout)
+
+    @staticmethod
+    def hook_jq_defs() -> str:
+        text = INSTALLER.read_text(encoding="utf-8")
+        match = re.search(r"^_CLAUDE_HOOK_JQ_DEFS='([^']*)'$", text, re.M)
+        assert match, "no _CLAUDE_HOOK_JQ_DEFS in the installer"
+        return match.group(1)
+
+    def test_shared_fixtures_are_matched_for_every_event(self) -> None:
+        # The fixture rows are Stop entries; with `stop` swapped for each hook's
+        # name they must give the same answer for all four, hyphenated names
+        # included. Runs the installer's own runs_hook, without an install.
+        rows = json.loads(HOOK_STOP_FIXTURES.read_text(encoding="utf-8"))["rows"]
+        for event, name in self.plugin_hook_names().items():
+            entries = [
+                json.loads(json.dumps({"type": "command", **{k: v for k, v in row.items() if k not in ("wired", "note")}}).replace("stop", name))
+                for row in rows
+            ]
+            ran = subprocess.run(
+                ["jq", "-c", "--arg", "name", name, self.hook_jq_defs() + "[.[] | runs_hook($name)]"],
+                input=json.dumps(entries),
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(ran.returncode, 0, ran.stderr)
+            for row, entry, wired in zip(rows, entries, json.loads(ran.stdout)):
+                with self.subTest(event=event, entry=entry, note=row["note"]):
+                    self.assertEqual(wired, row["wired"])
 
     def test_a_trusted_prefix_counts_as_wired(self) -> None:
         # The prefix doctor's hint tells users to add to a read-only hook.
@@ -1144,6 +1248,10 @@ class InstallIronmemSelfTest(unittest.TestCase):
                     contents, "{path} holds no JSON value (it is empty or only whitespace)"
                 )
 
+    def test_several_json_values_are_refused(self) -> None:
+        # jq without -s would read each value and write each back, merged.
+        self.assert_settings_refused('{"a": 1}\n{"b": 2}\n', "{path} holds more than one JSON value")
+
     def test_a_top_level_array_is_reported_as_not_an_object(self) -> None:
         self.assert_settings_refused("[1]", "{path} is not a JSON object with array-valued hooks")
 
@@ -1157,12 +1265,45 @@ class InstallIronmemSelfTest(unittest.TestCase):
                     contents, "{path} is not a JSON object with array-valued hooks"
                 )
 
+    def installer_jq_programs(self) -> list[str]:
+        """The hook jq definitions and every jq program the installer passes
+        inline, read from its code with comment lines dropped."""
+        code = "\n".join(
+            line for line in INSTALLER.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#")
+        )
+        inline = re.findall(r"(?:^|\$\(|[|;&!]|\bif|\bthen)\s*jq\s(?:[^'\n]|\\\n)*'([^']*)'", code, re.M)
+        self.assertGreater(len(inline), 10, inline)
+        self.assertTrue(any("disableAllHooks" in program for program in inline), inline)
+        return [self.hook_jq_defs(), *inline]
+
     def test_the_hook_jq_uses_no_builtin_newer_than_jq_1_5(self) -> None:
-        # jq 1.5, still packaged on some distributions, has no IN (added in
-        # 1.6): one IN( in the shared defs makes every hook jq call fail to
-        # compile, so no hook would be wired.
-        text = INSTALLER.read_text(encoding="utf-8")
-        self.assertNotRegex(text, r"\bIN\(")
+        # jq 1.5, still packaged on some distributions, lacks these (jq's
+        # NEWS.md): IN and INDEX (the SQL-style builtins), walk, isempty,
+        # halt_error, utf8bytelength, $ENV and ?// came in 1.6; pick, abs and
+        # `if` without `else` in 1.7; trim, ltrim, rtrim, trimstr, toboolean
+        # and skip in 1.8. One of them in the shared defs makes every hook jq
+        # call fail to compile, so no hook would be wired.
+        newer = re.compile(
+            r"\b(?:IN|INDEX|walk|isempty|pick|trim|ltrim|rtrim|trimstr|toboolean|skip|halt_error|utf8bytelength)\("
+            r"|\babs\b|\$ENV\b|\?//"
+        )
+        for program in self.installer_jq_programs():
+            with self.subTest(program=program[:60]):
+                self.assertIsNone(newer.search(program))
+                # Every `if` has an `else` (jq 1.5 has no `if` without one).
+                # String literals are dropped first, so a regex holding "end"
+                # cannot count.
+                words = re.findall(r"\b(?:if|else|end)\b", re.sub(r'"(?:[^"\\]|\\.)*"', '""', program))
+                open_ifs: list[bool] = []
+                for word in words:
+                    if word == "if":
+                        open_ifs.append(False)
+                    elif word == "else":
+                        self.assertTrue(open_ifs, "else without if")
+                        open_ifs[-1] = True
+                    else:
+                        self.assertTrue(open_ifs and open_ifs.pop(), "an if without an else")
+                self.assertEqual(open_ifs, [])
 
     def test_a_refused_file_doctor_does_not_read_says_so(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1182,14 +1323,17 @@ class InstallIronmemSelfTest(unittest.TestCase):
             )
             self.assertNotIn("shows what is missing", result.stderr)
 
-    def other_program_warning(self, home: pathlib.Path, event: str, runs: str, line: str) -> str:
+    def other_program_warning(self, home: pathlib.Path, event: str, program: str, line: str) -> str:
+        # Doctor warns only when no other run of the event starts, and the WARN
+        # names only the program path, never the whole entry.
         path = home / ".claude" / "settings.json"
         target = home / ".ironrace" / "bin" / "ironmem"
         return (
             f"    WARN: {event} in {path} is already wired, so this install left it as it is, but "
-            f"the program it names by path is not {target}, the program this install put in place. It runs:\n"
-            f"            {runs}\n"
-            f"          If that program is not an executable file, `ironmem doctor` warns on its {line} line.\n"
+            f"the program it names by path is not {target}, the program this install put in place. It names:\n"
+            f"            {program}\n"
+            f"          If no other command for {event} starts and that program is not an executable file, "
+            f"`ironmem doctor` warns on its {line} line.\n"
         )
 
     def test_an_event_wired_to_another_program_is_named_in_a_warning(self) -> None:
@@ -1214,12 +1358,10 @@ class InstallIronmemSelfTest(unittest.TestCase):
             result = self.run_installer(home, home / ".claude.json")
 
             self.assertEqual(self.claude_settings(home), original)
-            self.assertIn(self.other_program_warning(home, "Stop", stop, "hook_mining"), result.stderr)
-            self.assertIn(self.other_program_warning(home, "UserPromptSubmit", prompt, "hooks"), result.stderr)
-            runs = 'env with args ["IRONMEM_MCP_MODE=trusted","/old/ironmem","hook","session-start"]'
-            self.assertIn(self.other_program_warning(home, "SessionStart", runs, "hooks"), result.stderr)
-            runs = 'bash with args ["-c","\\"/old/ironmem\\" hook precompact"]'
-            self.assertIn(self.other_program_warning(home, "PreCompact", runs, "hook_mining"), result.stderr)
+            self.assertIn(self.other_program_warning(home, "Stop", "/opt/elsewhere/ironmem", "hook_mining"), result.stderr)
+            self.assertIn(self.other_program_warning(home, "UserPromptSubmit", "/opt/old dir/ironmem", "hooks"), result.stderr)
+            self.assertIn(self.other_program_warning(home, "SessionStart", "/old/ironmem", "hooks"), result.stderr)
+            self.assertIn(self.other_program_warning(home, "PreCompact", "/old/ironmem", "hook_mining"), result.stderr)
             self.assertIn(
                 "Claude hooks already wired, left as they are: SessionStart UserPromptSubmit Stop PreCompact",
                 result.stdout,
@@ -1227,8 +1369,9 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
     def test_an_event_wired_to_this_install_gets_no_program_warning(self) -> None:
         # <target> is this install's program and <link> a symlink to it. A PATH
-        # lookup, a path the shell builds and the plugin's wrapper scripts are
-        # not judged, as doctor's missing-program check does not judge them.
+        # lookup, a path the shell builds and a wrapper script run as `bash
+        # <script>` are not judged, as doctor's missing-program check does not
+        # judge them.
         shell_commands = (
             "<target> hook stop",
             '"<target>" hook stop',
@@ -1292,11 +1435,11 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
                 result = self.run_installer(home, home / ".claude.json")
 
-                shown = f"{command} with args {json.dumps(args, separators=(',', ':'))}"
+                shown = "~/.ironrace/bin/ironmem"
                 self.assertIn(
                     f"    WARN: Stop in {path} is already wired, so this install left it as it is, but "
                     "its exec-form entry (args set) starts its program with ~/, which doctor reads as "
-                    "not expanded, as no shell reads an exec-form command. It runs:\n"
+                    "not expanded, as no shell reads an exec-form command. It names:\n"
                     f"            {shown}\n"
                     "          Write the program's full path in that entry, or remove the entry and "
                     "re-run this script. If no other command for Stop starts, `ironmem doctor` "
@@ -1320,7 +1463,59 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
                 result = self.run_installer(home, home / ".claude.json")
 
-                self.assertIn(self.other_program_warning(home, "Stop", stop, "hook_mining"), result.stderr)
+                self.assertIn(self.other_program_warning(home, "Stop", str(other), "hook_mining"), result.stderr)
+
+    def test_a_program_warning_names_only_the_program_path(self) -> None:
+        # A token in a NAME=value word or an argument never reaches the output,
+        # and a bare `ironmem` run beside the other one still leaves the WARN
+        # (doctor then reports the hook as starting, so the WARN is hedged).
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            stop = [
+                {"hooks": [{"type": "command", "command": "API_TOKEN=sekrit /old/bin/ironmem hook stop --token sekrit"}]},
+                {"hooks": [{"type": "command", "command": "ironmem hook stop"}]},
+                {"hooks": [{"type": "command", "command": "env", "args": ["API_TOKEN=sekrit", "/old/bin/ironmem", "hook", "stop"]}]},
+            ]
+            self.settings_with_stop(home, stop)
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertIn(self.other_program_warning(home, "Stop", "/old/bin/ironmem", "hook_mining"), result.stderr)
+            self.assertEqual(result.stderr.count("/old/bin/ironmem"), 1, "one line per distinct path")
+            self.assertNotIn("sekrit", result.stderr + result.stdout)
+
+    def test_a_program_path_with_control_characters_is_shown_with_question_marks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            # No `[`: a glob character would make it a path the shell builds.
+            program = "/old/a\x1bb\rc\x07d\x7fe/ironmem"
+            self.settings_with_stop(home, [{"hooks": [{"type": "command", "command": "env", "args": [program, "hook", "stop"]}]}])
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertIn(self.other_program_warning(home, "Stop", "/old/a?b?c?d?e/ironmem", "hook_mining"), result.stderr)
+            for byte in ("\x1b", "\r", "\x07", "\x7f"):
+                self.assertNotIn(byte, result.stderr)
+
+    def test_a_wrapper_script_named_as_the_program_gets_a_program_warning(self) -> None:
+        # Doctor checks a wrapper named directly as the program (not one run as
+        # `bash <script>`), so the installer names it too.
+        cases = (
+            ("/old/hooks/ironmem-hook.sh stop", "/old/hooks/ironmem-hook.sh"),
+            ("/old/bin/ironmem-mcp.sh hook stop", "/old/bin/ironmem-mcp.sh"),
+            ({"command": "/old/hooks/ironmem-hook.sh", "args": ["stop"]}, "/old/hooks/ironmem-hook.sh"),
+            ({"command": "/old/bin/ironmem-mcp.sh", "args": ["hook", "stop"]}, "/old/bin/ironmem-mcp.sh"),
+        )
+        for entry, program in cases:
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                hook = {"type": "command", **(entry if isinstance(entry, dict) else {"command": entry})}
+                self.settings_with_stop(home, [{"hooks": [hook]}])
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                self.assertIn(self.other_program_warning(home, "Stop", program, "hook_mining"), result.stderr)
+                self.assertIn("Claude hooks already wired, left as they are: Stop", result.stdout)
 
     def test_a_program_warning_for_a_file_doctor_does_not_read_says_so(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1361,6 +1556,55 @@ class InstallIronmemSelfTest(unittest.TestCase):
 
             self.assertIn("Fix that, then re-run this script. `ironmem doctor` shows what is missing.", refused.stderr)
             self.assertNotIn("not this file", refused.stderr)
+
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "precondition: root writes into a mode 0555 directory",
+    )
+    def test_a_trailing_slash_in_claude_home_names_doctor_when_the_file_cannot_be_made(self) -> None:
+        # `-ef` is false for a file that does not exist, so the directories are
+        # compared instead.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            claude = home / ".claude"
+            claude.mkdir()
+            claude.chmod(0o555)
+            try:
+                result = self.run_installer(home, home / ".claude.json", extra_env={"CLAUDE_HOME": f"{claude}/"})
+            finally:
+                claude.chmod(0o755)
+
+            self.assertIn(f"WARN: cannot create {claude}//settings.json; wired no Claude hooks.", result.stderr)
+            self.assertIn("`ironmem doctor` shows what is missing.", result.stderr)
+            self.assertNotIn("not this file", result.stderr)
+
+    def test_a_jq_error_in_the_mining_line_says_it_cannot_tell(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            env = self.jq_stub(home, "IRONMEM_MCP_MODE | strings")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertIn("Wired Claude hooks", result.stdout)
+            self.assertIn(
+                f"    WARN: jq failed reading env.IRONMEM_MCP_MODE in {path}, so this script cannot say whether "
+                "Stop PreCompact mine (see `ironmem doctor`).\n          jq said: stub jq failure\n",
+                result.stderr,
+            )
+
+    def test_jq_stderr_on_success_is_not_read_as_a_program_path(self) -> None:
+        # A jq that writes a notice to stderr and still succeeds. A PATH lookup
+        # gives no record of its own, so a merged notice would be the only one.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            self.settings_with_stop(home, [{"hooks": [{"type": "command", "command": "ironmem hook stop"}]}])
+            env = self.command_stub(home, "jq", "--arg home ", 'echo "/opt/noise/ironmem" >&2')
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertNotIn("WARN", result.stderr)
+            self.assertIn("already wired, left as they are: Stop", result.stdout)
 
     def mining_line_after_install(self, settings: dict[str, object]) -> str:
         """The line the installer prints about Stop and PreCompact mining after
@@ -1531,23 +1775,108 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertNotIn("Wired Claude hooks", result.stdout)
             self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
 
-    def test_a_failed_final_write_names_the_file_it_may_have_cut_short(self) -> None:
+    def test_a_failed_final_write_leaves_settings_unchanged_and_says_so(self) -> None:
+        # The merged file is written to a temp file next to settings.json and
+        # renamed onto it, so a write that fails partway (a full disk) leaves
+        # settings.json as it was and no temp file behind.
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
             path = self.settings_with_stop(home, [])
+            before = path.read_bytes()
             # Writes three bytes of the merged file, then fails, like a full disk.
             env = self.command_stub(home, "cat", "ironmem-hooks", 'head -c 3 "$1"; exit 1')
 
             result = self.run_installer(home, home / ".claude.json", extra_env=env)
 
-            warning = f"WARN: the write to {path} did not finish, so it may be incomplete. Check it, then re-run this script."
-            self.assertIn(warning, result.stderr)
-            # Some bytes may have landed, so it must not claim nothing was wired.
-            line = next(line for line in result.stderr.splitlines() if "did not finish" in line)
-            self.assertNotIn("wired no Claude hooks", line)
-            self.assertNotIn("wired no Claude hooks", result.stderr)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertIn(f"WARN: could not write {path}; wired no Claude hooks.", result.stderr)
+            self.assertEqual(sorted(p.name for p in path.parent.iterdir()), ["settings.json"])
             self.assertNotIn("Wired Claude hooks", result.stdout)
             self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text(encoding="utf-8"))
+
+    def test_the_write_replaces_the_file_a_symlink_chain_ends_at(self) -> None:
+        # Two relative hops; both links stay links, and the file keeps its mode.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            real = home / "dots" / "sub" / "real.json"
+            real.parent.mkdir(parents=True)
+            real.write_text("{}", encoding="utf-8")
+            real.chmod(0o640)
+            hop = home / "dots" / "link2.json"
+            hop.symlink_to("sub/real.json")
+            link = home / ".claude" / "settings.json"
+            link.parent.mkdir()
+            link.symlink_to("../dots/link2.json")
+
+            self.run_installer(home, home / ".claude.json")
+
+            self.assertTrue(link.is_symlink() and hop.is_symlink())
+            self.assertEqual(set(json.loads(real.read_text(encoding="utf-8"))["hooks"]), set(self.plugin_hook_names()))
+            self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o640)
+            self.assertEqual(sorted(p.name for p in real.parent.iterdir()), ["real.json"])
+
+    def test_a_new_settings_file_is_private(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            self.run_installer(home, home / ".claude.json")
+            self.assertEqual(stat.S_IMODE((home / ".claude" / "settings.json").stat().st_mode), 0o600)
+
+    @unittest.skipIf(
+        hasattr(os, "geteuid") and os.geteuid() == 0,
+        "precondition: root writes into a mode 0555 directory",
+    )
+    def test_a_read_only_directory_refuses_the_write_up_front(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_bytes()
+            path.parent.chmod(0o555)
+            try:
+                result = self.run_installer(home, home / ".claude.json")
+            finally:
+                path.parent.chmod(0o755)
+
+            self.assertEqual(path.read_bytes(), before)
+            self.assertIn(
+                f"WARN: cannot write a new file in {path.parent}, the directory holding {path}; wired no Claude hooks.",
+                result.stderr,
+            )
+
+    def test_a_settings_file_changed_during_the_run_is_not_overwritten(self) -> None:
+        for existing in (True, False):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                path = home / ".claude" / "settings.json"
+                if existing:
+                    self.settings_with_stop(home, [])
+                else:
+                    path.parent.mkdir(parents=True)
+                # Another program writes settings.json while the merge runs: on
+                # the last check of the merged work file, just before the write.
+                other = '{"model": "written meanwhile"}'
+                env = self.command_stub(home, "jq", '-e|type == "object"|ironmem-hooks', f"printf %s {shlex.quote(other)} > {shlex.quote(str(path))}")
+
+                result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+                self.assertEqual(path.read_text(encoding="utf-8"), other)
+                self.assertIn(f"WARN: {path} changed while this script ran; wired no Claude hooks.", result.stderr)
+                self.assertNotIn("Wired Claude hooks", result.stdout)
+
+    def test_an_interrupted_wiring_removes_its_temp_files_and_stops(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            (home / "tmp").mkdir()
+            # cp runs in the installer's own process, so $PPID is the installer.
+            env = {
+                **self.command_stub(home, "cp", "ironmem-hooks", "kill -TERM $PPID; exit 1"),
+                "TMPDIR": str(home / "tmp"),
+            }
+            self.settings_with_stop(home, [])
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env, expected_returncode=143)
+
+            self.assertEqual(list((home / "tmp").iterdir()), [])
+            self.assertNotIn("==> Done", result.stdout)
 
     def test_a_failed_dirname_creates_no_settings_and_says_so(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1612,6 +1941,123 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertIn("wired no Claude hooks", result.stderr)
             self.assertFalse((home / "no-such-dir").exists())
 
+    def disabled_all_hooks_warning(self, path: pathlib.Path) -> str:
+        return (
+            f"    WARN: {path} sets disableAllHooks to true, so Claude Code runs none of these hooks unless a "
+            "project's settings set it back to false. To turn them on, remove disableAllHooks from "
+            "settings.json or set it to false.\n"
+        )
+
+    def test_disable_all_hooks_still_wires_and_warns_instead_of_the_mining_line(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"disableAllHooks": True}), encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            # A project's settings can set it back to false, and then these run.
+            self.assertEqual(set(self.claude_settings(home)["hooks"]), set(self.plugin_hook_names()))
+            self.assertIn(self.disabled_all_hooks_warning(path), result.stderr)
+            self.assertNotIn("prompt recall still works", result.stdout)
+            self.assertNotIn("mine", result.stdout)
+
+            again = self.run_installer(home, home / ".claude.json")
+
+            self.assertIn("already wired, left as they are", again.stdout)
+            self.assertIn(self.disabled_all_hooks_warning(path), again.stderr)
+
+    def test_disable_all_hooks_false_or_not_a_boolean_true_changes_nothing(self) -> None:
+        for value in (False, "true", 1):
+            with self.subTest(value=value):
+                line = self.mining_line_after_install({"disableAllHooks": value})
+                self.assertIn("run read-only and skip mining", line)
+
+    def test_disable_all_hooks_on_the_plugin_path_warns_too(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"disableAllHooks": True, "enabledPlugins": {"ironmem@ironrace": True}}), encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertIn("come from the enabled ironmem plugin", result.stdout)
+            self.assertIn(self.disabled_all_hooks_warning(path), result.stderr)
+
+    def test_a_jq_error_reading_disable_all_hooks_wires_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = self.settings_with_stop(home, [])
+            before = path.read_text(encoding="utf-8")
+            env = self.jq_stub(home, "disableAllHooks")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=env)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before)
+            self.assertIn(f"WARN: jq failed reading disableAllHooks in {path}; wired no Claude hooks.", result.stderr)
+            self.assertIn("          jq said: stub jq failure\n", result.stderr)
+
+    def test_hand_wired_hooks_beside_the_enabled_plugin_get_a_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            self.run_installer(home, home / ".claude.json")
+            path = home / ".claude" / "settings.json"
+            settings = self.claude_settings(home)
+            settings["enabledPlugins"] = {"ironmem@ironrace": True}
+            path.write_text(json.dumps(settings), encoding="utf-8")
+            before = path.read_text(encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertEqual(path.read_text(encoding="utf-8"), before, "the plugin path writes nothing")
+            self.assertIn("Claude hooks come from the enabled ironmem plugin; wired none in", result.stdout)
+            self.assertIn(
+                f"    WARN: {path} also hand-wires SessionStart UserPromptSubmit Stop PreCompact, which the enabled "
+                "ironmem plugin supplies; where both copies start, the hook runs twice. Remove the hand-wired "
+                "ironmem entries from settings.json. `ironmem doctor` says which.\n",
+                result.stderr,
+            )
+
+    def test_the_enabled_plugin_alone_gets_no_duplicate_warning(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            path = home / ".claude" / "settings.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps({"enabledPlugins": {"ironmem@ironrace": True}, "hooks": {"Stop": []}}), encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertNotIn("hand-wires", result.stderr)
+
+    def test_enabled_plugins_is_read_as_doctor_reads_it(self) -> None:
+        # The rows of doctor's only_an_ironmem_plugin_key_set_to_true_enables_the_plugin
+        # (crates/ironmem/src/doctor/hooks.rs), plus enabledPlugins values that
+        # are not an object, which both read as not enabled.
+        rows = (
+            ({"ironmem@ironrace": True}, True),
+            ({"ironmem": True}, True),
+            ({"ironmem-extras@x": True}, False),
+            ({"notironmem@x": True}, False),
+            ({"ironmem@x": "true"}, False),
+            ([], False),
+            ("x", False),
+            (None, False),
+            (False, False),
+        )
+        for plugins, enabled in rows:
+            with self.subTest(plugins=plugins), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                path = home / ".claude" / "settings.json"
+                path.parent.mkdir(parents=True)
+                path.write_text(json.dumps({"enabledPlugins": plugins}), encoding="utf-8")
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                self.assertEqual("come from the enabled ironmem plugin" in result.stdout, enabled, result.stdout)
+                self.assertEqual("hooks" in self.claude_settings(home), not enabled)
+
     def test_a_disabled_plugin_still_gets_hooks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
@@ -1628,7 +2074,9 @@ class InstallIronmemSelfTest(unittest.TestCase):
             home = pathlib.Path(directory)
             path = home / ".claude" / "settings.json"
             path.parent.mkdir(parents=True)
-            wrapper = "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh"
+            # A literal script path: Claude Code leaves ${CLAUDE_PLUGIN_ROOT}
+            # unset for a settings.json hook, so that spelling does not count.
+            wrapper = "bash /p/hooks/ironmem-hook.sh"
             hooks = {
                 event: [{"hooks": [{"type": "command", "command": f"{wrapper} {name}"}]}]
                 for event, name in self.plugin_hook_names().items()
@@ -1641,6 +2089,31 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertIn("Wired Claude hooks", result.stdout)
             self.assertIn("SessionStart", result.stdout)
             self.assertNotIn("skip mining", result.stdout)
+
+    def test_a_plugin_root_command_in_settings_does_not_count_as_wired(self) -> None:
+        # Measured on Claude Code 2.1.329: a settings.json hook (no plugin)
+        # runs with CLAUDE_PLUGIN_ROOT unset, so these find no script.
+        for entry in (
+            {"command": "bash ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh stop"},
+            {"command": 'bash "${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh" stop'},
+            {"command": "$CLAUDE_PLUGIN_ROOT/hooks/ironmem-hook.sh stop"},
+            {"command": "${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh hook stop"},
+            {"command": "bash -c '${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh hook stop'"},
+            {"command": "bash", "args": ["${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh", "stop"]},
+            {"command": "${CLAUDE_PLUGIN_ROOT}/bin/ironmem-mcp.sh", "args": ["hook", "stop"]},
+        ):
+            with self.subTest(entry=entry), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                group = {"hooks": [{"type": "command", **entry}]}
+                self.settings_with_stop(home, [group])
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                stop = self.claude_settings(home)["hooks"]["Stop"]
+                self.assertEqual(stop[0], group)
+                self.assertEqual(len(stop), 2, stop)
+                self.assertIn("hook stop --harness claude-code", json.dumps(stop[1]))
+                self.assertIn("Stop", result.stdout.split("Wired Claude hooks", 1)[1].splitlines()[0])
 
     @staticmethod
     def path_without_jq(bin_dir: pathlib.Path) -> str:

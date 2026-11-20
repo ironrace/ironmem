@@ -67,27 +67,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wired when ironmem is in program position, as doctor reads it (so `echo
   ironmem hook stop` and a comment do not, and `hook --harness <v> <name>`
   and a quoted name do); unlike doctor, the installer reads an operator
-  inside quotes or a comment as the start of a command. When an already-wired
+  inside quotes or a comment as the start of a command. A command whose
+  program or script path uses `${CLAUDE_PLUGIN_ROOT}` does not count as
+  wired: Claude Code leaves that variable unset for a `settings.json` hook
+  (measured on 2.1.329), so the installer adds its own. When an already-wired
   hook names a program by a full path (or `~/...`) that is not the same file
   as the installed one, and none of its commands names the installed one, a
-  WARN names what it runs; a bare `ironmem` on `PATH`, a `$HOME/...` path and
-  the plugin's wrapper scripts get none. An exec-form `~/` program gets a
-  WARN (doctor reads it as not expanded), and is left wired.
-  `--skip-wiring` skips this, and without `jq` it prints the four entries to
-  add by hand, with a note to skip them when the plugin is enabled. If
-  settings.json cannot be read or written it warns, wires nothing, and the
-  install continues (a write that fails partway can leave the file
-  incomplete, and the warning says so). The warning tells invalid JSON (with
-  jq's own error), an empty file, and a file that is not a JSON object with
-  array-valued hooks (including `"hooks": false`) apart, and for a settings
-  file other than `~/.claude/settings.json` it says `ironmem doctor` does not
-  read that file. The wired hooks set no `IRONMEM_MCP_MODE`, so they run
-  read-only and don't mine unless trusted reaches them (the line printed after
-  wiring says they mine when the file's `env` sets it, that they do not when it
-  sets another value, and otherwise that the environment Claude Code is
-  launched with decides); a cheaper way to mine
-  outside the plugin is #418. The installer's jq programs use only jq 1.5
-  builtins.
+  WARN names the event and that program path (not the whole entry, which can
+  carry a token); a bare `ironmem` on `PATH`, a `$HOME/...` path and a
+  wrapper script run as `bash <script>` get none, while the plugin's
+  `ironmem-hook.sh` or `ironmem-mcp.sh` named directly as the program gets
+  one, as doctor checks it. An exec-form `~/` program gets a WARN (doctor
+  reads it as not expanded), and is left wired. With the plugin enabled it
+  wires none and warns when `settings.json` also hand-wires any of the four
+  (the hook runs twice where both copies start). With `disableAllHooks` set
+  to `true` it still wires them (a project's settings can set it back) and
+  warns that Claude Code runs none of them instead of printing the mining
+  line. `--skip-hooks` skips only the hooks (the MCP server is still
+  registered); `--skip-wiring` skips both. Without `--skip-hooks`, a re-run
+  adds back any of the four you deleted. Without `jq` it prints the four
+  entries to add by hand, with a note to skip them when the plugin is
+  enabled. If settings.json cannot be read or written, holds more than one
+  JSON value, or is changed by another program while the script runs, it
+  warns, wires nothing, leaves the file as it was, and the install continues.
+  The merged file is written to a temp file beside the file a symlink chain
+  ends at and renamed onto it, so a dotfiles symlink stays a symlink, a reader
+  never sees a partial file, and a write that fails partway leaves the old
+  one; a hard link to the file is not kept, and a new `settings.json` is
+  created mode 0600. The warning tells invalid JSON (with jq's own error), an
+  empty file, and a file that is not a JSON object with array-valued hooks
+  (including `"hooks": false`) apart, and for a settings file other than
+  `~/.claude/settings.json` it says `ironmem doctor` does not read that file.
+  The wired hooks set no `IRONMEM_MCP_MODE`, so they run read-only and don't
+  mine unless trusted reaches them (the line printed after wiring says they
+  mine when the file's `env` sets it, that they do not when it sets another
+  value, and otherwise that the environment Claude Code is launched with
+  decides); a cheaper way to mine outside the plugin is #418. The installer's
+  jq programs use only jq 1.5 builtins. The binary itself is now installed
+  under a temporary name and renamed into place, so a hook that starts
+  mid-install runs the old or the new whole binary, and a relative
+  `IRONMEM_INSTALL_DIR` is made absolute, since hooks and MCP clients start in
+  directories of their own.
 - **`ironmem autopilot status <owner/repo>` (#420).** A report of a repo's
   gate config (state, gate commands, `manifest_warnings`, `proposed_at`,
   `approved_at`) and of which `agent:*` and `risk:*` labels it has, as text
