@@ -75,7 +75,9 @@ pub(super) enum ProgramProblem {
     /// The program or wrapper-script word uses `${CLAUDE_PLUGIN_ROOT}` (or
     /// `$CLAUDE_PLUGIN_ROOT`) in a non-plugin install. Measured on Claude
     /// Code 2.1.329: a `settings.json` hook without the plugin runs with
-    /// that variable unset, so the run finds no script.
+    /// that variable unset, so the run finds no script. A use the shell
+    /// gives a default (`${CLAUDE_PLUGIN_ROOT:-/path}`) is not this problem:
+    /// see [`uses_plugin_root`].
     PluginRootOutsidePlugin,
     /// An exec-form program (or the program `env` and the like run from its
     /// arguments) starts with `~/`. Claude Code's hooks docs say exec form
@@ -122,8 +124,9 @@ pub(super) enum Program {
     /// not expanded ([`ProgramProblem::TildeNotExpanded`]).
     ExecTilde(String),
     /// A program or wrapper-script word, as written, that uses
-    /// `${CLAUDE_PLUGIN_ROOT}` or `$CLAUDE_PLUGIN_ROOT`
-    /// ([`ProgramProblem::PluginRootOutsidePlugin`] outside the plugin).
+    /// `${CLAUDE_PLUGIN_ROOT}` or `$CLAUDE_PLUGIN_ROOT` with nothing to fall
+    /// back on when it is unset ([`uses_plugin_root`];
+    /// [`ProgramProblem::PluginRootOutsidePlugin`] outside the plugin).
     PluginRoot(String),
 }
 
@@ -674,8 +677,8 @@ impl ShellVar {
     /// What the programs the shell runs next get (`None`: as inherited).
     fn seen(&self) -> Option<ModeSet> {
         match (&self.value, self.exported) {
+            (VarValue::Unset, _) | (_, Exported::No) => Some(ModeSet::Unset),
             (VarValue::Inherited, _) => None,
-            (VarValue::Unset, _) | (VarValue::Set(_), Exported::No) => Some(ModeSet::Unset),
             (VarValue::Set(v), Exported::Yes) => Some(ModeSet::Value(v.clone())),
             (VarValue::Set(v), Exported::AsInherited) => Some(ModeSet::IfInherited(v.clone())),
         }
@@ -689,6 +692,14 @@ impl ShellVar {
                     self.value = VarValue::Set(v);
                 }
                 self.exported = Exported::Yes;
+            }
+            // `export -n` drops the export flag and keeps the value, which
+            // a later bare `export` sends again.
+            VarChange::Unexport(value) => {
+                if let Some(v) = value {
+                    self.value = VarValue::Set(v);
+                }
+                self.exported = Exported::No;
             }
             // `unset` drops the variable and its export flag.
             VarChange::Unset => {
@@ -707,6 +718,8 @@ enum VarChange {
     Assign(ModeValue),
     /// `export IRONMEM_MCP_MODE=v`, or a bare `export IRONMEM_MCP_MODE`.
     Export(Option<ModeValue>),
+    /// `export -n IRONMEM_MCP_MODE=v`, or a bare `export -n IRONMEM_MCP_MODE`.
+    Unexport(Option<ModeValue>),
     /// `unset IRONMEM_MCP_MODE`.
     Unset,
 }
@@ -730,17 +743,45 @@ struct Invocation {
 /// The name of the variable Claude Code sets to a plugin's directory.
 const PLUGIN_ROOT_VAR: &str = "CLAUDE_PLUGIN_ROOT";
 
-/// True when `text` uses `$CLAUDE_PLUGIN_ROOT` or `${CLAUDE_PLUGIN_ROOT}` (the
-/// name not running on into a longer one), as scripts/install-ironmem.sh's
-/// `plugin_root` reads it.
-fn uses_plugin_root(text: &str) -> bool {
+/// True when `text` uses `$CLAUDE_PLUGIN_ROOT` or `${CLAUDE_PLUGIN_ROOT...}`
+/// (the name not running on into a longer one) in a way that leaves nothing
+/// when the variable is unset, as scripts/install-ironmem.sh reads it
+/// (`re_plugin_root` for a word a shell reads, `plugin_root` for an
+/// exec-form element).
+///
+/// In a word a shell reads (`by_shell`), a braced use with a default that is
+/// not empty (`:-`, `-`, `:=` or `=`) does not count: measured with /bin/sh
+/// and bash, the variable unset, the shell runs the default's path. Any
+/// other expansion of an unset variable (`%`, `#`, `:+`, an empty default) is
+/// still empty. No shell reads an exec-form element to apply a default, so
+/// there every use counts; what Claude Code does with a default in one was
+/// not measured.
+fn uses_plugin_root(text: &str, by_shell: bool) -> bool {
     text.match_indices('$').any(|(at, _)| {
         let rest = &text[at + 1..];
-        let rest = rest.strip_prefix('{').unwrap_or(rest);
-        rest.strip_prefix(PLUGIN_ROOT_VAR).is_some_and(|after| {
-            !after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
-        })
+        let (braced, rest) = match rest.strip_prefix('{') {
+            Some(rest) => (true, rest),
+            None => (false, rest),
+        };
+        let Some(after) = rest.strip_prefix(PLUGIN_ROOT_VAR) else {
+            return false;
+        };
+        if after.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_') {
+            return false;
+        }
+        !(by_shell && braced && starts_with_a_default(after))
     })
+}
+
+/// True when `after`, the text that follows a variable's name inside `${`,
+/// is a default operator (`:-`, `-`, `:=` or `=`) and a default that is not
+/// empty.
+fn starts_with_a_default(after: &str) -> bool {
+    after
+        .strip_prefix(':')
+        .unwrap_or(after)
+        .strip_prefix(['-', '='])
+        .is_some_and(|default| !default.is_empty() && !default.starts_with('}'))
 }
 
 /// The program word's literal path, if doctor can check it: see
@@ -763,7 +804,7 @@ fn literal_path(word: &Word) -> Option<String> {
 
 /// What doctor can tell about a run's program from its program word.
 fn program_of(word: &Word) -> Program {
-    if uses_plugin_root(&word.text) {
+    if uses_plugin_root(&word.text, !word.is_exec()) {
         Program::PluginRoot(word.text.clone())
     } else if word.is_exec() && word.text.starts_with("~/") {
         Program::ExecTilde(word.text.clone())
@@ -862,13 +903,30 @@ fn simple_command(
     let program = basename(&program_word.text);
     match program {
         "export" => {
-            return args
-                .iter()
-                .rev()
-                .find_map(|w| match mode_assignment(w, false) {
-                    Some(value) => Some(VarChange::Export(Some(value))),
-                    None => (w.text == MODE_VAR).then_some(VarChange::Export(None)),
-                });
+            // The option words come first. `-f` makes every name a function,
+            // which leaves the variable as it was, and `-n` takes the export
+            // away (both measured with /bin/sh and bash).
+            let flags = || {
+                args.iter()
+                    .map(|w| w.text.as_str())
+                    .take_while(|text| text.starts_with('-') && *text != "--")
+                    .flat_map(|text| text.chars().skip(1))
+            };
+            if flags().any(|c| c == 'f') {
+                return None;
+            }
+            let unexports = flags().any(|c| c == 'n');
+            return args.iter().rev().find_map(|w| {
+                let value = mode_assignment(w, false);
+                if value.is_none() && w.text != MODE_VAR {
+                    return None;
+                }
+                Some(if unexports {
+                    VarChange::Unexport(value)
+                } else {
+                    VarChange::Export(value)
+                })
+            });
         }
         // `unset -f` removes functions, not variables.
         "unset" => {
@@ -946,7 +1004,7 @@ fn shell_args(args: &[Word], mode: Option<ModeSet>, found: &mut Vec<Invocation>)
         if let Some(hook) = hook {
             // The program is the shell, found on PATH; the script it runs
             // is not checked, except for a `${CLAUDE_PLUGIN_ROOT}` in it.
-            let program = if uses_plugin_root(text) {
+            let program = if uses_plugin_root(text, !arg.is_exec()) {
                 Program::PluginRoot(text.to_owned())
             } else {
                 Program::Unchecked
@@ -1611,6 +1669,97 @@ mod tests {
     }
 
     #[test]
+    fn export_n_takes_the_export_away_and_keeps_the_value() {
+        use McpAccessMode::*;
+        // Each case measured with /bin/sh and bash on macOS.
+        // `export -n NAME`: programs run after it get no value.
+        assert_eq!(
+            hook_mode(
+                "export -n IRONMEM_MCP_MODE; ironmem hook stop",
+                "stop",
+                shell("trusted")
+            ),
+            (Ok(ReadOnly), ModeSource::Default)
+        );
+        // The shell keeps the value, so a later bare export sends it again.
+        assert_eq!(
+            hook_mode(
+                "export -n IRONMEM_MCP_MODE; export IRONMEM_MCP_MODE; ironmem hook stop",
+                "stop",
+                shell("trusted")
+            ),
+            (Ok(Trusted), ModeSource::Environment)
+        );
+        // `export -n NAME=value` sets the shell's value and does not export it.
+        let assigned = "export -n IRONMEM_MCP_MODE=trusted; ironmem hook stop";
+        assert_eq!(
+            hook_mode(assigned, "stop", ModeEnv::default()),
+            (Ok(ReadOnly), ModeSource::Default)
+        );
+        assert_eq!(
+            hook_mode(assigned, "stop", shell("trusted")),
+            (Ok(ReadOnly), ModeSource::Default)
+        );
+        assert_eq!(
+            hook_mode(
+                "export -n IRONMEM_MCP_MODE=trusted; export IRONMEM_MCP_MODE; ironmem hook stop",
+                "stop",
+                shell("read-only")
+            ),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+        // An assignment on the run itself still reaches it.
+        assert_eq!(
+            hook_mode(
+                "export -n IRONMEM_MCP_MODE; IRONMEM_MCP_MODE=trusted ironmem hook stop",
+                "stop",
+                shell("read-only")
+            ),
+            (Ok(Trusted), ModeSource::Inline)
+        );
+        // A bash -c string starts from what its parent shell exports.
+        assert_eq!(
+            hook_mode(
+                "export -n IRONMEM_MCP_MODE; bash -c 'ironmem hook stop'",
+                "stop",
+                shell("trusted")
+            ),
+            (Ok(ReadOnly), ModeSource::Default)
+        );
+    }
+
+    #[test]
+    fn export_f_names_a_function_not_the_variable() {
+        use McpAccessMode::*;
+        // `export -f NAME` exports a function: the variable stays unexported.
+        assert_eq!(
+            hook_mode(
+                "IRONMEM_MCP_MODE=trusted; export -f IRONMEM_MCP_MODE; ironmem hook stop",
+                "stop",
+                ModeEnv::default()
+            ),
+            (Ok(ReadOnly), ModeSource::Default)
+        );
+        // `export -fn NAME` un-exports a function: the variable stays exported.
+        assert_eq!(
+            hook_mode(
+                "export -fn IRONMEM_MCP_MODE; ironmem hook stop",
+                "stop",
+                shell("trusted")
+            ),
+            (Ok(Trusted), ModeSource::Environment)
+        );
+        assert_eq!(
+            hook_mode(
+                "export -nf IRONMEM_MCP_MODE; ironmem hook stop",
+                "stop",
+                shell("trusted")
+            ),
+            (Ok(Trusted), ModeSource::Environment)
+        );
+    }
+
+    #[test]
     fn a_bash_c_string_inherits_what_its_parent_string_set() {
         use McpAccessMode::*;
         let cmd = "IRONMEM_MCP_MODE=trusted; bash -c 'ironmem hook stop'";
@@ -1673,7 +1822,97 @@ mod tests {
             program("bash /p/hooks/ironmem-hook.sh stop"),
             Program::Unchecked
         );
-        assert!(uses_plugin_root("${CLAUDE_PLUGIN_ROOT:-/x}/hooks"));
-        assert!(!uses_plugin_root("CLAUDE_PLUGIN_ROOT/hooks"));
+        for by_shell in [true, false] {
+            assert!(!uses_plugin_root("CLAUDE_PLUGIN_ROOT/hooks", by_shell));
+            assert!(!uses_plugin_root(
+                "${CLAUDE_PLUGIN_ROOTS:-/x}/hooks",
+                by_shell
+            ));
+            assert!(uses_plugin_root(
+                "${CLAUDE_PLUGIN_ROOT:+/x}/hooks",
+                by_shell
+            ));
+        }
+        assert!(!uses_plugin_root("${CLAUDE_PLUGIN_ROOT:-/x}/hooks", true));
+        assert!(uses_plugin_root("${CLAUDE_PLUGIN_ROOT:-/x}/hooks", false));
+    }
+
+    #[test]
+    fn a_default_the_shell_applies_is_not_a_plugin_root_run() {
+        let root = |w: &str| Program::PluginRoot(w.to_owned());
+        // Measured with /bin/sh and bash, the variable unset: each of these
+        // runs the default's path, which the shell builds, so doctor does
+        // not check it.
+        for defaulted in [
+            r#""${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem" hook stop"#,
+            "${CLAUDE_PLUGIN_ROOT-/x}/bin/ironmem hook stop",
+            "bash ${CLAUDE_PLUGIN_ROOT:=/x}/hooks/ironmem-hook.sh stop",
+            "bash -c '${CLAUDE_PLUGIN_ROOT=/x}/bin/ironmem-mcp.sh hook stop'",
+            "${CLAUDE_PLUGIN_ROOT:-$HOME/.ironrace}/bin/ironmem hook stop",
+        ] {
+            assert_eq!(program(defaulted), Program::Unchecked, "{defaulted}");
+        }
+        // An empty default, any other expansion, or a second use with no
+        // default still leaves nothing where the variable was.
+        for (command, word) in [
+            (
+                "${CLAUDE_PLUGIN_ROOT:-}/bin/ironmem hook stop",
+                "${CLAUDE_PLUGIN_ROOT:-}/bin/ironmem",
+            ),
+            (
+                "${CLAUDE_PLUGIN_ROOT-}/bin/ironmem hook stop",
+                "${CLAUDE_PLUGIN_ROOT-}/bin/ironmem",
+            ),
+            (
+                "${CLAUDE_PLUGIN_ROOT%/}/bin/ironmem hook stop",
+                "${CLAUDE_PLUGIN_ROOT%/}/bin/ironmem",
+            ),
+            (
+                "${CLAUDE_PLUGIN_ROOT:+/x}/bin/ironmem hook stop",
+                "${CLAUDE_PLUGIN_ROOT:+/x}/bin/ironmem",
+            ),
+            (
+                "${CLAUDE_PLUGIN_ROOT:-/x}/${CLAUDE_PLUGIN_ROOT}/ironmem hook stop",
+                "${CLAUDE_PLUGIN_ROOT:-/x}/${CLAUDE_PLUGIN_ROOT}/ironmem",
+            ),
+            (
+                "$CLAUDE_PLUGIN_ROOT:-/x/bin/ironmem hook stop",
+                "$CLAUDE_PLUGIN_ROOT:-/x/bin/ironmem",
+            ),
+        ] {
+            assert_eq!(program(command), root(word), "{command}");
+        }
+        // No shell reads an exec-form word, so nothing applies the default.
+        let exec = HookCommand::Exec {
+            program: "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem".to_owned(),
+            args: vec!["hook".into(), "stop".into()],
+        };
+        assert_eq!(
+            exec.hook_modes("stop", ModeEnv::default())[0].program,
+            root("${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem")
+        );
+        let exec_script = HookCommand::Exec {
+            program: "bash".to_owned(),
+            args: vec![
+                "${CLAUDE_PLUGIN_ROOT:-/x}/hooks/ironmem-hook.sh".into(),
+                "stop".into(),
+            ],
+        };
+        assert_eq!(
+            exec_script.hook_modes("stop", ModeEnv::default())[0].program,
+            root("${CLAUDE_PLUGIN_ROOT:-/x}/hooks/ironmem-hook.sh")
+        );
+        // bash -c reads its string, exec form or not.
+        let exec_string = HookCommand::Exec {
+            program: "bash".to_owned(),
+            args: vec![
+                "-c".into(),
+                "${CLAUDE_PLUGIN_ROOT:-/x}/bin/ironmem hook stop".into(),
+            ],
+        };
+        assert_eq!(
+            exec_string.hook_modes("stop", ModeEnv::default())[0].program,
+            Program::Unchecked
+        );
     }
 }

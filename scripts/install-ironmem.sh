@@ -722,6 +722,8 @@ register_json_mcpservers() {
 # so is every other hook and key. A run whose program or script word uses
 # ${CLAUDE_PLUGIN_ROOT} does not count: Claude Code leaves that variable unset
 # for a settings.json hook (measured on 2.1.329), so the run finds no script.
+# (A shell command that gives the variable a default, as in
+# ${CLAUDE_PLUGIN_ROOT:-/path}, runs the default and does count.)
 # When an event holds such an entry and nothing else that runs the hook, the
 # hook is added beside it and, once the file is written, a WARN names the
 # event and says that entry does not run outside the plugin and can be
@@ -877,8 +879,15 @@ _wire_claude_hooks_warn() {
 # and in doctor it does not; doctor drops a redirection before the program
 # (`2>/dev/null ironmem hook stop` counts there), and this does not. A program
 # or script word that uses ${CLAUDE_PLUGIN_ROOT} (or $CLAUDE_PLUGIN_ROOT)
-# never matches, in either form (re_plugin_root, plugin_root): Claude Code
-# leaves it unset for a settings.json hook, so the run finds no script.
+# does not match: Claude Code leaves it unset for a settings.json hook, so
+# the run finds no script. In a word a shell reads (re_plugin_root), a use
+# with a default that is not empty (${CLAUDE_PLUGIN_ROOT:-/path}, also `-`,
+# `:=` and `=`) still matches, because the shell runs the default (measured
+# with /bin/sh and bash); any other expansion of the unset variable is empty
+# and does not. No shell reads an exec-form element, so there every use is
+# refused (plugin_root); what Claude Code does with a default in one was not
+# measured. unroot puts a path where each use was, to ask whether the entry
+# would run the hook but for the variable.
 _CLAUDE_HOOK_JQ_DEFS='
 def base: sub("^.*/"; "");
 def is_one_of(words): . as $w | any(words; . == $w);
@@ -904,7 +913,9 @@ def re_shell:
   + "(?:\\s+(?:[-+][oO]\\s+" + re_word + "|\\+" + re_seg + "*|--" + re_seg + "*|-[^\\sc\"\u0027;&|()<>]*))*";
 def re_bash_c: re_shell + "\\s+-(?!-)[^\\s\"\u0027;&|()<>]*c[^\\s\"\u0027;&|()<>]*\\s+[\"\u0027]\\s*";
 def re_lead: re_start + re_head + "(?:" + re_bash_c + re_head + ")*";
-def re_plugin_root: "[^\\s;&|()<>]*\\$\\{?CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])";
+def re_plugin_root:
+  re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*|\u0027[^\u0027]*)?"
+  + "\\$(?:CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])|\\{CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_]|:?[-=][^}]))";
 def plugin_root: test("\\$\\{?CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])");
 def re_program($b):
   "(?<p>(?!" + re_plugin_root + ")(?:" + re_seg + "*(?:\"(?:[^\"\\\\]|\\\\.)*/|\u0027[^\u0027]*/|/))?" + re_q + $b + re_q + ")";
@@ -959,7 +970,7 @@ def runs_hook($name):
   elif exec_form then [.command] + .args | exec_runs($name)
   else false end;
 def unroot:
-  gsub("\\$\\{CLAUDE_PLUGIN_ROOT\\}"; "/claude-plugin-root")
+  gsub("\\$\\{CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])[^}]*\\}"; "/claude-plugin-root")
   | gsub("\\$CLAUDE_PLUGIN_ROOT(?![A-Za-z0-9_])"; "/claude-plugin-root");
 def plugin_root_copy($name):
   ([.command] + (if exec_form then .args else [] end) | any(.[]; plugin_root))
@@ -1240,7 +1251,10 @@ _wire_claude_hooks_into() {
     fi
     # The new file is renamed onto the file a symlink chain ends at, so the
     # links stay links and that file's directory must take a new name.
-    if ! real="$(_resolve_link "$settings")" || [[ -z "$real" ]]; then
+    # `-ef`: the file found must be the one $settings opens. A link target
+    # that ends in a newline loses it in the command substitutions, and the
+    # rename would then land on another file.
+    if ! real="$(_resolve_link "$settings")" || [[ -z "$real" || ! "$real" -ef "$settings" ]]; then
       _wire_claude_hooks_warn "could not follow the symlinks from $settings" "$settings"
       return 0
     fi

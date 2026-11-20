@@ -1803,6 +1803,31 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(real.stat().st_mode), 0o640)
             self.assertEqual(sorted(p.name for p in real.parent.iterdir()), ["real.json"])
 
+    def test_a_link_target_ending_in_a_newline_is_refused_not_written_to_its_sibling(self) -> None:
+        # $(...) drops a trailing newline, so the name the installer follows
+        # the link to is the sibling's. It must not rename the result there.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            claude = home / ".claude"
+            claude.mkdir()
+            real = claude / "real.json\n"
+            real.write_text('{"model": "real"}', encoding="utf-8")
+            sibling = claude / "real.json"
+            sibling.write_text('{"model": "sibling"}', encoding="utf-8")
+            link = claude / "settings.json"
+            link.symlink_to("real.json\n")
+
+            result = self.run_installer(home, home / ".claude.json")
+
+            self.assertEqual(sibling.read_text(encoding="utf-8"), '{"model": "sibling"}')
+            self.assertEqual(real.read_text(encoding="utf-8"), '{"model": "real"}')
+            self.assertTrue(link.is_symlink())
+            self.assertEqual(sorted(p.name for p in claude.iterdir()), ["real.json", "real.json\n", "settings.json"])
+            self.assertIn(
+                f"WARN: could not follow the symlinks from {link}; wired no Claude hooks.",
+                result.stderr,
+            )
+
     def test_a_new_settings_file_is_private(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)

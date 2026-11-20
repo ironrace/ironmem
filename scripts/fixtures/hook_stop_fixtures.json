@@ -511,6 +511,78 @@
       "command": "bash ${CLAUDE_PLUGIN_ROOTS}/hooks/ironmem-hook.sh stop",
       "wired": true,
       "note": "a longer variable name is another variable"
+    },
+    {
+      "command": "\"${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem\" hook stop",
+      "wired": true,
+      "note": "a :- default: the shell runs the default when the variable is unset (measured with /bin/sh and bash)"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT-/opt/ironmem}/bin/ironmem hook stop",
+      "wired": true,
+      "note": "a - default"
+    },
+    {
+      "command": "bash ${CLAUDE_PLUGIN_ROOT:=/opt/ironmem}/hooks/ironmem-hook.sh stop",
+      "wired": true,
+      "note": "a := default, the script run by bash"
+    },
+    {
+      "command": "bash -c '${CLAUDE_PLUGIN_ROOT=/opt/ironmem}/bin/ironmem-mcp.sh hook stop'",
+      "wired": true,
+      "note": "a = default inside bash -c"
+    },
+    {
+      "command": "bash",
+      "args": [
+        "-c",
+        "${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem hook stop"
+      ],
+      "wired": true,
+      "note": "exec form, a :- default in the string bash -c reads"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:-}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "an empty default leaves nothing"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT%/}/bin/ironmem hook stop",
+      "wired": false,
+      "note": "another expansion of the unset variable is still empty"
+    },
+    {
+      "command": "${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/bin/ironmem",
+      "args": [
+        "hook",
+        "stop"
+      ],
+      "wired": false,
+      "note": "exec form, a :- default in the program: no shell reads it to apply the default (not measured on Claude Code)"
+    },
+    {
+      "command": "bash",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT:-/opt/ironmem}/hooks/ironmem-hook.sh",
+        "stop"
+      ],
+      "wired": false,
+      "note": "exec form, a :- default in the script word: bash gets the word as written (not measured on Claude Code)"
+    },
+    {
+      "command": "\"/my dir/${CLAUDE_PLUGIN_ROOT}/bin/ironmem\" hook stop",
+      "wired": false,
+      "note": "a plugin-root use after a space inside quotes"
+    },
+    {
+      "command": "/my\\ dir/$CLAUDE_PLUGIN_ROOT/bin/ironmem hook stop",
+      "wired": false,
+      "note": "a plugin-root use after an escaped space"
+    },
+    {
+      "command": "\"${CLAUDE_PLUGIN_ROOT:-/my dir}/${CLAUDE_PLUGIN_ROOT}/ironmem\" hook stop",
+      "wired": false,
+      "note": "a use with a default, then one without, in one quoted word"
     }
   ],
   "env_rows": [

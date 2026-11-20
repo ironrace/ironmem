@@ -63,7 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   as not running (`Stop: wired to ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh,
   which uses ${CLAUDE_PLUGIN_ROOT}, a variable Claude Code sets only for
   plugin hooks -> does not run`), since Claude Code leaves that variable unset
-  for a `settings.json` hook (measured on 2.1.329). A program path whose
+  for a `settings.json` hook (measured on 2.1.329). A shell command that gives
+  the variable a default that is not empty (`${CLAUDE_PLUGIN_ROOT:-/path}`,
+  also `-`, `:=` and `=`) runs the default, so doctor and the installer read
+  it as running; an exec-form entry (no shell) is still read as not running.
+  `export -n IRONMEM_MCP_MODE` reads as taking the mode away from the hooks
+  after it, and `export -f` as leaving it alone. A program path whose
   lookup fails for another reason than not found (a file used as a
   directory, a symlink loop, a directory the user may not search) reads as
   `cannot be reached (<reason>)`. Doctor follows `export`, `unset` and a plain

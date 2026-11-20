@@ -655,8 +655,10 @@ the first `[FAIL]`:
     `${CLAUDE_PLUGIN_ROOT}` (copied from the plugin's hooks.json) does not
     run either: Claude Code sets that variable only for plugin hooks
     (measured on 2.1.329), and the line says `uses ${CLAUDE_PLUGIN_ROOT}, a
-    variable Claude Code sets only for plugin hooks`. A Stop or PreCompact
-    that fails to start is reported on `hook_mining` instead.
+    variable Claude Code sets only for plugin hooks`. A shell command that
+    gives the variable a default (`${CLAUDE_PLUGIN_ROOT:-/path}`) runs the
+    default, so doctor and the installer read it as running. A Stop or
+    PreCompact that fails to start is reported on `hook_mining` instead.
   - The enabled plugin and a hand-wired entry both supply a hook, so it runs
     twice, or one copy does not start, as in `the hand-wired <Event> is wired
     to <path>, which does not exist, so only the plugin's copy runs`.
