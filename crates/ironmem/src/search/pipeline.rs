@@ -47,8 +47,10 @@ pub fn search(
         filters.limit
     };
 
-    // Step 0: Ensure index is up-to-date (lazy rebuild after writes)
-    app.ensure_index_fresh()?;
+    // Step 0: the embedder must be ready before anything is embedded. The
+    // HNSW index is rebuilt after writes only where it is read (the unscoped
+    // vector leg, `vector_candidates`): a scoped search never reads it.
+    app.ensure_embedder_ready()?;
 
     // Step 1: Always-on query sanitization
     let sanitized = sanitize_query(query);
@@ -416,8 +418,8 @@ fn is_scoped(filters: &SearchFilters) -> bool {
 /// Vector candidates for one query (plus the optional content-word variant),
 /// as drawer ids in rank order.
 ///
-/// Unscoped searches take the top `overfetch` across the HNSW index and drop
-/// superseded rows. A wing/room-scoped search does not use the index: it
+/// Unscoped searches take the top `overfetch` across the HNSW index (rebuilt
+/// first if a write left it stale) and drop superseded rows. A wing/room-scoped search does not use the index: it
 /// scores every drawer in the scope exactly (`scoped_vector_candidates`). The
 /// index has no scope filter, and its global top-k can hold none of the
 /// scope's drawers, so a search of the index would return nothing for a
@@ -432,6 +434,8 @@ fn vector_candidates(
     if is_scoped(filters) {
         return scoped_vector_candidates(app, primary, content, overfetch, filters);
     }
+    // Lazy rebuild after writes, here where the index is read.
+    app.ensure_index_fresh()?;
     let ids = search_index_ids(app, primary, content, overfetch)?;
     filter_superseded_candidate_ids(app, ids, filters.include_superseded)
 }
@@ -1532,6 +1536,19 @@ mod tests {
         assert_eq!(ids, ["b00"]);
         assert_eq!(result.total_candidates, 1);
         assert_eq!(result.bm25_hit_count, 0);
+    }
+
+    /// A scoped search never reads the HNSW index, so after a write it does
+    /// not pay for a rebuild; the next unscoped search, which reads it, does.
+    #[test]
+    fn a_scoped_search_leaves_the_index_rebuild_to_the_next_unscoped_search() {
+        let app = App::open_for_test().unwrap();
+        add(&app, "a00", "a", "r", &at_similarity(0.5, 1.0));
+        app.mark_dirty();
+        search(&app, "anything", &scope(Some("a"), None)).unwrap();
+        assert!(app.index_is_dirty());
+        search(&app, "anything", &scope(None, None)).unwrap();
+        assert!(!app.index_is_dirty());
     }
 
     /// A scoped search with PRF on (forced: the env gate is OnceLock-cached).

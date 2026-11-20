@@ -657,6 +657,12 @@ impl App {
         Ok(())
     }
 
+    /// Test-only: whether a write has left the HNSW index to be rebuilt.
+    #[cfg(test)]
+    pub(crate) fn index_is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
     /// Rebuild the HNSW index if dirty. Called before search.
     pub fn ensure_index_fresh(&self) -> Result<(), MemoryError> {
         self.ensure_embedder_ready()?;
