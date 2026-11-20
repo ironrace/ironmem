@@ -2269,19 +2269,29 @@ mod tests {
         }
     }
 
+    /// Prompts shaped like FTS5 operators used to be rejected by FTS5 (and
+    /// read as no hits). `fts5_sanitize` quotes every token, so they now find
+    /// the drawer their words match; a prompt of nothing but an operator word
+    /// has no word left to match. Since sanitizing makes every query valid,
+    /// FTS5 rejecting the query text is a backstop no public call reaches;
+    /// `is_fts_query_rejection` is checked on hand-built errors.
     #[test]
-    fn prompt_recall_bm25_reports_failures_but_not_rejected_query_text() {
+    fn prompt_recall_bm25_finds_operator_shaped_prompts() {
         let db = Database::open_in_memory().unwrap();
         let emb = dummy_embedding();
         db.insert_drawer("n", "needle note", &emb, "shop", "docs", "", "mcp")
             .unwrap();
-        // Text FTS5 can't parse is a prompt's doing, not a failure.
-        for prompt in ["needle -", "needle - note", "\"needle", "NOT", "needle AND"] {
-            assert!(
-                db.prompt_recall_bm25_search(prompt, 3, None).is_ok(),
-                "{prompt:?}"
-            );
+        let ids = |prompt: &str| -> Vec<String> {
+            db.prompt_recall_bm25_search(prompt, 3, None)
+                .unwrap_or_else(|e| panic!("{prompt:?}: {e}"))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        for prompt in ["needle -", "needle - note", "\"needle", "needle AND"] {
+            assert_eq!(ids(prompt), ["n"], "{prompt:?}");
         }
+        assert!(ids("NOT").is_empty());
         let busy = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             Some("database is locked".to_string()),
@@ -2297,6 +2307,36 @@ mod tests {
             Some("no such column: note".to_string()),
         );
         assert!(is_fts_query_rejection(&column));
+    }
+
+    /// The prompt-recall path (strict, recall-eligible rows only) keeps
+    /// hyphenated and id-shaped words, as the general search does: a `-`
+    /// inside or in front of a word is not read as a column filter or NOT.
+    #[test]
+    fn prompt_recall_bm25_finds_hyphenated_and_id_shaped_prompts() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer(
+            "h",
+            "resume handoff-issue-377: the non-plugin hooks",
+            &emb,
+            "shop",
+            "handoffs",
+            "",
+            "mcp",
+        )
+        .unwrap();
+        db.insert_drawer("other", "unrelated text", &emb, "shop", "docs", "", "mcp")
+            .unwrap();
+        for prompt in ["handoff-issue-377", "non-plugin", "-hooks"] {
+            let ids: Vec<String> = db
+                .prompt_recall_bm25_search(prompt, 5, None)
+                .unwrap_or_else(|e| panic!("{prompt:?}: {e}"))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(ids, ["h"], "{prompt:?}");
+        }
     }
 
     #[test]

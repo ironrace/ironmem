@@ -8869,6 +8869,16 @@ mod tests {
             "search must not panic or error: {:?}",
             result.err()
         );
+        // It is out of the vector index but still found by keyword.
+        let plan_id =
+            crate::db::drawers::generate_id("CANONICAL BODY", "ironrace-memory", "collab-plans");
+        let ids: Vec<String> = result
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|r| r.drawer.id)
+            .collect();
+        assert!(ids.contains(&plan_id), "{ids:?}");
     }
 
     // ── plan-by-reference (#90) collab_status compact-reference tests ──────────

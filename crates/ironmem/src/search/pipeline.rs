@@ -1621,6 +1621,36 @@ mod tests {
         assert_eq!(embedding_reads, 1);
     }
 
+    /// An Autopilot backlog-lineage row is stored with a zero vector and so is
+    /// left out of the vector index, but keyword search still finds it, as
+    /// `load_all_vectors`' doc and the CHANGELOG say.
+    #[test]
+    fn search_finds_a_zero_vector_lineage_row_by_keyword() {
+        let app = App::open_for_test().unwrap();
+        add(&app, "real", "a", "r", &at_similarity(0.5, 1.0));
+        app.db
+            .insert_drawer(
+                "lineage",
+                "superseded by the zanzibar backlog item",
+                &vec![0.0; DIM],
+                crate::autopilot::WING,
+                crate::autopilot::ROOM,
+                "",
+                "autopilot",
+            )
+            .unwrap();
+        app.mark_dirty();
+        let result = search(&app, "zanzibar", &scope(None, None)).unwrap();
+        let ids: Vec<&str> = result
+            .results
+            .iter()
+            .map(|r| r.drawer.id.as_str())
+            .collect();
+        // "real" comes from the vector leg (the noop query matches anything
+        // in the index); "lineage" can only come from the keyword leg.
+        assert!(ids.contains(&"lineage"), "{ids:?}");
+    }
+
     /// A vector whose cosine similarity with `query_vec()` is exactly `s`,
     /// scaled to length `len` (so the score must divide by the norm).
     fn at_similarity(s: f32, len: f32) -> Vec<f32> {
