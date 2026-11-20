@@ -1000,6 +1000,36 @@ impl Database {
         count
     }
 
+    /// Test-only: record, from now on, every (table, column) read by the
+    /// statements this connection prepares, in order (SQLite's authorizer
+    /// sees each read as the statement is prepared). Replaces any authorizer
+    /// installed before, `count_select_statements`' included.
+    #[cfg(test)]
+    pub(crate) fn record_column_reads(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{Arc, Mutex};
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reads);
+        self.conn
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name,
+                    column_name,
+                } = context.action
+                {
+                    seen.lock()
+                        .unwrap()
+                        .push((table_name.to_string(), column_name.to_string()));
+                }
+                Authorization::Allow
+            }))
+            .expect("install the authorizer");
+        reads
+    }
+
     /// BM25 full-text search via SQLite FTS5. Returns (drawer_id, score) pairs
     /// ordered by relevance descending. Score is positive (negated bm25() output).
     ///

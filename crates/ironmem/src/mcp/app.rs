@@ -41,6 +41,9 @@ pub struct App {
     /// Test-only: force the rerank stage even when `IRONMEM_RERANK` is unset
     /// (the env gate is OnceLock-cached and can't be flipped per-test).
     pub(crate) force_rerank: bool,
+    /// Test-only: run pseudo-relevance feedback even when
+    /// `IRONMEM_PRF_ENABLED` is unset (the gate is OnceLock-cached too).
+    pub(crate) force_prf: bool,
     pub index_state: RwLock<IndexState>,
     /// Dirty flag: set after writes, cleared after rebuild.
     dirty: AtomicBool,
@@ -156,6 +159,7 @@ impl App {
             reranker: RwLock::new(None),
             pref_extractor_override: RwLock::new(None),
             force_rerank: false,
+            force_prf: false,
             index_state: RwLock::new(IndexState { index, id_map }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
@@ -188,6 +192,7 @@ impl App {
             reranker: RwLock::new(None),
             pref_extractor_override: RwLock::new(None),
             force_rerank: false,
+            force_prf: false,
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -453,6 +458,7 @@ impl App {
             reranker: RwLock::new(None),
             pref_extractor_override: RwLock::new(None),
             force_rerank: false,
+            force_prf: false,
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),

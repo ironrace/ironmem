@@ -97,13 +97,28 @@ pub fn search(
     // overfetch at 5× limit, clamped to MAX_OVERFETCH.
     let overfetch = limit.saturating_mul(5).clamp(30, tunables::max_overfetch());
 
-    let vector_ids = vector_candidates(
-        app,
-        &primary_vec,
-        maybe_content_vec.as_deref(),
-        overfetch,
-        filters,
-    )?;
+    // A scoped search that may run PRF keeps the rows its scan scored, so
+    // the PRF re-query (step 5b) ranks them without reading the scope again.
+    let prf_on = tunables::prf_enabled() || app.force_prf;
+    let (vector_ids, scope_kept) = if is_scoped(filters) {
+        scoped_scan(
+            app,
+            &primary_vec,
+            maybe_content_vec.as_deref(),
+            overfetch,
+            filters,
+            prf_on,
+        )?
+    } else {
+        let ids = vector_candidates(
+            app,
+            &primary_vec,
+            maybe_content_vec.as_deref(),
+            overfetch,
+            filters,
+        )?;
+        (ids, None)
+    };
     let total_candidates = vector_ids.len();
 
     // Step 4: BM25 full-text search.
@@ -130,13 +145,14 @@ pub fn search(
 
     // Step 5b: Pseudo-relevance feedback (E3) — expand the query with discriminative
     // terms from the top-K initial candidates, then re-search and 4-way RRF merge.
-    // Gated on IRONMEM_PRF_ENABLED (default off). prf_top_k defaults to 15 so that
+    // Gated on IRONMEM_PRF_ENABLED (default off; `force_prf` is the test-only
+    // seam, as `force_rerank` is for step 9). prf_top_k defaults to 15 so that
     // preference-question gold sessions (E1: ranks 6-22) appear in the foreground.
     let mut prf_expanded_vector_ids: Option<Vec<String>> = None;
     let mut prf_expanded_bm25_ids: Option<Vec<String>> = None;
     let mut prf_drawer_cache: HashMap<String, Drawer> = HashMap::new();
 
-    if tunables::prf_enabled()
+    if prf_on
         && merged_ids.len() >= tunables::prf_top_k()
         && merged_ids.len() >= tunables::prf_min_corpus()
     {
@@ -238,7 +254,10 @@ pub fn search(
                 emb.embed_one(&expanded_query).map_err(MemoryError::Embed)?
             };
 
-            let exp_vector_ids = vector_candidates(app, &expanded_vec, None, overfetch, filters)?;
+            let exp_vector_ids = match &scope_kept {
+                Some(kept) => rank_kept_candidates(kept, &expanded_vec, overfetch, filters),
+                None => vector_candidates(app, &expanded_vec, None, overfetch, filters)?,
+            };
 
             let exp_bm25_pairs = app.db.bm25_search_with_history(
                 &expanded_query,
@@ -445,15 +464,24 @@ fn search_index_ids(
 /// Vector candidates for a wing/room-scoped search, scored exactly.
 ///
 /// One `SELECT` (after the column probe `scope_vectors` makes, as the other
-/// drawer reads do) fetches the scope's drawers, in no particular order. A
-/// drawer is kept when `row_matches_filters` keeps it (the same rules as the
-/// final filter) and its embedding decodes, has the query's length and has a
-/// non-zero, finite norm; only rows the filters keep are decoded. Each is
-/// scored by cosine similarity with the query; the content-word variant is
-/// scored the same way and merged with `union_hnsw`, as the unscoped path
-/// merges it. Returns at most `overfetch` ids, highest score first, ties
-/// broken by drawer id. The cost grows with the scope: every in-scope row is
-/// read and scored, with no cap or cache.
+/// drawer reads do) streams the scope's drawers, in no particular order; the
+/// SQL already leaves out collab messages and, unless history is asked for,
+/// superseded rows. A drawer is kept when `row_matches_filters` keeps it (the
+/// same rules as the final filter) and its embedding decodes, has the query's
+/// length and has a non-zero, finite norm. Each row is scored by cosine
+/// similarity with the query and with the content-word variant in the same
+/// pass, and each query vector holds only its best `overfetch` rows
+/// ([`TopK`]); the two rankings are merged with `union_hnsw`, as the unscoped
+/// path merges them. Returns at most `overfetch` ids, highest score first,
+/// ties broken by drawer id: exactly what scoring every row and sorting them
+/// all would return.
+///
+/// The cost is linear in the scope and is paid on every scoped search: every
+/// row the SQL keeps is read, decoded and scored, with no cap, cache or index
+/// (an 18k-drawer room is ~56MB of blob reads). Memory stays at `overfetch`
+/// rows per query vector, plus one decoded row at a time. Indexing the scope
+/// instead is not exact: an HNSW search widened to reach the scope can still
+/// miss drawers its graph does not connect.
 ///
 /// An all-zero embedding (Autopilot and collab rows) is skipped silently: it
 /// is deliberate and has no direction to score. Every other skipped row (an
@@ -467,10 +495,35 @@ fn scoped_vector_candidates(
     overfetch: usize,
     filters: &SearchFilters,
 ) -> Result<Vec<String>, MemoryError> {
+    scoped_scan(app, primary, content, overfetch, filters, false).map(|(ids, _)| ids)
+}
+
+/// The scan behind [`scoped_vector_candidates`]. With `keep`, it also returns
+/// every row it decoded and could classify, so the PRF re-query can rank the
+/// scope with [`rank_kept_candidates`] instead of reading it again; that holds
+/// the scope's decoded vectors in memory until the search ends, which is why
+/// only a search that may run PRF asks for it. The kept rows are `None` when
+/// no query vector could be scored and the scope was not read.
+fn scoped_scan(
+    app: &App,
+    primary: &[f32],
+    content: Option<&[f32]>,
+    overfetch: usize,
+    filters: &SearchFilters,
+    keep: bool,
+) -> Result<(Vec<String>, Option<Vec<ScopeCandidate>>), MemoryError> {
     use crate::db::drawers::EmbeddingNorm;
 
+    let mut queries: Vec<ScopedQuery<'_>> = std::iter::once(primary)
+        .chain(content)
+        .filter_map(|query| ScopedQuery::new(query, overfetch))
+        .collect();
+    if queries.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
     let mut malformed = 0usize;
-    let mut candidates: Vec<ScopeCandidate> = Vec::new();
+    let mut kept = keep.then(Vec::new);
     app.db.scope_vectors(
         filters.wing.as_deref(),
         filters.room.as_deref(),
@@ -495,29 +548,58 @@ fn scoped_vector_candidates(
                     return;
                 }
             };
-            candidates.push(ScopeCandidate {
-                id: row.id,
-                embedding,
-                norm,
-            });
+            // A row either query cannot score counts once, however many
+            // queries drop it. (`&=` offers the row to every query.)
+            let mut scorable = true;
+            for query in &mut queries {
+                scorable &= query.offer(&row.id, &embedding, norm);
+            }
+            if !scorable {
+                malformed += 1;
+            }
+            if let Some(kept) = kept.as_mut() {
+                kept.push(ScopeCandidate {
+                    id: row.id,
+                    embedding,
+                    norm,
+                });
+            }
         },
     )?;
-    // `union_hnsw` breaks ties by position, so positions must follow id order.
-    candidates.sort_unstable_by(|a, b| a.id.cmp(&b.id));
 
-    // A row either query cannot score counts once, however many queries
-    // drop it.
+    let mut rankings = queries.into_iter().map(ScopedQuery::finish);
+    let first = rankings.next().unwrap_or_default();
+    let top = match rankings.next() {
+        Some(second) => union_hnsw(first, second, overfetch),
+        None => first,
+    };
+    warn_malformed(malformed, filters);
+    Ok((top.into_iter().map(|(id, _)| id).collect(), kept))
+}
+
+/// Rank the rows a scoped scan kept (see [`scoped_scan`]) against `query`,
+/// PRF's expanded query, as the scan itself would rank them, without reading
+/// the scope again.
+fn rank_kept_candidates(
+    candidates: &[ScopeCandidate],
+    query: &[f32],
+    overfetch: usize,
+    filters: &SearchFilters,
+) -> Vec<String> {
+    let Some(scoring) = query_scoring(query) else {
+        return Vec::new();
+    };
     let mut unscorable = vec![false; candidates.len()];
-    let mut ranked = |query: &[f32]| match query_scoring(query) {
-        Some(scoring) => exact_top_k(&candidates, query, scoring, overfetch, &mut unscorable),
-        None => Vec::new(),
-    };
-    let primary_top = ranked(primary);
-    let top = match content {
-        Some(cv) => union_hnsw(primary_top, ranked(cv), overfetch),
-        None => primary_top,
-    };
-    malformed += unscorable.iter().filter(|dropped| **dropped).count();
+    let top = exact_top_k(candidates, query, scoring, overfetch, &mut unscorable);
+    warn_malformed(
+        unscorable.iter().filter(|dropped| **dropped).count(),
+        filters,
+    );
+    top.into_iter().map(|(id, _)| id).collect()
+}
+
+/// The scoped leg's one warning for the rows it skipped as malformed.
+fn warn_malformed(malformed: usize, filters: &SearchFilters) {
     if malformed > 0 {
         tracing::warn!(
             malformed,
@@ -526,10 +608,6 @@ fn scoped_vector_candidates(
             "scoped search skipped drawers whose stored embedding is malformed"
         );
     }
-    Ok(top
-        .into_iter()
-        .map(|(pos, _)| candidates[pos].id.clone())
-        .collect())
 }
 
 /// An in-scope drawer the scoped vector leg can score: its id, its decoded
@@ -573,53 +651,158 @@ fn query_scoring(query: &[f32]) -> Option<QueryScoring> {
     }
 }
 
-/// The top `k` of `candidates` by `scoring` against `query`, as (position,
-/// score), highest first, ties broken by drawer id whatever order
-/// `candidates` is in. A candidate of another length than `query` is skipped
-/// (the scoped leg has already dropped, and counted, rows of another length
-/// than the primary query). A candidate whose score is not finite is skipped
-/// and marked in `unscorable` (indexed by position, the same length as
-/// `candidates`); marks are only ever set, so one slice can collect them
-/// over several queries. An all-zero query ([`QueryScoring::AllZero`])
-/// scores every candidate 0, so ids decide the order; a query with any other
-/// unusable norm never gets here ([`query_scoring`] gives it no scoring).
+/// One query vector's ranking of the scope: each row is offered once, and
+/// only the best `k` are held.
+struct ScopedQuery<'q> {
+    vector: &'q [f32],
+    scoring: QueryScoring,
+    top: TopK,
+}
+
+impl<'q> ScopedQuery<'q> {
+    /// `None` for a query [`query_scoring`] gives no scoring.
+    fn new(vector: &'q [f32], k: usize) -> Option<Self> {
+        query_scoring(vector).map(|scoring| Self {
+            vector,
+            scoring,
+            top: TopK::new(k),
+        })
+    }
+
+    /// Score one row and rank it. `false` when its score is not finite, so it
+    /// is not ranked. A row of another length than the query is not scored
+    /// and is not counted here: the scan has already dropped, and counted,
+    /// rows of another length than the primary query. An all-zero query
+    /// ([`QueryScoring::AllZero`]) scores every row 0, so ids decide.
+    fn offer(&mut self, id: &str, embedding: &[f32], norm: f32) -> bool {
+        if embedding.len() != self.vector.len() {
+            return true;
+        }
+        let score = match self.scoring {
+            QueryScoring::Cosine(query_norm) => {
+                match crate::db::drawers::cosine(self.vector, query_norm, embedding, norm) {
+                    Some(score) => score,
+                    None => return false,
+                }
+            }
+            QueryScoring::AllZero => 0.0,
+        };
+        self.top.offer(id, score);
+        true
+    }
+
+    fn finish(self) -> Vec<(String, f32)> {
+        self.top.into_sorted()
+    }
+}
+
+/// The top `k` of `candidates` by `scoring` against `query`, as (id, score),
+/// highest first, ties broken by drawer id whatever order `candidates` is
+/// in, ranked as [`ScopedQuery::offer`] ranks a streamed row. A candidate
+/// whose score is not finite is skipped and marked in `unscorable` (indexed
+/// by position, the same length as `candidates`); marks are only ever set,
+/// so one slice can collect them over several queries.
 fn exact_top_k(
     candidates: &[ScopeCandidate],
     query: &[f32],
     scoring: QueryScoring,
     k: usize,
     unscorable: &mut [bool],
-) -> Vec<(usize, f32)> {
-    let mut scored: Vec<(usize, f32)> = candidates
-        .iter()
-        .enumerate()
-        .filter(|(_, candidate)| candidate.embedding.len() == query.len())
-        .filter_map(|(pos, candidate)| {
-            let score = match scoring {
-                QueryScoring::Cosine(query_norm) => {
-                    let score = crate::db::drawers::cosine(
-                        query,
-                        query_norm,
-                        &candidate.embedding,
-                        candidate.norm,
-                    );
-                    if score.is_none() {
-                        unscorable[pos] = true;
-                    }
-                    score?
-                }
-                QueryScoring::AllZero => 0.0,
-            };
-            Some((pos, score))
-        })
-        .collect();
-    scored.sort_by(|a, b| {
-        b.1.total_cmp(&a.1)
-            .then_with(|| candidates[a.0].id.cmp(&candidates[b.0].id))
-    });
-    scored.truncate(k);
-    scored
+) -> Vec<(String, f32)> {
+    let mut ranking = ScopedQuery {
+        vector: query,
+        scoring,
+        top: TopK::new(k),
+    };
+    for (pos, candidate) in candidates.iter().enumerate() {
+        if !ranking.offer(&candidate.id, &candidate.embedding, candidate.norm) {
+            unscorable[pos] = true;
+        }
+    }
+    ranking.finish()
 }
+
+/// The best `k` (id, score) pairs offered, by score descending (`total_cmp`)
+/// then id ascending: what sorting every pair that way and cutting at `k`
+/// keeps, ties included, whatever order they arrive in. Holds at most `k`
+/// pairs, and copies an id only when its pair is kept.
+struct TopK {
+    k: usize,
+    /// Worst kept pair on top (see [`Ranked`]'s order), so it is the one
+    /// evicted.
+    heap: std::collections::BinaryHeap<Ranked>,
+}
+
+impl TopK {
+    fn new(k: usize) -> Self {
+        Self {
+            k,
+            heap: std::collections::BinaryHeap::new(),
+        }
+    }
+
+    fn offer(&mut self, id: &str, score: f32) {
+        if self.k == 0 {
+            return;
+        }
+        if self.heap.len() == self.k {
+            let worst = self.heap.peek().expect("a full heap of k > 0 pairs");
+            let better = match score.total_cmp(&worst.score) {
+                std::cmp::Ordering::Greater => true,
+                std::cmp::Ordering::Equal => id < worst.id.as_str(),
+                std::cmp::Ordering::Less => false,
+            };
+            if !better {
+                return;
+            }
+            self.heap.pop();
+        }
+        self.heap.push(Ranked {
+            score,
+            id: id.to_string(),
+        });
+    }
+
+    /// The kept pairs, best first.
+    fn into_sorted(self) -> Vec<(String, f32)> {
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|ranked| (ranked.id, ranked.score))
+            .collect()
+    }
+}
+
+/// A [`TopK`] entry, ordered worst-last: a lower score is greater, and among
+/// equal scores a later id is. The heap's maximum is then the pair to evict,
+/// and its ascending order is best first.
+struct Ranked {
+    score: f32,
+    id: String,
+}
+
+impl Ord for Ranked {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .score
+            .total_cmp(&self.score)
+            .then_with(|| self.id.cmp(&other.id))
+    }
+}
+
+impl PartialOrd for Ranked {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Ranked {}
 
 fn drawer_matches_filters(drawer: &Drawer, filters: &SearchFilters) -> bool {
     row_matches_filters(
@@ -664,21 +847,21 @@ fn filter_superseded_candidate_ids(
         .collect())
 }
 
-/// Union two vector result lists (HNSW, or the scoped exact scan) by max
-/// score, deduplicating by index position.
-/// Merged list is sorted by score desc, then index asc (deterministic), capped at `cap`.
-fn union_hnsw(
-    primary: Vec<(usize, f32)>,
-    secondary: Vec<(usize, f32)>,
+/// Union two vector result lists by max score, deduplicating by key: an
+/// HNSW index position, or the scoped exact scan's drawer id.
+/// Merged list is sorted by score desc, then key asc (deterministic), capped at `cap`.
+fn union_hnsw<K: Clone + Eq + std::hash::Hash + Ord>(
+    primary: Vec<(K, f32)>,
+    secondary: Vec<(K, f32)>,
     cap: usize,
-) -> Vec<(usize, f32)> {
-    let mut seen: HashMap<usize, f32> = HashMap::with_capacity(primary.len() + secondary.len());
-    for (idx, score) in primary.iter().chain(secondary.iter()) {
-        seen.entry(*idx)
-            .and_modify(|s| *s = s.max(*score))
-            .or_insert(*score);
+) -> Vec<(K, f32)> {
+    let mut seen: HashMap<K, f32> = HashMap::with_capacity(primary.len() + secondary.len());
+    for (key, score) in primary.into_iter().chain(secondary) {
+        seen.entry(key)
+            .and_modify(|s| *s = s.max(score))
+            .or_insert(score);
     }
-    let mut merged: Vec<(usize, f32)> = seen.into_iter().collect();
+    let mut merged: Vec<(K, f32)> = seen.into_iter().collect();
     merged.sort_by(|a, b| {
         b.1.partial_cmp(&a.1)
             .unwrap_or(std::cmp::Ordering::Equal)
@@ -1351,6 +1534,76 @@ mod tests {
         assert_eq!(result.bm25_hit_count, 0);
     }
 
+    /// A scoped search with PRF on (forced: the env gate is OnceLock-cached).
+    /// 110 in-scope drawers match the query by keyword (at least
+    /// `prf_min_corpus`, so PRF fires), and so do drawers in another wing.
+    /// Every vector is zero, so BM25 drives PRF, and "alpha" is the term it
+    /// expands with. Every result stays in scope, PRF re-runs its keyword
+    /// leg, and the expanded query is scored against the rows the first scan
+    /// kept: the scope's embeddings are read once.
+    #[test]
+    fn a_scoped_search_with_prf_stays_in_scope_and_reads_the_scope_once() {
+        let mut app = App::open_for_test().unwrap();
+        let zero = vec![0.0; DIM];
+        for (wing, count) in [("p", 110), ("q", 40)] {
+            for i in 0..count {
+                let id = format!("{wing}{i:03}");
+                app.db
+                    .insert_drawer(
+                        &id,
+                        &format!("needle alpha {id}"),
+                        &zero,
+                        wing,
+                        "r",
+                        "",
+                        "t",
+                    )
+                    .unwrap();
+            }
+        }
+        let filters = SearchFilters {
+            limit: 20,
+            ..scope(Some("p"), None)
+        };
+        let run = |app: &mut App| {
+            let reads = app.db.record_column_reads();
+            let result = search(app, "needle", &filters).unwrap();
+            let reads = reads.lock().unwrap().clone();
+            let count = |table: &str, column: &str| {
+                reads
+                    .iter()
+                    .filter(|(t, c)| t == table && c == column)
+                    .count()
+            };
+            (
+                result,
+                count("drawers", "embedding"),
+                count("drawers_fts", "drawers_fts"),
+            )
+        };
+
+        let (_, plain_embedding_reads, plain_keyword_reads) = run(&mut app);
+        app.force_prf = true;
+        let (result, embedding_reads, keyword_reads) = run(&mut app);
+
+        assert_eq!(result.results.len(), 20);
+        assert!(
+            result.results.iter().all(|r| r.drawer.wing == "p"),
+            "{:?}",
+            result
+                .results
+                .iter()
+                .map(|r| r.drawer.id.as_str())
+                .collect::<Vec<_>>()
+        );
+        // PRF ran: its expanded query took a second keyword search.
+        assert!(plain_keyword_reads > 0);
+        assert_eq!(keyword_reads, 2 * plain_keyword_reads);
+        // And it did not read the scope's embeddings a second time.
+        assert_eq!(plain_embedding_reads, 1);
+        assert_eq!(embedding_reads, 1);
+    }
+
     /// A vector whose cosine similarity with `query_vec()` is exactly `s`,
     /// scaled to length `len` (so the score must divide by the norm).
     fn at_similarity(s: f32, len: f32) -> Vec<f32> {
@@ -1468,9 +1721,21 @@ mod tests {
         let mut unscorable = [false; 2];
         let top = exact_top_k(&candidates, &query, scoring_of(&query), 10, &mut unscorable);
         assert_eq!(top.len(), 1, "{top:?}");
-        assert_eq!(candidates[top[0].0].id, "plain");
+        assert_eq!(top[0].0, "plain");
         // The dropped candidate is reported, so the scoped leg can count it.
         assert_eq!(unscorable, [true, false]);
+        // A second query on the same slice drops it again, and it is still
+        // marked once: a row no query can score counts once.
+        let scaled: Vec<f32> = query.iter().map(|x| x * 2.0).collect();
+        let top = exact_top_k(
+            &candidates,
+            &scaled,
+            scoring_of(&scaled),
+            10,
+            &mut unscorable,
+        );
+        assert_eq!(top.len(), 1, "{top:?}");
+        assert_eq!(unscorable.iter().filter(|dropped| **dropped).count(), 1);
     }
 
     /// The scoring a usable or all-zero test query gets.
@@ -1486,6 +1751,42 @@ mod tests {
         }
     }
 
+    /// The bounded ranking keeps exactly what a full sort (score descending,
+    /// then id ascending) cut at `k` keeps, ties included, whatever order the
+    /// rows arrive in.
+    #[test]
+    fn top_k_matches_a_full_sort() {
+        let mut state = 7u64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            state >> 33
+        };
+        for n in [0usize, 1, 5, 64, 300] {
+            // Five distinct scores (one negative, one -0.0), so most rows tie.
+            let scores = [-0.5, -0.0, 0.0, 0.25, 0.9];
+            let mut rows: Vec<(String, f32)> = (0..n)
+                .map(|i| (format!("id{i:03}"), scores[(next() % 5) as usize]))
+                .collect();
+            // Arrival order: a deterministic shuffle.
+            for i in (1..rows.len()).rev() {
+                let j = (next() % (i as u64 + 1)) as usize;
+                rows.swap(i, j);
+            }
+            let mut sorted = rows.clone();
+            sorted.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            for k in [0, 1, 2, 10, n, n + 3] {
+                let mut top = TopK::new(k);
+                for (id, score) in &rows {
+                    top.offer(id, *score);
+                }
+                let expected: Vec<(String, f32)> = sorted.iter().take(k).cloned().collect();
+                assert_eq!(top.into_sorted(), expected, "n={n} k={k}");
+            }
+        }
+    }
+
     /// `exact_top_k` itself breaks ties by id, not by its input order.
     #[test]
     fn exact_top_k_breaks_ties_by_id_not_input_order() {
@@ -1497,7 +1798,7 @@ mod tests {
             candidate_of("b", v, 1.0),
         ];
         let mut unscorable = [false; 4];
-        let order: Vec<&str> = exact_top_k(
+        let order: Vec<String> = exact_top_k(
             &candidates,
             &query_vec(),
             scoring_of(&query_vec()),
@@ -1505,15 +1806,15 @@ mod tests {
             &mut unscorable,
         )
         .into_iter()
-        .map(|(pos, _)| candidates[pos].id.as_str())
+        .map(|(id, _)| id)
         .collect();
         assert_eq!(order, ["top", "a", "b", "c"]);
         // With a zero query every score is 0 and the id order alone decides.
         let zero = vec![0.0; DIM];
-        let order: Vec<&str> =
+        let order: Vec<String> =
             exact_top_k(&candidates, &zero, scoring_of(&zero), 2, &mut unscorable)
                 .into_iter()
-                .map(|(pos, _)| candidates[pos].id.as_str())
+                .map(|(id, _)| id)
                 .collect();
         assert_eq!(order, ["a", "b"]);
         assert_eq!(unscorable, [false; 4]);
