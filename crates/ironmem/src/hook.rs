@@ -9963,16 +9963,25 @@ mod tests {
         let mut payload = HookPayload::parse(&input);
         payload.session_id = Some("conv".into());
         let summary = session_summary(&payload, "stop", "agy", None).unwrap();
-        assert!(summary.contains("cwd=/repo "), "{summary}");
+        // The messages deliberately do not print `summary`: it embeds the
+        // session id, and CodeQL treats a panic message as a log sink
+        // (rust/cleartext-logging).
+        assert!(
+            summary.contains("cwd=/repo "),
+            "summary must record the payload's workspace_root as cwd=/repo"
+        );
         assert!(
             summary.contains("transcript_path=/t/agy.jsonl"),
-            "{summary}"
+            "summary must record the camelCase transcriptPath"
         );
         assert_eq!(payload.workspace_root, Some(PathBuf::from("/repo")));
 
         let agy = serde_json::json!({ "workspacePaths": ["/w"] });
         let summary = session_summary(&HookPayload::parse(&agy), "stop", "agy", None).unwrap();
-        assert!(summary.contains("cwd=/w "), "{summary}");
+        assert!(
+            summary.contains("cwd=/w "),
+            "summary must fall back to workspacePaths[0] as cwd=/w"
+        );
     }
 
     /// A payload with only Antigravity's camelCase keys resolves its
