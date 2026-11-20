@@ -801,8 +801,28 @@ impl Database {
         f(&self.conn)
     }
 
-    /// Load all vectors from the drawers table for HNSW index building.
-    /// Returns (id, embedding) pairs.
+    /// Load the vectors the HNSW index is built from, as (id, embedding) pairs.
+    ///
+    /// A drawer whose embedding has no usable norm is left out
+    /// (`crate::db::drawers::embedding_norm` decides). The index's cosine
+    /// distance is 0 against a zero vector, so such a row would match every
+    /// query perfectly. An all-zero embedding (Autopilot and collab rows, or
+    /// anything written by the noop embedder) is deliberate and is only
+    /// counted at `debug`; any other unusable norm (a NaN or infinite
+    /// component, a norm that overflows or underflows) is damage, reported in
+    /// one `warn` per load with the count and the first
+    /// [`UNUSABLE_IDS_NAMED`] ids (each id is also logged at `debug`). A load
+    /// runs on every search after a write, so a warning per drawer would
+    /// repeat for every damaged row each time. Either way the drawers stay
+    /// in the table and can still be read by id. Autopilot backlog-lineage
+    /// rows and collab plans and task lists are still found by keyword
+    /// search; collab messages are not, since `insert_drawer` keeps them out
+    /// of the keyword index.
+    ///
+    /// A row whose embedding cannot be converted (not a whole `EMBED_DIM`
+    /// floats, or not a blob) is skipped and counted in one `warn`. Any other
+    /// row error fails the load rather than return a truncated list as the
+    /// whole table.
     pub fn load_all_vectors(&self) -> Result<Vec<(String, Vec<f32>)>, MemoryError> {
         let mut stmt = self.conn.prepare("SELECT id, embedding FROM drawers")?;
 
@@ -847,21 +867,64 @@ impl Database {
 
         let mut result = Vec::new();
         let mut skipped = 0usize;
+        let mut zero = 0usize;
+        let mut unusable = 0usize;
+        let mut first_unusable: Vec<String> = Vec::new();
         for row in rows {
             match row {
-                Ok(item) => result.push(item),
-                Err(_) => skipped += 1,
+                Ok((id, embedding)) => match crate::db::drawers::embedding_norm(&embedding) {
+                    crate::db::drawers::EmbeddingNorm::Usable(_) => result.push((id, embedding)),
+                    crate::db::drawers::EmbeddingNorm::Zero => zero += 1,
+                    crate::db::drawers::EmbeddingNorm::Unusable => {
+                        unusable += 1;
+                        tracing::debug!(drawer_id = %id, "{UNUSABLE_NORM_LEFT_OUT}");
+                        if first_unusable.len() < UNUSABLE_IDS_NAMED {
+                            first_unusable.push(id);
+                        }
+                    }
+                },
+                // The closure's own length checks, and a value that is not
+                // a blob: this row cannot be indexed, the rest can.
+                Err(
+                    rusqlite::Error::FromSqlConversionFailure(..)
+                    | rusqlite::Error::InvalidColumnType(..),
+                ) => skipped += 1,
+                // Anything else (busy, I/O, corruption, an interrupt) ends
+                // the statement, so the rows read so far are not the table.
+                Err(e) => return Err(e.into()),
             }
+        }
+        if zero > 0 {
+            tracing::debug!("{zero} drawer(s) left out of the vector index: all-zero embedding");
+        }
+        if unusable > 0 {
+            tracing::warn!(
+                unusable,
+                first_ids = ?first_unusable,
+                "{unusable} drawer(s) {UNUSABLE_NORM_LEFT_OUT}"
+            );
         }
         if skipped > 0 {
             tracing::warn!(
-                "{skipped} drawer(s) skipped: embedding dimension mismatch — \
-                 re-embed or run `ironmem migrate` to restore full search coverage"
+                "{skipped} drawer(s) skipped: embedding is not a {EMBED_DIM}-float blob (a \
+                 dimension mismatch, a damaged blob or a value that is not a blob) — re-embed \
+                 or run `ironmem migrate` to restore full search coverage"
             );
         }
         Ok(result)
     }
 }
+
+/// What is said of a drawer whose embedding has no usable norm:
+/// [`Database::load_all_vectors`] logs it for each one at `debug` and for
+/// their count at `warn`, and `App::insert_into_index` warns it for the one
+/// drawer it was given, so the two cannot drift apart.
+pub(crate) const UNUSABLE_NORM_LEFT_OUT: &str =
+    "left out of the vector index: embedding has no usable \
+     norm (a non-finite value, or a norm that overflows or underflows)";
+
+/// How many ids [`Database::load_all_vectors`]' one warning names.
+const UNUSABLE_IDS_NAMED: usize = 5;
 
 /// Read the highest applied schema version from `schema_version`.
 ///

@@ -160,6 +160,15 @@ both Codex and Claude Code:
 - `iron-build`
 - `iron-tdd`
 
+It also appends ironmem's four Claude Code hooks (SessionStart,
+UserPromptSubmit, Stop, PreCompact) to `$CLAUDE_HOME/settings.json`
+(override the file with `CLAUDE_SETTINGS_JSON`), leaving hooks that are
+already wired alone, and only when the ironmem Claude Code plugin is not
+enabled. `--skip-hooks` skips the hooks and still registers the MCP server;
+`--skip-wiring` skips both. Without `jq` it prints the entries to add by
+hand. See [`ironmem doctor`](#ironmem-doctor)'s `hooks`
+line.
+
 Codex also receives the `pr-review-toolkit` skill used by the `/collab`
 `review_fix_global` turn before Codex fans confirmed fixes out to
 subagents and Claude runs `/ultrareview-local`.
@@ -605,8 +614,10 @@ Validate a local install in one command. `doctor` reports the binary version,
 database path and schema/migration status, embedding-model cache status, MCP
 access mode, warmup readiness, which registered harnesses have the `ironmem`
 MCP server registered (and whether they're wired with the shared-daemon proxy
-command or the legacy bare `serve`), and the shared daemon's own reachability
-and auto-spawn configuration — see
+command or the legacy bare `serve`), whether Claude Code's four ironmem hooks are
+wired in `~/.claude/settings.json` (or supplied by the plugin) and whether its
+Stop/PreCompact hooks can mine, how old the newest mined row is, and the shared
+daemon's own reachability and auto-spawn configuration — see
 [Troubleshooting](#troubleshooting) under Shared Daemon Mode for the daemon-
 specific checks:
 
@@ -643,6 +654,155 @@ the first `[FAIL]`:
   `ironmem gemini` launcher left in `~/.gemini/settings.json`. Register for
   Antigravity with `ironmem agy` or the installer, then delete
   `mcpServers.ironmem` from that file.
+- **`hooks` warning** (a `[WARN]`) → the plugin's four hooks (SessionStart,
+  UserPromptSubmit, Stop, PreCompact) are not all wired and working. The line
+  says which case it is, and the hint on the line beneath says what to do for
+  that case; follow it:
+  - `settings.json` does not exist, or is not a JSON object doctor can read:
+    doctor reports a dangling symlink, a FIFO or other non-regular file, a
+    file over 8 MiB or one that is not UTF-8 without reading it, and a
+    `~/.claude` that is not a directory instead of skipping the checks.
+  - Its `hooks` block is mis-shaped: `hooks` is not an object (`[]`, `false`, a
+    string), or a `hooks.<event>` is not an array. The line reads `Claude Code
+    hooks: cannot read the hooks in <path>: <reason>`, with a reason such as
+    `hooks.Stop is not an array` or `hooks is not an object`, and `hook_mining`
+    is skipped. The installer refuses such a file too, so fix it by hand first.
+  - `settings.json` sets `disableAllHooks` to `true`, so Claude Code runs no
+    ironmem hook unless a project's settings set it back to `false`; doctor
+    reads only `~/.claude/settings.json`, and managed-policy hooks still run.
+    `hook_mining` is skipped. The hint is `remove disableAllHooks from
+    settings.json or set it to false`.
+  - Some hooks are missing. Doctor counts a command as the hook when its
+    program is `ironmem` (or the plugin's wrapper script), alone or after
+    `env`, `exec`, `command`, `nohup` or `bash -c`. A hook behind `if`, `{ }`,
+    `timeout`, `time`, `nice` or another wrapper reads as missing, and so does
+    one with a quoted mode prefix such as `"IRONMEM_MCP_MODE=trusted" ironmem
+    hook stop`: the shell does not read a quoted `NAME=value` as an assignment,
+    so it looks for a program with that name. The installer reads these
+    shapes the same way, with one difference: it reads a `;`, `&`, `|`, `(`,
+    `)` or line break inside quotes or a comment as the start of a command, so
+    it can call a hook already wired that doctor reports missing (`echo "x;
+    ironmem hook stop"`), and the hint says what to do then. When a missing
+    hook's entry mentions its command (`timeout 5 ironmem hook stop`), a
+    further hint says not to re-run the installer if that entry does run the
+    hook, since the installer would add a second copy beside it.
+  - A SessionStart or UserPromptSubmit hook fails or may fail to start: its
+    `IRONMEM_MCP_MODE` is invalid or cannot be judged statically, or its
+    program is a full path (or `~/...`) that does not exist, is not an
+    executable file or cannot be reached (`cannot be reached (not a
+    directory)`), as in `Claude Code hooks: SessionStart is wired to <path>,
+    which does not exist, so no memory context is loaded at session start`.
+    On a non-plugin install, a command whose program or wrapper script uses
+    `${CLAUDE_PLUGIN_ROOT}` (copied from the plugin's hooks.json) does not
+    run either: Claude Code sets that variable only for plugin hooks
+    (measured on 2.1.329), and the line says `uses ${CLAUDE_PLUGIN_ROOT}, a
+    variable Claude Code sets only for plugin hooks`. A shell command that
+    gives the variable a default (`${CLAUDE_PLUGIN_ROOT:-/path}`) that the
+    shell expands (not in single quotes or after a backslash) runs the
+    default, so doctor and the installer read it as running. A Stop or
+    PreCompact that fails to start is reported on `hook_mining` instead.
+  - The enabled plugin and a hand-wired entry both supply a hook, so it runs
+    twice, or one copy does not start, as in `the hand-wired <Event> is wired
+    to <path>, which does not exist, so only the plugin's copy runs`.
+
+  Where hooks are affected the line names them; for a missing hook, or one that
+  fails to start with no other copy running, it also says what is off without
+  it, e.g. "prompt recall is off".
+
+  Doctor reads exec-form entries too. When an entry sets `args` (an array of
+  strings), Claude Code runs `command` directly with `args` as its arguments
+  and no shell, and doctor reads that argument vector the same way:
+  `{"command": "env", "args": ["IRONMEM_MCP_MODE=trusted",
+  "/path/to/ironmem", "hook", "stop"]}` is a trusted Stop, and `{"command":
+  "ironmem hook stop", "args": []}` names a program called `ironmem hook stop`,
+  so it is not the hook. `exec` is a shell builtin with no program behind it,
+  so an entry whose program is `exec` (or `env` running `exec`) never starts
+  and reads as missing; in shell form too, `env`, `nohup` or `exec` followed
+  by `exec` reads as missing, while `command exec` runs the builtin. An element holding a `${...}` placeholder counts as
+  unknown until run time, and any other `$` is literal. Doctor reads a `~/`
+  program as not expanded (exec form runs no shell, and the hooks docs list
+  no `~` expansion), so it reports that hook as not running; writing the full
+  path fixes it either way. An entry whose `args` is not an array of strings
+  is skipped, and so is one whose `command` is not a string.
+
+  Re-running `scripts/install-ironmem.sh` appends only the missing hooks and
+  leaves every hook that is already wired alone, so it fixes a missing hook or
+  a missing `settings.json`, and it adds back any of the four hooks you
+  deleted unless you pass `--skip-hooks`, which skips the hooks and still
+  registers the MCP server (`--skip-wiring` skips both). It does not fix a
+  hook that fails to start or runs twice, a mis-shaped `hooks` block,
+  `disableAllHooks` (it wires the hooks anyway and warns that none run), or an
+  unreadable `settings.json`, which you fix by hand. A command that reaches
+  the hook through `${CLAUDE_PLUGIN_ROOT}` does not count as wired: Claude
+  Code leaves that variable unset for a `settings.json` hook, so the
+  installer adds its own and prints a WARN naming the event; you can delete
+  the copied plugin command. With
+  the plugin enabled it wires nothing and warns when `settings.json` also
+  hand-wires any of the four. The hooks it adds bring back session
+  context and prompt recall. They set no `IRONMEM_MCP_MODE`, so they mine only
+  once `IRONMEM_MCP_MODE=trusted` reaches them: from their commands, from
+  `settings.json`'s `env`, or from the environment Claude Code is launched
+  with (see `hook_mining`). After wiring it prints whether the Stop and
+  PreCompact hooks it added mine, judged from that file's `env`; when that
+  sets no `IRONMEM_MCP_MODE`, the line says the environment Claude Code is
+  launched with decides. When a
+  hook it leaves alone names a program by a full path (or `~/...`) that is not
+  the same file as the one it installed, and no command of that hook names
+  the installed program, it prints a WARN naming the event and that program
+  path; a bare `ironmem` found on `PATH`, a path built with `$HOME` and a
+  wrapper script run as `bash <script>` get no WARN, while the plugin's
+  `ironmem-hook.sh` or `ironmem-mcp.sh` named directly as the program gets
+  one. An exec-form entry whose program starts with
+  `~/` gets a WARN too, even when it would expand to the installed program,
+  since doctor reports it as not running; the installer still counts it as
+  wired and leaves it. It writes `settings.json` once, through a temp file
+  beside the file a symlink chain ends at, renamed onto it, so a symlink
+  stays a symlink and a failed write leaves the old file; a hard link to the
+  file is not kept.
+- **`hook_mining` not mining** (a `[WARN]`) → a Stop or PreCompact hook does not
+  mine, or neither is wired. A wired hook does not mine when its
+  `IRONMEM_MCP_MODE` is `read-only` or `restricted`, or is invalid (the hook
+  fails to start), or when its program is a full path that does not exist or
+  is not an executable file (`Stop: wired to <path>, which does not exist ->
+  does not run`). When the mode cannot be judged statically, the line instead
+  says the hook "may not be mined". A plugin hook whose default is overridden to
+  a non-trusted mode by `settings.json` `env` or the shell also warns. The line
+  also says where each hook's mode came from; a mode doctor finds only in its
+  own environment applies to a Claude Code launched from that same shell.
+  Read-only is the expected state for a script install: MCP writes and prompt
+  recall still work. Prefixing the Stop and PreCompact commands with
+  `IRONMEM_MCP_MODE=trusted` turns mining on when ironmem runs in the
+  command's first simple command; a prefix reaches only that one, so for
+  `cd /x && ironmem hook stop` put `export IRONMEM_MCP_MODE=trusted;` at the
+  start instead (the hint says which; doctor follows `export`, `unset` and a
+  plain `IRONMEM_MCP_MODE=v` earlier in the same command, but not `env -i` or
+  `env -u`) (for an exec-form entry, make
+  `env` the command and put `IRONMEM_MCP_MODE=trusted`, then the program,
+  first in `args`; for a run inside an exec-form entry's `bash -c` string, put
+  it before the ironmem command inside that string), at the cost of loading the embedding model and rebuilding
+  the vector index on each run; a cheaper path is tracked in #418. A
+  `settings.json` `env.IRONMEM_MCP_MODE` that is not a string reads as unset,
+  with a hint to make it one. On the plugin path the OK lines end `(if the
+  plugin's wrapper starts; doctor does not check the plugin's own files)`:
+  the plugin's wrapper exits without running a hook when the `ironmem`
+  binary's version differs from the plugin's `plugin.json` version (or no
+  binary resolves), and doctor does not check that, so after an upgrade keep
+  the binary and the plugin on the same version. The line is
+  an `[INFO]` skip when the `hooks` block cannot be read (`hook mining:
+  skipped (the hooks in settings.json cannot be read)`) or `disableAllHooks`
+  is true (`hook mining: skipped (disableAllHooks is true in settings.json;
+  see the hooks line)`).
+- **`mined_rows` older than 7 days** (a `[WARN]`) → no workspace file has been
+  mined in that time. Mining stores only files whose content changed, so a
+  workspace you haven't edited looks the same as mining that stopped; MCP writes
+  don't count. Check the `hook_mining` line. A newest row dated in the future
+  warns about the system clock. With no mined row at all the line
+  is an `[INFO]`, and its hint lists what mines: trusted Stop and PreCompact
+  hooks on every run, `ironmem mine <dir>`, the `ironmem claude` and `ironmem
+  codex` launchers, and, the first time for a workspace, a trusted SessionStart
+  hook or a trusted MCP server start with `IRONMEM_WORKSPACE_ROOT` set.
+  Known limit: no index covers this read, so it scans every drawer, once per
+  `ironmem doctor` run (about 20 ms on 40,000 drawers with a warm cache).
 
 Codex's config location honors `CODEX_HOME` (default `~/.codex/config.toml`);
 Claude Code's is `~/.claude.json`; Muse Code's is `$XDG_CONFIG_HOME/muse/settings.json`,
@@ -832,7 +992,7 @@ The DB is updated automatically as you work:
 
 - **Session start** — bootstrap runs if this is the first time; the workspace is mined if it hasn't been indexed yet. In Claude Code the injected status block also tells the session to say "ironmem tools failed to load" when no ironmem tools reached it, so a rejected tool list or dead server is loud instead of a session silently working without memory
 - **UserPromptSubmit** (Claude Code only) — every prompt with at least two content words triggers bounded local BM25/KG/diary recall, with drawers scoped to the current workspace (with opt-in ready-daemon hybrid vector recall; embedder never loaded by the hook) that injects sanitized untrusted-memory excerpts as `additionalContext`; see [docs/CODEX.md](docs/CODEX.md) for all prompt-recall tunables and daemon cost caveats, and [UserPromptSubmit recall](#userpromptsubmit-recall-claude-code-only) for what is and isn't recalled
-- **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary. A hook without write access (`ironmem hook` run with `IRONMEM_MCP_MODE` unset or `read-only`, the default for hand-registered hook commands) never mines and only records metrics, from the database alone: the embedder and vector index are never loaded, so a Stop costs milliseconds instead of seconds on a large store. The plugin's hooks run `trusted` and still load them to mine
+- **Stop / PreCompact** — changed files are detected via SHA-256 manifest and re-mined incrementally; a session summary is appended to the diary. A hook without write access (`ironmem hook` run with `IRONMEM_MCP_MODE` unset or `read-only`, the default for hand-registered hook commands) never mines and only records metrics, from the database alone: the embedder and vector index are never loaded, so a Stop costs milliseconds instead of seconds on a large store. The plugin's hooks run `trusted` and still load them to mine. `scripts/install-ironmem.sh` wires these hooks with no `IRONMEM_MCP_MODE`, so they run read-only unless `IRONMEM_MCP_MODE=trusted` reaches them from `settings.json`'s `env` or the environment Claude Code is launched with, and `ironmem doctor`'s `hook_mining` line shows whether they can mine and its `mined_rows` line when a file was last mined.
 - **Stop handoff nudge** (Claude Code only) — after a commit, push or PR, or 5+ file edits since the session last saved to ironmem, the Stop is blocked once with a request to save a handoff drawer (wing = the workspace's repository wing, the one prompt recall reads it from, room `handoffs`, logical_key `<branch>-handoff`), so the next session in any harness resumes from memory. At most once per 30 minutes per session, never on a stop that is already retrying; `IRONMEM_HANDOFF_NUDGE=0` (or `false`/`no`/`off`) turns it off
 - **Later sessions** — only files whose content hash changed since the last hook run are re-embedded, so updates are fast
 
@@ -1062,7 +1222,11 @@ Known limits: the thresholds above (two content words, three to reach other
 projects or to search with no workspace, the 50-entry diary scan) are fixed, not
 tunables. A nested checkout is told apart from the parent only once it has been
 mined on its own, and only while its `.git` is there. BM25 matches only rows
-containing every word of the prompt. A non-Git subdirectory of a mined non-Git root
+containing every word of the prompt (after stemming): a word with a hyphen or
+an apostrophe must appear as its parts side by side, upper-case `AND`, `OR`,
+`NOT` and `NEAR` are dropped rather than read as operators (unless quoted on
+their own, as in `"NOT"`), and a token with no
+letter or digit is ignored. A non-Git subdirectory of a mined non-Git root
 doesn't see the root's other files ([#388](https://github.com/ironrace/ironmem/issues/388)),
 and a non-Git `$HOME` used directly as the workspace takes in everything mined
 below it ([#389](https://github.com/ironrace/ironmem/issues/389)). A new

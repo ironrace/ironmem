@@ -239,7 +239,9 @@ impl Embedder {
     }
 
     /// Create a noop embedder that returns zero vectors without loading any model.
-    /// Intended for testing — zero vectors are valid inputs to the DB and HNSW index.
+    /// Intended for testing. The DB stores a zero vector as it stores any other,
+    /// but ironmem keeps it out of its HNSW index: it has no direction, so the
+    /// index's cosine distance would match it to every query.
     pub fn new_noop() -> Self {
         Self {
             inner: EmbedderInner::Noop,
@@ -272,7 +274,8 @@ impl Embedder {
         }
 
         if matches!(self.inner, EmbedderInner::Noop) {
-            // Return deterministic zero vectors — valid for DB storage and index ops.
+            // Deterministic zero vectors: stored in the DB, but ironmem keeps
+            // them out of its HNSW index (see `new_noop`).
             return Ok(vec![0.0f32; texts.len() * EMBED_DIM]);
         }
 

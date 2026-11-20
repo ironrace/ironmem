@@ -659,7 +659,7 @@ A write is classified by its arguments, not just its name: `collab_recv` with `a
 - `IRONMEM_MCP_MODE=read-only` disables write tools (binary default).
 - `IRONMEM_MCP_MODE=restricted` disables writes and redacts sensitive returned content.
 - Mining skips hidden files and directories by default. Set `IRONMEM_MINE_HIDDEN=1` only when you explicitly want dot-paths indexed.
-- `IRONMEM_EMBED_MODE=noop` disables the ONNX embedder entirely (useful for process-level tests or smoke runs without the model).
+- `IRONMEM_EMBED_MODE=noop` disables the ONNX embedder entirely (useful for process-level tests or smoke runs without the model). The noop embedder writes all-zero vectors, which are kept out of the vector index, so search over drawers it wrote is keyword-only.
 - `IRONMEM_AUTO_BOOTSTRAP=0` disables the automatic bootstrap on `serve` start.
 - `IRONMEM_DISABLE_MIGRATION=1` disables the first-run mempalace migration.
 - `IRONMEM_WRITE_READINESS_TIMEOUT_SECS` (default `90`) — how long a

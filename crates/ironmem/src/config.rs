@@ -31,7 +31,11 @@ pub enum McpAccessMode {
 }
 
 impl McpAccessMode {
-    fn parse(raw: &str) -> Result<Self, MemoryError> {
+    /// The mode when `IRONMEM_MCP_MODE` is unset. `ironmem doctor` reads it
+    /// too, to say which mode a hook command that sets nothing runs in.
+    pub(crate) const UNSET_DEFAULT: Self = Self::ReadOnly;
+
+    pub(crate) fn parse(raw: &str) -> Result<Self, MemoryError> {
         match raw.trim().to_ascii_lowercase().as_str() {
             "trusted" => Ok(Self::Trusted),
             "read-only" | "readonly" => Ok(Self::ReadOnly),
@@ -39,6 +43,16 @@ impl McpAccessMode {
             other => Err(MemoryError::Config(format!(
                 "IRONMEM_MCP_MODE must be one of trusted, read-only, restricted; got {other}"
             ))),
+        }
+    }
+
+    /// The canonical `IRONMEM_MCP_MODE` spelling of this mode, which
+    /// [`Self::parse`] reads back.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Trusted => "trusted",
+            Self::ReadOnly => "read-only",
+            Self::Restricted => "restricted",
         }
     }
 
@@ -116,7 +130,7 @@ impl Config {
         let state_dir = base_dir.join("hook_state");
         let mcp_access_mode = match std::env::var("IRONMEM_MCP_MODE") {
             Ok(mode) => McpAccessMode::parse(&mode)?,
-            Err(_) => McpAccessMode::ReadOnly,
+            Err(_) => McpAccessMode::UNSET_DEFAULT,
         };
         let embed_mode = match std::env::var("IRONMEM_EMBED_MODE") {
             Ok(mode) => EmbedMode::parse(&mode)?,
@@ -350,6 +364,18 @@ mod tests {
             state_dir,
             mcp_access_mode: McpAccessMode::ReadOnly,
             embed_mode: EmbedMode::Noop,
+        }
+    }
+
+    #[test]
+    fn mcp_access_mode_as_str_is_the_spelling_parse_reads_back() {
+        for (mode, text) in [
+            (McpAccessMode::Trusted, "trusted"),
+            (McpAccessMode::ReadOnly, "read-only"),
+            (McpAccessMode::Restricted, "restricted"),
+        ] {
+            assert_eq!(mode.as_str(), text);
+            assert_eq!(McpAccessMode::parse(mode.as_str()).unwrap(), mode);
         }
     }
 

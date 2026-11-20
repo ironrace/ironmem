@@ -6,16 +6,34 @@ use sha2::{Digest, Sha256};
 
 /// Sanitize a query string for FTS5 MATCH syntax.
 ///
-/// Previous behaviour wrapped every token in double-quotes, making the query a
-/// strict AND-of-phrases. This caused empty BM25 hits on verbose questions
-/// (any absent token → zero results) and collapsed the hybrid pipeline to
-/// vector-only retrieval.
+/// The query is split on whitespace and each token keeps only its letters, digits,
+/// `'` and `-`. Every cleaned token is emitted as an FTS5 string (wrapped in `"`;
+/// cleaning has already removed every `"`, so none needs escaping) and the tokens
+/// are joined by spaces, so FTS5's implicit AND applies: a drawer must contain
+/// every token.
 ///
-/// New behaviour: strip FTS5 operator characters and emit bare stemmed tokens
-/// separated by spaces. FTS5 with `tokenize='porter ascii'` will apply the
-/// Porter stemmer so morphological variants still match, and the implicit AND
-/// applies at the token level (not phrase level) so partial overlap now returns
-/// results with appropriate BM25 scores rather than nothing.
+/// The quoting is what makes `-` safe. Bare, FTS5 reads it as a column filter
+/// (`handoff-issue-377` gives `no such column: issue`, `-hooks` gives
+/// `no such column: hooks`), and the caller scores that rejection as zero keyword
+/// hits. Inside quotes `-` is plain text.
+///
+/// A quoted string is a phrase, so a hyphenated word such as `non-plugin` matches
+/// only where `non` and `plugin` are adjacent and in that order (the
+/// `porter ascii` tokenizer splits on `-` and stems each part).
+///
+/// A token with no letter or digit (`-`, `'`) is dropped.
+///
+/// A token that is exactly `AND`, `OR`, `NOT` or `NEAR` once cleaned (`NOT`,
+/// `NOT,`) is dropped, not quoted, so it is neither an FTS5 operator nor a word
+/// the drawer must contain: `a OR b` and `a NOT b` both require `a` and `b`, so
+/// `a NOT b` matches only drawers that do contain `b`. That is on purpose, because queries are natural-language text
+/// (the prompt-recall hook passes the user's prompt, where "do NOT ..." is
+/// ordinary English). Lower-case `and`, `or`, `not` and `near` stay ordinary
+/// words, and so does a token that starts and ends with `"` (`"NOT"`). Only a
+/// whole whitespace-separated token counts as quoted, so the word is still
+/// dropped inside a quoted phrase (`"NOT here"`) or with punctuation outside the
+/// quotes (`"NOT",`). If every token is dropped the result is empty, and the
+/// caller returns no hits without querying FTS5.
 fn fts5_sanitize(query: &str) -> String {
     query
         .split_whitespace()
@@ -24,10 +42,13 @@ fn fts5_sanitize(query: &str) -> String {
                 .chars()
                 .filter(|c| c.is_alphanumeric() || matches!(c, '\'' | '-'))
                 .collect();
-            if clean.is_empty() {
-                None
+            let was_quoted = token.len() >= 2 && token.starts_with('"') && token.ends_with('"');
+            let is_fts_keyword =
+                !was_quoted && matches!(clean.as_str(), "AND" | "OR" | "NOT" | "NEAR");
+            if !is_fts_keyword && clean.chars().any(char::is_alphanumeric) {
+                Some(format!("\"{clean}\""))
             } else {
-                Some(clean)
+                None
             }
         })
         .collect::<Vec<_>>()
@@ -266,11 +287,13 @@ enum Bm25Rows<'a> {
     PromptRecall(Option<&'a RecallScope>),
 }
 
-/// Whether FTS5 rejected the query text itself, which a user's prompt can do: a
-/// syntax error, or a `-` it reads as a column filter (`needle - note` asks for
-/// column `note`). Only ever raised while stepping a statement that already
-/// prepared, so a "no such column" here is the query's, not the schema's. Any other
-/// failure (a busy or locked database, I/O, corruption) is not "no hits".
+/// Whether FTS5 rejected the query text itself: a syntax error, or a `-` it reads
+/// as a column filter (`needle - note` asks for column `note`). `fts5_sanitize`
+/// quotes every token, so neither should reach FTS5 and this is a backstop. Only
+/// ever raised while stepping a statement that already prepared, so a "no such
+/// column" here is the query's, not the schema's. Any other failure (a busy or
+/// locked database, I/O, corruption) is not a rejection, and the prompt-recall
+/// search returns it as an error rather than as no hits.
 fn is_fts_query_rejection(error: &rusqlite::Error) -> bool {
     matches!(
         error,
@@ -319,6 +342,27 @@ pub struct SearchFilters {
     pub include_superseded: bool,
 }
 
+/// One drawer's scope columns and stored embedding, as
+/// [`Database::scope_vectors`] reads them for an exact scoped vector search.
+/// The embedding stays undecoded until [`ScopeVector::embedding`] is called,
+/// so rows the caller filters out are never decoded.
+pub(crate) struct ScopeVector {
+    pub id: String,
+    pub wing: String,
+    pub room: String,
+    pub superseded_by: Option<String>,
+    embedding_blob: Option<Vec<u8>>,
+}
+
+impl ScopeVector {
+    /// The decoded embedding, or `None` when the stored value is missing or
+    /// not a blob, or the blob is not a whole number of `f32`s or holds a
+    /// non-finite value.
+    pub(crate) fn embedding(&self) -> Option<Vec<f32>> {
+        self.embedding_blob.as_deref().and_then(decode_embedding)
+    }
+}
+
 /// The message of the `NotFound` error [`Database::mark_drawer_superseded_tx`]
 /// returns when the predecessor id names no drawer. `add_drawer` matches on it to
 /// tell that miss from a missing successor before it adds its id hint, so both
@@ -357,6 +401,27 @@ impl Database {
             source_file,
             added_by,
         )
+    }
+
+    /// `filed_at` of the newest drawer the miner wrote (`added_by = 'mine'`),
+    /// or `None` when nothing has ever been mined into this store. Superseded
+    /// rows count: the question is when mining last wrote a row, not what is
+    /// current. The miner writes only files that changed, so a run that found
+    /// nothing new leaves this value as it was: it dates the last mined write,
+    /// not the last run. `ironmem doctor` shows it because MCP writes keep a
+    /// store looking alive while the hooks mine nothing (#377).
+    ///
+    /// Unindexed: no index covers `added_by`, so this is a full scan of
+    /// `drawers`. It runs once per `ironmem doctor`, not on a hot path, so it
+    /// is accepted rather than given a migration (about 20 ms on 40,000
+    /// drawers with a warm cache).
+    pub fn newest_mined_filed_at(&self) -> Result<Option<String>, MemoryError> {
+        let newest: Option<String> = self.conn.query_row(
+            "SELECT MAX(filed_at) FROM drawers WHERE added_by = ?1",
+            [MINED_ADDED_BY],
+            |row| row.get(0),
+        )?;
+        Ok(newest)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -821,20 +886,20 @@ impl Database {
                 skipped_malformed += 1;
                 continue;
             }
-            let Some(candidate_norm) = vector_norm(&candidate) else {
+            // An all-zero row means "no vector" (see `EmbeddingNorm::Zero`),
+            // so it is skipped without counting as damage.
+            let candidate_norm = match embedding_norm(&candidate) {
+                EmbeddingNorm::Usable(norm) => norm,
+                EmbeddingNorm::Zero => continue,
+                EmbeddingNorm::Unusable => {
+                    skipped_malformed += 1;
+                    continue;
+                }
+            };
+            let Some(score) = cosine(embedding, query_norm, &candidate, candidate_norm) else {
                 skipped_malformed += 1;
                 continue;
             };
-            let dot_product: f32 = embedding
-                .iter()
-                .zip(&candidate)
-                .map(|(query, stored)| query * stored)
-                .sum();
-            let score = dot_product / (query_norm * candidate_norm);
-            if !score.is_finite() {
-                skipped_malformed += 1;
-                continue;
-            }
             if score < NEAR_DUPLICATE_THRESHOLD {
                 continue;
             }
@@ -857,11 +922,127 @@ impl Database {
         Ok(best)
     }
 
+    /// Hand `f` every drawer in `wing` and/or `room`, one row at a time and in
+    /// no particular order, with the columns the search filters read and the
+    /// stored embedding. One `SELECT` (unsorted: sorting would make SQLite
+    /// sort the embedding blobs), after the `PRAGMA table_info` column probe
+    /// the other drawer reads also make. The rules that do not depend on the
+    /// scope run in the SQL, so the rows they exclude are never read: a collab
+    /// message is left out, and so is a superseded row unless
+    /// `include_superseded` is set. The caller still applies its own filter
+    /// rules to what arrives. Rows are streamed, not collected, so the caller
+    /// decides what to keep.
+    pub(crate) fn scope_vectors(
+        &self,
+        wing: Option<&str>,
+        room: Option<&str>,
+        include_superseded: bool,
+        mut f: impl FnMut(ScopeVector),
+    ) -> Result<(), MemoryError> {
+        let has_superseded_by = Self::has_superseded_by_column(&self.conn)?;
+        let superseded_by = if has_superseded_by {
+            "superseded_by"
+        } else {
+            "NULL"
+        };
+        let mut sql = format!(
+            "SELECT id, wing, room, {superseded_by}, embedding FROM drawers WHERE room <> ?"
+        );
+        let mut values: Vec<&str> = vec![COLLAB_MESSAGE_ROOM];
+        if !include_superseded && has_superseded_by {
+            sql.push_str(" AND superseded_by IS NULL");
+        }
+        if let Some(wing) = wing {
+            sql.push_str(" AND wing = ?");
+            values.push(wing);
+        }
+        if let Some(room) = room {
+            sql.push_str(" AND room = ?");
+            values.push(room);
+        }
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            Ok(ScopeVector {
+                id: row.get(0)?,
+                wing: row.get(1)?,
+                room: row.get(2)?,
+                superseded_by: row.get(3)?,
+                // A value that is not a blob (a hand edit or a foreign import;
+                // BLOB affinity does not convert it) is malformed, not an
+                // error that fails the whole search.
+                embedding_blob: match row.get_ref(4)? {
+                    rusqlite::types::ValueRef::Blob(blob) => Some(blob.to_vec()),
+                    _ => None,
+                },
+            })
+        })?;
+        for row in rows {
+            f(row?);
+        }
+        Ok(())
+    }
+
+    /// Test-only: count the `SELECT` statements this connection prepares from
+    /// now on (SQLite's authorizer sees each one as it is prepared).
+    #[cfg(test)]
+    pub(crate) fn count_select_statements(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&count);
+        self.conn
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if matches!(context.action, AuthAction::Select) {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                }
+                Authorization::Allow
+            }))
+            .expect("install the authorizer");
+        count
+    }
+
+    /// Test-only: record, from now on, every (table, column) read by the
+    /// statements this connection prepares, in order (SQLite's authorizer
+    /// sees each read as the statement is prepared). Replaces any authorizer
+    /// installed before, `count_select_statements`' included.
+    #[cfg(test)]
+    pub(crate) fn record_column_reads(
+        &mut self,
+    ) -> std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>> {
+        use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+        use std::sync::{Arc, Mutex};
+
+        let reads = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&reads);
+        self.conn
+            .authorizer(Some(move |context: AuthContext<'_>| {
+                if let AuthAction::Read {
+                    table_name,
+                    column_name,
+                } = context.action
+                {
+                    seen.lock()
+                        .unwrap()
+                        .push((table_name.to_string(), column_name.to_string()));
+                }
+                Authorization::Allow
+            }))
+            .expect("install the authorizer");
+        reads
+    }
+
     /// BM25 full-text search via SQLite FTS5. Returns (drawer_id, score) pairs
     /// ordered by relevance descending. Score is positive (negated bm25() output).
     ///
     /// Returns an empty vec if the FTS table doesn't exist yet or the query is
     /// syntactically invalid — callers fall back to vector-only search gracefully.
+    /// Any other failure while it runs (a busy or locked database, I/O) also
+    /// returns the hits read so far, with a `warn`: every query is quoted, so
+    /// such a failure is almost always the database's, not the query's.
     pub fn bm25_search(
         &self,
         query: &str,
@@ -1008,10 +1189,12 @@ impl Database {
             ),
             Bm25Rows::PromptRecall(None) => (prompt_recall_eligible_sql(), None, true),
         };
-        if query.trim().is_empty() {
+        let fts_query = fts5_sanitize(query);
+        // Nothing left to match (a query of only whitespace, punctuation or
+        // operator words): `MATCH ''` is a syntax error, not an empty result.
+        if fts_query.is_empty() {
             return Ok(vec![]);
         }
-        let fts_query = fts5_sanitize(query);
         let limit_i64 = limit as i64;
         // A pre-v17 database has no physical `superseded_by`, so the filter must
         // be omitted there rather than referencing an absent column. (Reads of
@@ -1118,7 +1301,11 @@ impl Database {
                 if strict && !is_fts_query_rejection(&e) {
                     return Err(e.into());
                 }
-                tracing::debug!("BM25 query failed (will use vector-only): {e}");
+                if is_fts_query_rejection(&e) {
+                    tracing::debug!("BM25 query failed (will use vector-only): {e}");
+                } else {
+                    tracing::warn!(error = %e, "BM25 search failed; the keyword leg returns no hits");
+                }
                 Ok(vec![])
             }
             Ok(rows) => {
@@ -1129,7 +1316,16 @@ impl Database {
                         // A truncated result would read as complete.
                         Err(e) if strict && !is_fts_query_rejection(&e) => return Err(e.into()),
                         Err(e) => {
-                            tracing::debug!("BM25 row error: {e}");
+                            if is_fts_query_rejection(&e) {
+                                tracing::debug!("BM25 row error: {e}");
+                            } else {
+                                tracing::warn!(
+                                    error = %e,
+                                    "BM25 search failed; the keyword leg returns the {} hit(s) \
+                                     read before it",
+                                    result.len()
+                                );
+                            }
                             break;
                         }
                     }
@@ -1372,6 +1568,48 @@ fn vector_norm(embedding: &[f32]) -> Option<f32> {
     (norm.is_finite() && norm > 0.0).then_some(norm)
 }
 
+/// What an embedding's norm makes of it, for the vector index and for exact
+/// cosine scoring. [`embedding_norm`] is the one place that decides it, so
+/// the index rebuild, the single-drawer index insert and the scoped search
+/// cannot disagree about which rows are damaged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum EmbeddingNorm {
+    /// A finite, non-zero norm: the vector has a direction to score.
+    Usable(f32),
+    /// Every component is zero (`0.0` or `-0.0`). Autopilot and collab rows,
+    /// and anything the noop embedder wrote, carry one on purpose: it means
+    /// "no vector", not damage, so skipping it is silent.
+    Zero,
+    /// No usable norm for any other reason: an empty vector, a NaN or
+    /// infinite component, or a sum of squares that overflows `f32` or
+    /// rounds to zero although some component is not zero. Damage, worth a
+    /// warning.
+    Unusable,
+}
+
+/// Classify `embedding` by its norm (see [`EmbeddingNorm`]).
+pub(crate) fn embedding_norm(embedding: &[f32]) -> EmbeddingNorm {
+    if let Some(norm) = vector_norm(embedding) {
+        EmbeddingNorm::Usable(norm)
+    } else if !embedding.is_empty() && embedding.iter().all(|value| *value == 0.0) {
+        EmbeddingNorm::Zero
+    } else {
+        EmbeddingNorm::Unusable
+    }
+}
+
+/// Cosine similarity of `a` and `b`, given their norms (from [`vector_norm`]
+/// or [`EmbeddingNorm::Usable`]), or `None` when the lengths differ or the
+/// result is not finite.
+pub(crate) fn cosine(a: &[f32], a_norm: f32, b: &[f32], b_norm: f32) -> Option<f32> {
+    if a.len() != b.len() {
+        return None;
+    }
+    let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+    let score = dot / (a_norm * b_norm);
+    score.is_finite().then_some(score)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1379,6 +1617,62 @@ mod tests {
 
     fn dummy_embedding() -> Vec<f32> {
         vec![0.1; ironrace_embed::embedder::EMBED_DIM]
+    }
+
+    #[test]
+    fn newest_mined_filed_at_reads_only_mined_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        assert_eq!(db.newest_mined_filed_at().unwrap(), None);
+
+        db.insert_drawer(
+            "a".repeat(32).as_str(),
+            "old mined",
+            &emb,
+            "w",
+            "r",
+            "f1",
+            MINED_ADDED_BY,
+        )
+        .unwrap();
+        db.insert_drawer(
+            "b".repeat(32).as_str(),
+            "new mined",
+            &emb,
+            "w",
+            "r",
+            "f2",
+            MINED_ADDED_BY,
+        )
+        .unwrap();
+        db.insert_drawer(
+            "c".repeat(32).as_str(),
+            "newest, but mcp",
+            &emb,
+            "w",
+            "r",
+            "",
+            "mcp",
+        )
+        .unwrap();
+        for (id, at) in [
+            ("a".repeat(32), "2026-01-01 00:00:00"),
+            ("b".repeat(32), "2026-03-01 12:00:00"),
+            ("c".repeat(32), "2026-11-01 00:00:00"),
+        ] {
+            db.conn
+                .execute(
+                    "UPDATE drawers SET filed_at = ?1 WHERE id = ?2",
+                    rusqlite::params![at, id],
+                )
+                .unwrap();
+        }
+
+        assert_eq!(
+            db.newest_mined_filed_at().unwrap().as_deref(),
+            Some("2026-03-01 12:00:00"),
+            "an MCP write must not count as mining"
+        );
     }
 
     #[test]
@@ -1980,19 +2274,29 @@ mod tests {
         }
     }
 
+    /// Prompts shaped like FTS5 operators used to be rejected by FTS5 (and
+    /// read as no hits). `fts5_sanitize` quotes every token, so they now find
+    /// the drawer their words match; a prompt of nothing but an operator word
+    /// has no word left to match. Since sanitizing makes every query valid,
+    /// FTS5 rejecting the query text is a backstop no public call reaches;
+    /// `is_fts_query_rejection` is checked on hand-built errors.
     #[test]
-    fn prompt_recall_bm25_reports_failures_but_not_rejected_query_text() {
+    fn prompt_recall_bm25_finds_operator_shaped_prompts() {
         let db = Database::open_in_memory().unwrap();
         let emb = dummy_embedding();
         db.insert_drawer("n", "needle note", &emb, "shop", "docs", "", "mcp")
             .unwrap();
-        // Text FTS5 can't parse is a prompt's doing, not a failure.
-        for prompt in ["needle -", "needle - note", "\"needle", "NOT", "needle AND"] {
-            assert!(
-                db.prompt_recall_bm25_search(prompt, 3, None).is_ok(),
-                "{prompt:?}"
-            );
+        let ids = |prompt: &str| -> Vec<String> {
+            db.prompt_recall_bm25_search(prompt, 3, None)
+                .unwrap_or_else(|e| panic!("{prompt:?}: {e}"))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        for prompt in ["needle -", "needle - note", "\"needle", "needle AND"] {
+            assert_eq!(ids(prompt), ["n"], "{prompt:?}");
         }
+        assert!(ids("NOT").is_empty());
         let busy = rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
             Some("database is locked".to_string()),
@@ -2008,6 +2312,36 @@ mod tests {
             Some("no such column: note".to_string()),
         );
         assert!(is_fts_query_rejection(&column));
+    }
+
+    /// The prompt-recall path (strict, recall-eligible rows only) keeps
+    /// hyphenated and id-shaped words, as the general search does: a `-`
+    /// inside or in front of a word is not read as a column filter or NOT.
+    #[test]
+    fn prompt_recall_bm25_finds_hyphenated_and_id_shaped_prompts() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer(
+            "h",
+            "resume handoff-issue-377: the non-plugin hooks",
+            &emb,
+            "shop",
+            "handoffs",
+            "",
+            "mcp",
+        )
+        .unwrap();
+        db.insert_drawer("other", "unrelated text", &emb, "shop", "docs", "", "mcp")
+            .unwrap();
+        for prompt in ["handoff-issue-377", "non-plugin", "-hooks"] {
+            let ids: Vec<String> = db
+                .prompt_recall_bm25_search(prompt, 5, None)
+                .unwrap_or_else(|e| panic!("{prompt:?}: {e}"))
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect();
+            assert_eq!(ids, ["h"], "{prompt:?}");
+        }
     }
 
     #[test]
@@ -2248,6 +2582,143 @@ mod tests {
         assert_eq!(vectors.len(), 1);
         assert_eq!(vectors[0].0, "id01aabbccddeeff01aabbccddeeff01");
         assert_eq!(vectors[0].1, emb);
+    }
+
+    #[test]
+    fn load_all_vectors_leaves_out_zero_norm_embeddings() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let zero = vec![0.0; ironrace_embed::embedder::EMBED_DIM];
+        // -0.0 has a sign bit set but is still a zero component.
+        let negative_zero = vec![-0.0; ironrace_embed::embedder::EMBED_DIM];
+        db.insert_drawer("real", "c", &emb, "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("zero", "c", &zero, "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("negzero", "c", &negative_zero, "w", "r", "", "mcp")
+            .unwrap();
+
+        let vectors = db.load_all_vectors().unwrap();
+        let ids: Vec<&str> = vectors.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["real"]);
+        // The rows themselves are untouched.
+        assert!(db.get_drawer("zero").unwrap().is_some());
+    }
+
+    #[test]
+    fn embedding_norm_tells_a_deliberate_zero_vector_from_damage() {
+        let dim = ironrace_embed::embedder::EMBED_DIM;
+        let mut unit = vec![0.0; dim];
+        unit[3] = 1.0;
+        assert_eq!(embedding_norm(&unit), EmbeddingNorm::Usable(1.0));
+        assert_eq!(embedding_norm(&vec![0.0; dim]), EmbeddingNorm::Zero);
+        assert_eq!(embedding_norm(&vec![-0.0; dim]), EmbeddingNorm::Zero);
+
+        let mut nan = unit.clone();
+        nan[0] = f32::NAN;
+        let mut infinite = unit.clone();
+        infinite[0] = f32::INFINITY;
+        let mut nan_otherwise_zero = vec![0.0; dim];
+        nan_otherwise_zero[0] = f32::NAN;
+        for (what, embedding) in [
+            ("a NaN component", nan),
+            ("an infinite component", infinite),
+            ("a NaN among zeros", nan_otherwise_zero),
+            // Finite components whose sum of squares overflows `f32`.
+            ("an overflowing norm", vec![1e20; dim]),
+            // Non-zero components whose squares round to zero.
+            ("an underflowing norm", vec![1e-30; dim]),
+            ("an empty vector", Vec::new()),
+        ] {
+            assert_eq!(
+                embedding_norm(&embedding),
+                EmbeddingNorm::Unusable,
+                "{what}"
+            );
+        }
+    }
+
+    /// Damaged embeddings are one warning per rebuild, with their count and
+    /// the first few ids (a rebuild runs on every search after a write, so a
+    /// warning per drawer would repeat for every damaged row each time); a
+    /// deliberate zero vector is not warned about. None of them is indexed.
+    #[test]
+    fn load_all_vectors_warns_once_for_damaged_embeddings_but_not_a_zero_one() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+
+        let db = Database::open_in_memory().unwrap();
+        let dim = ironrace_embed::embedder::EMBED_DIM;
+        let mut nan = dummy_embedding();
+        nan[5] = f32::NAN;
+        db.insert_drawer("real", "c", &dummy_embedding(), "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("zero-row", "c", &vec![0.0; dim], "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("nan-row", "c", &nan, "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("overflow-row", "c", &vec![1e20; dim], "w", "r", "", "mcp")
+            .unwrap();
+        let damaged: Vec<String> = (0..5).map(|i| format!("damaged-{i}")).collect();
+        for id in &damaged {
+            db.insert_drawer(id, id, &nan, "w", "r", "", "mcp").unwrap();
+        }
+
+        let (vectors, log) = with_captured_log(|| db.load_all_vectors().unwrap());
+        let ids: Vec<&str> = vectors.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["real"]);
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("unusable=7"), "{log}");
+        // The first five damaged rows are named, and no more.
+        let named = ["nan-row", "overflow-row"]
+            .into_iter()
+            .chain(damaged.iter().map(String::as_str))
+            .filter(|id| warnings[0].contains(&format!("\"{id}\"")))
+            .count();
+        assert_eq!(named, 5, "{log}");
+        assert!(!log.contains("zero-row"), "{log}");
+    }
+
+    /// A row whose embedding cannot be converted (a blob of another length,
+    /// a value that is not a blob) is skipped and counted. Any other error
+    /// fails the load: SQLite ends the statement at the first one (here an
+    /// interrupted step, standing in for a busy or I/O failure), so returning
+    /// the rows read so far would install a truncated index as a whole one.
+    #[test]
+    fn load_all_vectors_skips_unconvertible_rows_but_fails_on_a_step_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut db = Database::open_in_memory().unwrap();
+        for i in 0..50 {
+            let id = format!("row{i:02}");
+            db.insert_drawer(&id, "c", &dummy_embedding(), "w", "r", "", "mcp")
+                .unwrap();
+        }
+        db.insert_drawer("short", "c", &[1.0; 4], "w", "r", "", "mcp")
+            .unwrap();
+        db.insert_drawer("text", "c", &dummy_embedding(), "w", "r", "", "mcp")
+            .unwrap();
+        db.exec_raw("UPDATE drawers SET embedding = 'text' WHERE id = 'text'")
+            .unwrap();
+        assert_eq!(db.load_all_vectors().unwrap().len(), 50);
+
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&steps);
+        db.conn
+            .progress_handler(
+                1,
+                Some(move || counted.fetch_add(1, Ordering::SeqCst) > 100),
+            )
+            .unwrap();
+        let result = db.load_all_vectors();
+        db.conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert!(
+            steps.load(Ordering::SeqCst) > 100,
+            "the scan was not interrupted"
+        );
+        let error = result.expect_err("an interrupted scan must not read as complete");
+        assert!(error.to_string().contains("interrupt"), "{error}");
     }
 
     #[test]
@@ -2582,6 +3053,317 @@ mod tests {
         }
     }
 
+    /// The ids `bm25_search` returns for `query`. `bm25_search` reads an FTS5
+    /// rejection of the query text as no hits, so an empty result alone does
+    /// not show that FTS5 ran: a test expecting no hit for a query also files
+    /// a drawer that the same query does match, and asserts exactly that one.
+    fn bm25_ids(db: &Database, query: &str, wing: Option<&str>) -> Vec<String> {
+        db.bm25_search(query, 10, wing, None)
+            .unwrap_or_else(|e| panic!("{query:?} must not error: {e}"))
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn bm25_finds_hyphenated_words() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "b".repeat(32);
+        db.insert_drawer(
+            &id,
+            "the non-plugin hooks run read-only",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        for query in ["non-plugin hooks", "read-only"] {
+            assert_eq!(bm25_ids(&db, query, None), vec![id.clone()], "{query:?}");
+        }
+        // A quoted string is a phrase: the two halves must be adjacent and in
+        // order, so only the control drawer, which has them as "plugin non",
+        // matches. A query FTS5 rejected would match nothing, not the control.
+        let control = "b2".repeat(16);
+        db.insert_drawer(
+            &control,
+            "a plugin non sequitur",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(bm25_ids(&db, "plugin-non", None), vec![control]);
+    }
+
+    #[test]
+    fn bm25_finds_an_id_shaped_query() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "c".repeat(32);
+        db.insert_drawer(
+            &id,
+            "resume with handoff-issue-377 hook doctor",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        assert_eq!(bm25_ids(&db, "handoff-issue-377", None), vec![id.clone()]);
+    }
+
+    #[test]
+    fn bm25_accepts_fts_keywords_and_operator_prefixes() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "d".repeat(32);
+        db.insert_drawer(&id, "the hooks are wired", &emb, "w", "r", "", "test")
+            .unwrap();
+        for query in ["hooks AND", "NOT hooks", "NEAR hooks", "-hooks", "^hooks"] {
+            // Each must be accepted and keep its keyword hit.
+            assert_eq!(bm25_ids(&db, query, None), vec![id.clone()], "{query:?}");
+        }
+    }
+
+    fn two_drawers(db: &Database) -> (String, String) {
+        let emb = dummy_embedding();
+        let only_hooks = "h".repeat(32);
+        let both = "i".repeat(32);
+        db.insert_drawer(
+            &only_hooks,
+            "the hooks are wired",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        db.insert_drawer(
+            &both,
+            "hooks and doctor, not near",
+            &emb,
+            "w",
+            "r",
+            "",
+            "test",
+        )
+        .unwrap();
+        (only_hooks, both)
+    }
+
+    #[test]
+    fn bm25_ignores_upper_case_operator_words_so_every_term_is_required() {
+        let db = Database::open_in_memory().unwrap();
+        let (only_hooks, both) = two_drawers(&db);
+        // `OR` and `NOT` do not act as operators: both words are required.
+        assert_eq!(bm25_ids(&db, "hooks OR doctor", None), vec![both.clone()]);
+        assert_eq!(bm25_ids(&db, "hooks NOT doctor", None), vec![both.clone()]);
+        // The check is made after punctuation is stripped, so `NOT,` is dropped too.
+        assert_eq!(bm25_ids(&db, "wired NOT,", None), vec![only_hooks]);
+    }
+
+    #[test]
+    fn bm25_keeps_lower_case_operator_words_and_words_that_contain_them() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let (_only_hooks, both) = two_drawers(&db);
+        // Lower-case `or` is a word: neither drawer above has it, so only the
+        // control drawer, which does, is a hit. A query FTS5 rejected would
+        // match nothing, not the control.
+        let control = "o".repeat(32);
+        db.insert_drawer(&control, "hooks or doctor", &emb, "w", "r", "", "test")
+            .unwrap();
+        assert_eq!(bm25_ids(&db, "hooks or doctor", None), vec![control]);
+        let android = "j".repeat(32);
+        db.insert_drawer(&android, "an android phone", &emb, "w", "r", "", "test")
+            .unwrap();
+        assert_eq!(bm25_ids(&db, "ANDROID", None), vec![android]);
+        assert_eq!(bm25_ids(&db, "hooks and doctor", None), vec![both]);
+    }
+
+    #[test]
+    fn bm25_keeps_an_operator_word_only_when_its_whole_token_is_quoted() {
+        let db = Database::open_in_memory().unwrap();
+        let (only_hooks, both) = two_drawers(&db);
+        // `"NOT"` is the word, so the drawer lacking "not" is not a hit.
+        assert_eq!(bm25_ids(&db, "hooks \"NOT\"", None), vec![both]);
+        // Only a whole whitespace-separated token counts as quoted, so the word is
+        // still dropped inside a quoted phrase or with punctuation outside the quotes.
+        let phrase = "hooks \"NOT wired\"";
+        assert_eq!(bm25_ids(&db, phrase, None), vec![only_hooks.clone()]);
+        assert_eq!(bm25_ids(&db, "wired \"NOT\",", None), vec![only_hooks]);
+    }
+
+    #[test]
+    fn bm25_punctuation_or_operator_only_query_matches_nothing() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer("e", "the hooks are wired", &emb, "w", "r", "", "test")
+            .unwrap();
+        for query in ["-", "^", "- ^", "!!! ???", "***", "AND", "NOT NEAR"] {
+            // Nothing survives sanitizing, so FTS5 is never asked.
+            assert!(fts5_sanitize(query).is_empty(), "{query:?}");
+            assert!(bm25_ids(&db, query, None).is_empty(), "{query:?}");
+        }
+    }
+
+    /// `bm25_search` reads an FTS5 rejection as no hits, so it would hide a sanitizer
+    /// bug. This runs the sanitized text through `MATCH` directly instead.
+    #[test]
+    fn fts5_sanitize_output_is_always_a_valid_match_expression() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        db.insert_drawer("k", "the hooks are wired", &emb, "w", "r", "", "test")
+            .unwrap();
+        let empty = [
+            "",
+            "   ",
+            "\t\n",
+            "-",
+            "--",
+            "'",
+            "''",
+            "'-'",
+            "\0",
+            "\u{7}",
+            "\"",
+            "\"\"\"\"",
+            "NEAR(",
+            "\u{1F389}",
+            "\u{1F469}\u{200D}\u{1F4BB}",
+        ];
+        for query in empty {
+            assert_eq!(fts5_sanitize(query), "", "{query:?}");
+        }
+        let reaches_fts5 = [
+            "a-",
+            "-a-",
+            "a--b",
+            "don't",
+            "café",
+            "日本語",
+            "\u{FF21}\u{FF2E}\u{FF24}",
+            "e\u{301}",
+            "²",
+            "drawer_id:a",
+            "{content}:",
+            "handoff-issue-377",
+            "-hooks",
+            "^hooks",
+            "hooks AND",
+        ];
+        let mut stmt = db
+            .conn
+            .prepare("SELECT drawer_id FROM drawers_fts WHERE drawers_fts MATCH ?1")
+            .unwrap();
+        let mut rejected = Vec::new();
+        for query in reaches_fts5 {
+            let sanitized = fts5_sanitize(query);
+            assert!(!sanitized.is_empty(), "{query:?}");
+            let run = stmt
+                .query_map([&sanitized], |row| row.get::<_, String>(0))
+                .and_then(|rows| rows.collect::<rusqlite::Result<Vec<_>>>());
+            if let Err(e) = run {
+                rejected.push(format!("{query:?} -> {sanitized:?}: {e}"));
+            }
+        }
+        assert!(rejected.is_empty(), "FTS5 rejected: {rejected:#?}");
+    }
+
+    /// The general BM25 search still degrades a failure to the hits it has,
+    /// but a failure that is not FTS5 rejecting the query (here an
+    /// interrupted step, standing in for a busy or I/O failure) is a warning:
+    /// since every query is quoted, such an error is almost always a real
+    /// database fault, not the query's.
+    #[test]
+    fn bm25_search_warns_on_a_database_error_but_still_returns() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let mut db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        for i in 0..50 {
+            let id = format!("n{i:02}");
+            db.insert_drawer(&id, "a needle here", &emb, "w", "r", "", "test")
+                .unwrap();
+        }
+        let (hits, log) = with_captured_log(|| db.bm25_search("needle", 100, None, None));
+        assert_eq!(hits.unwrap().len(), 50);
+        assert!(!log.contains("WARN"), "{log}");
+
+        let steps = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&steps);
+        db.conn
+            .progress_handler(
+                1,
+                Some(move || counted.fetch_add(1, Ordering::SeqCst) > 100),
+            )
+            .unwrap();
+        let (hits, log) = with_captured_log(|| db.bm25_search("needle", 100, None, None));
+        db.conn.progress_handler(0, None::<fn() -> bool>).unwrap();
+        assert!(hits.unwrap().len() < 50);
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("interrupt"), "{log}");
+    }
+
+    #[test]
+    fn bm25_hyphenated_query_keeps_its_hit_in_a_wing_scope() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        let id = "f".repeat(32);
+        db.insert_drawer(&id, "the non-plugin hooks", &emb, "w", "r", "", "test")
+            .unwrap();
+        db.insert_drawer("g", "the non-plugin hooks", &emb, "other", "r", "", "test")
+            .unwrap();
+        assert_eq!(bm25_ids(&db, "non-plugin", Some("w")), vec![id]);
+    }
+
+    /// The length precondition is checked, not only documented: a dot
+    /// product over the shorter vector is not a cosine.
+    #[test]
+    fn cosine_refuses_vectors_of_different_lengths() {
+        assert_eq!(cosine(&[1.0, 0.0], 1.0, &[1.0], 1.0), None);
+        assert_eq!(cosine(&[1.0, 0.0], 1.0, &[1.0, 0.0], 1.0), Some(1.0));
+    }
+
+    /// The rules that do not depend on the scope run in the SQL: a collab
+    /// message, and a superseded row unless history is asked for, never reach
+    /// the caller, so their blobs are never read.
+    #[test]
+    fn scope_vectors_leave_out_collab_messages_and_superseded_rows() {
+        let db = Database::open_in_memory().unwrap();
+        let emb = dummy_embedding();
+        for (id, room) in [
+            ("x-current", "r"),
+            ("x-old", "r"),
+            ("x-collab", COLLAB_MESSAGE_ROOM),
+        ] {
+            db.insert_drawer(id, id, &emb, "x", room, "", "test")
+                .unwrap();
+        }
+        db.exec_raw("UPDATE drawers SET superseded_by = 'x-current' WHERE id = 'x-old'")
+            .unwrap();
+        let read = |wing, room, include_superseded| {
+            let mut ids = Vec::new();
+            db.scope_vectors(wing, room, include_superseded, |row| ids.push(row.id))
+                .unwrap();
+            ids.sort_unstable();
+            ids
+        };
+        assert_eq!(read(Some("x"), None, false), ["x-current"]);
+        assert_eq!(read(Some("x"), None, true), ["x-current", "x-old"]);
+        assert!(read(None, Some(COLLAB_MESSAGE_ROOM), true).is_empty());
+    }
+
     /// The supersession filter has to hold in every scoped branch, not just the
     /// unscoped one.
     #[test]
@@ -2765,6 +3547,48 @@ mod tests {
             .find_near_duplicate(&query, "wing", "room", "excluded")
             .unwrap()
             .is_none());
+    }
+
+    /// A deliberate all-zero row is skipped without a warning; a damaged one
+    /// (a NaN component) is skipped and counted in the one warning.
+    #[test]
+    fn find_near_duplicate_warns_for_a_damaged_row_but_not_a_zero_one() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+
+        let db = Database::open_in_memory().unwrap();
+        let query = vec![1.0, 0.0];
+        db.insert_drawer("zero-row", "zero", &[0.0, -0.0], "wing", "room", "", "test")
+            .unwrap();
+        db.insert_drawer("real-row", "real", &query, "wing", "room", "", "test")
+            .unwrap();
+
+        let (found, log) =
+            with_captured_log(|| db.find_near_duplicate(&query, "wing", "room", "excluded"));
+        assert_eq!(
+            found.unwrap().map(|(id, _)| id).as_deref(),
+            Some("real-row")
+        );
+        assert!(!log.contains("WARN"), "a zero row is not damage: {log}");
+
+        db.insert_drawer(
+            "nan-row",
+            "nan",
+            &[f32::NAN, 1.0],
+            "wing",
+            "room",
+            "",
+            "test",
+        )
+        .unwrap();
+        let (found, log) =
+            with_captured_log(|| db.find_near_duplicate(&query, "wing", "room", "excluded"));
+        assert_eq!(
+            found.unwrap().map(|(id, _)| id).as_deref(),
+            Some("real-row")
+        );
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("skipped=1"), "{log}");
     }
 
     #[test]

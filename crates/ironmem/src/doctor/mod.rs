@@ -1,10 +1,12 @@
 //! `ironmem doctor` — local setup diagnostics.
 //!
 //! Validates the pieces a fresh install needs (binary, database + schema, model
-//! cache, MCP access mode, warmup readiness, configured harnesses) and reports
-//! each as a [`Check`]. The command is diagnose-only: it never modifies user
-//! config. Only a [`CheckStatus::Error`] is a *blocking* setup failure and
-//! drives a non-zero exit; warnings and info lines are advisory.
+//! cache, MCP access mode, warmup readiness, configured harnesses, Claude Code
+//! hook wiring and whether those hooks can mine, the newest mined row's age)
+//! and reports each as a [`Check`]. The command is
+//! diagnose-only: it never modifies user config. Only a [`CheckStatus::Error`]
+//! is a *blocking* setup failure and drives a non-zero exit; warnings and info
+//! lines are advisory.
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
@@ -15,6 +17,9 @@ use serde::Serialize;
 use crate::config::{Config, EmbedMode, McpAccessMode};
 use crate::db::schema::{Database, LATEST_SCHEMA_VERSION};
 
+mod hook_command;
+mod hooks;
+mod mined;
 mod render;
 pub use render::render_text;
 
@@ -88,32 +93,49 @@ impl DoctorReport {
     }
 }
 
+/// How long doctor's database opens wait on a busy store.
+pub(super) const DOCTOR_DB_BUSY_TIMEOUT: Duration = Duration::from_millis(500);
+
 /// Run every diagnostic against the loaded configuration and the current
 /// environment (home directory, `CODEX_HOME`). Never fails: every problem is
 /// captured as a [`Check`] rather than returned as an error.
 pub fn run_doctor(cfg: &Config) -> DoctorReport {
     let home = dirs::home_dir();
+    let process_mode = std::env::var("IRONMEM_MCP_MODE").ok();
+    run_doctor_in(cfg, home.as_deref(), process_mode.as_deref())
+}
 
+/// [`run_doctor`] with the home directory and doctor's own
+/// `IRONMEM_MCP_MODE` passed in, so unit tests read a temp home rather than
+/// the developer's `~/.claude`.
+fn run_doctor_in(cfg: &Config, home: Option<&Path>, process_mode: Option<&str>) -> DoctorReport {
     let binary = check_binary(env!("IRONMEM_VERSION"));
     let database = check_database(&cfg.db_path);
+    let database_status = database.status;
     let model = check_model_cache(&cfg.model_dir, cfg.embed_mode);
     let mcp = check_mcp_mode(cfg.mcp_access_mode);
     let warmup = check_warmup(database.status, model.status);
 
     let mut checks = vec![binary, database, model, mcp, warmup];
     checks.extend(harness_checks(
-        home.as_deref(),
+        home,
         std::env::var_os("XDG_CONFIG_HOME").as_deref(),
         crate::harness::REGISTRY,
     ));
-    checks.push(agy_hooks_check(home.as_deref()));
-    checks.push(gemini_cli_legacy_check(home.as_deref()));
+    checks.push(agy_hooks_check(home));
+    checks.push(gemini_cli_legacy_check(home));
     note_agy_installer_overrides(
         &mut checks,
-        home.as_deref(),
+        home,
         std::env::var_os("AGY_CONFIG_JSON").as_deref(),
         std::env::var_os("AGY_HOOKS_JSON").as_deref(),
     );
+    checks.extend(hooks::claude_hook_checks(home, process_mode));
+    checks.push(mined::check_mined_rows(
+        &cfg.db_path,
+        database_status,
+        chrono::Utc::now().naive_utc(),
+    ));
 
     DoctorReport { checks }
 }
@@ -124,9 +146,13 @@ pub fn run_doctor(cfg: &Config) -> DoctorReport {
 /// check in `run_doctor` is synchronous file/DB I/O and is unaffected — this
 /// wrapper exists so `run_doctor` itself, and its many existing synchronous
 /// callers/tests, stay untouched.
-#[cfg(unix)]
 pub async fn run_doctor_with_daemon(cfg: &Config) -> DoctorReport {
-    let mut report = run_doctor(cfg);
+    with_daemon_checks(cfg, run_doctor(cfg)).await
+}
+
+/// Append the daemon checks to `report`.
+#[cfg(unix)]
+async fn with_daemon_checks(cfg: &Config, mut report: DoctorReport) -> DoctorReport {
     let socket_path = cfg.daemon_socket_path();
     let health =
         crate::mcp::daemon::probe_daemon_health(&socket_path, Duration::from_millis(500)).await;
@@ -139,8 +165,7 @@ pub async fn run_doctor_with_daemon(cfg: &Config) -> DoctorReport {
 /// this platform, so the daemon check reports that directly instead of
 /// attempting a probe that could never succeed.
 #[cfg(not(unix))]
-pub async fn run_doctor_with_daemon(cfg: &Config) -> DoctorReport {
-    let mut report = run_doctor(cfg);
+async fn with_daemon_checks(cfg: &Config, mut report: DoctorReport) -> DoctorReport {
     report.checks.push(Check::new(
         "daemon",
         CheckStatus::Info,
@@ -609,7 +634,7 @@ fn check_database(db_path: &Path) -> Check {
 
     // Open the existing file without migrating or creating it: a diagnostic
     // must not mutate the store (no WAL switch, no chmod, no schema changes).
-    let db = match Database::open_with_busy_timeout(db_path, Duration::from_millis(500)) {
+    let db = match Database::open_with_busy_timeout(db_path, DOCTOR_DB_BUSY_TIMEOUT) {
         Ok(db) => db,
         Err(e) if is_db_busy(&e) => return database_busy_check(&shown),
         Err(e) => {
@@ -719,11 +744,12 @@ fn check_model_cache(model_dir: &Path, embed_mode: EmbedMode) -> Check {
 }
 
 fn check_mcp_mode(mode: McpAccessMode) -> Check {
-    let (label, writes) = match mode {
-        McpAccessMode::Trusted => ("trusted", "writes allowed"),
-        McpAccessMode::ReadOnly => ("read-only", "writes blocked"),
-        McpAccessMode::Restricted => ("restricted", "writes blocked, sensitive content redacted"),
+    let writes = match mode {
+        McpAccessMode::Trusted => "writes allowed",
+        McpAccessMode::ReadOnly => "writes blocked",
+        McpAccessMode::Restricted => "writes blocked, sensitive content redacted",
     };
+    let label = mode.as_str();
     Check::new(
         "mcp_access",
         CheckStatus::Info,
@@ -1673,7 +1699,7 @@ mod tests {
             mcp_access_mode: McpAccessMode::ReadOnly,
             embed_mode: EmbedMode::Noop,
         };
-        let report = run_doctor(&cfg);
+        let report = run_doctor_in(&cfg, Some(dir.path()), None);
         let names: Vec<&str> = report.checks.iter().map(|c| c.name).collect();
         assert_eq!(
             names,
@@ -1694,6 +1720,9 @@ mod tests {
                 // CLI leftover (`harness_gemini` was renamed `harness_agy`).
                 "agy_hooks",
                 "gemini_cli_legacy",
+                "hooks",
+                "hook_mining",
+                "mined_rows",
             ],
             "the toolable check-key set must stay stable"
         );
@@ -1810,6 +1839,12 @@ mod tests {
 
     // ---- #190 Task 14: run_doctor_with_daemon ------------------------------
 
+    /// [`run_doctor_with_daemon`]'s report, read with `home` as the home
+    /// directory rather than the developer's.
+    async fn daemon_report(cfg: &Config, home: &Path) -> DoctorReport {
+        with_daemon_checks(cfg, run_doctor_in(cfg, Some(home), None)).await
+    }
+
     fn test_doctor_config(dir: &Path) -> Config {
         Config {
             db_path: dir.join("m.sqlite3"),
@@ -1826,7 +1861,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_doctor_config(dir.path());
 
-        let report = run_doctor_with_daemon(&cfg).await;
+        let report = daemon_report(&cfg, dir.path()).await;
         let daemon = report
             .checks
             .iter()
@@ -1893,7 +1928,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
-        let report = run_doctor_with_daemon(&cfg).await;
+        let report = daemon_report(&cfg, dir.path()).await;
         let daemon_check = report
             .checks
             .iter()
@@ -1970,7 +2005,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let cfg = test_doctor_config(dir.path());
 
-        let report = run_doctor_with_daemon(&cfg).await;
+        let report = daemon_report(&cfg, dir.path()).await;
         let names: Vec<&str> = report.checks.iter().map(|c| c.name).collect();
         assert_eq!(
             names,
@@ -1987,6 +2022,9 @@ mod tests {
                 "harness_muse",
                 "agy_hooks",
                 "gemini_cli_legacy",
+                "hooks",
+                "hook_mining",
+                "mined_rows",
                 "daemon",
                 "daemon_autospawn",
             ]

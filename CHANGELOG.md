@@ -9,6 +9,139 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ironmem doctor` reports hooks that leave a store stale (#377).** Three
+  new lines. `hooks` names any of the plugin's four Claude Code hooks missing
+  from `~/.claude/settings.json` (or reports that the enabled plugin supplies
+  them). It warns when a SessionStart or UserPromptSubmit hook fails or may
+  fail to start (a Stop or PreCompact that fails to start is reported on
+  `hook_mining`), including a hook whose program is a full path or `~/...`
+  that does not exist or is not an executable file (`SessionStart is wired to
+  <path>, which does not exist, so no memory context is loaded at session
+  start`, hint `correct the program path in that settings.json entry, or
+  remove the entry and re-run scripts/install-ironmem.sh to wire it again (the
+  installer leaves an entry that is already wired as it is)`). It warns when
+  the enabled ironmem plugin and hand-wired entries in `settings.json` both
+  supply a hook ("so those hooks run twice"; the hint says to "remove the
+  hand-wired ironmem entries from settings.json"), or one copy does not start
+  (`the hand-wired <Event> is wired to <path>, which does not exist, so only
+  the plugin's copy runs`). It warns when the `hooks` block is mis-shaped
+  (`Claude Code hooks: cannot read the hooks in <path>: <reason>`, such as
+  `hooks.Stop is not an array` or `hooks is not an object`, hint `fix hooks in
+  settings.json by hand (it must be an object, and each hooks.<event> an array
+  of hook groups), then re-run scripts/install-ironmem.sh, which refuses the
+  file until then`), and when `settings.json` sets `disableAllHooks` to `true`
+  (`Claude Code hooks: <path> sets disableAllHooks to true, so Claude Code runs
+  no ironmem hook unless a project's settings set it back to false: no memory
+  context is loaded at session start, prompt recall is off and no hook mines
+  workspace files`, hint `remove disableAllHooks from settings.json or set it
+  to false`). A hook behind a quoted mode prefix (`"IRONMEM_MCP_MODE=trusted"
+  ironmem hook stop`) reads as missing, because the shell runs a program with
+  that name. `hook_mining` says whether Stop/PreCompact can mine, with each
+  hook's effective `IRONMEM_MCP_MODE` and where it came from (`Stop: wired to
+  <path>, which does not exist -> does not run` for a missing program); it is
+  skipped when the hooks cannot be read (`hook mining: skipped (the hooks in
+  settings.json cannot be read)`) or are all disabled (`hook mining: skipped
+  (disableAllHooks is true in settings.json; see the hooks line)`). A mode
+  doctor sees only in its own environment is reported as applying to a Claude
+  Code launched from that shell. `mined_rows` shows how old the newest mined
+  row (a chunk of a workspace file) is and warns past 7 days, which an
+  unchanged workspace also triggers; with no mined row, its hint lists
+  everything that mines. Doctor reads exec-form hook entries (`args` set to an
+  array of strings, which Claude Code runs with no shell) as that argument
+  vector: `env`, `command` and `nohup` apply to it (`exec`, a shell builtin
+  with no program, does not, so such an entry never starts and reads as
+  missing; a shell-form `env exec`, `nohup exec` or `exec exec` reads as
+  missing too), `bash -c` reads its string as a shell command, a `${...}`
+  placeholder counts as unknown, any other `$` is literal, a `~/` program is
+  read as not expanded (exec form runs no shell, and the hooks docs list no
+  `~` expansion), and an entry whose `args` is anything else is skipped. The
+  read-only hint for a run inside an exec-form `bash -c` string says to put
+  `IRONMEM_MCP_MODE=trusted` before the ironmem command inside that string.
+  When `settings.json`'s `env` sets a writing `IRONMEM_MCP_MODE`, the install
+  hints say the hooks the installer wires mine. On a non-plugin install a
+  command whose program or wrapper script uses `${CLAUDE_PLUGIN_ROOT}` reads
+  as not running (`Stop: wired to ${CLAUDE_PLUGIN_ROOT}/hooks/ironmem-hook.sh,
+  which uses ${CLAUDE_PLUGIN_ROOT}, a variable Claude Code sets only for
+  plugin hooks -> does not run`), since Claude Code leaves that variable unset
+  for a `settings.json` hook (measured on 2.1.329). A shell command that gives
+  the variable a default that is not empty (`${CLAUDE_PLUGIN_ROOT:-/path}`,
+  also `-`, `:=` and `=`) runs the default where the shell expands that use,
+  so doctor and the installer read it as running. A use the shell does not
+  expand (in single quotes, or with a backslash before its `$`) and an
+  exec-form entry (no shell) are still read as not running.
+  `export -n IRONMEM_MCP_MODE` reads as taking the mode away from the hooks
+  after it, and `export -f` as leaving it alone. A program path whose
+  lookup fails for another reason than not found (a file used as a
+  directory, a symlink loop, a directory the user may not search) reads as
+  `cannot be reached (<reason>)`. Doctor follows `export`, `unset` and a plain
+  `IRONMEM_MCP_MODE=v` earlier in the same command, and reads a backslash in
+  double quotes as POSIX does. When the ironmem command is not the first
+  simple command of its entry (`cd /x && ironmem hook stop`), the read-only
+  hint says to add `export IRONMEM_MCP_MODE=trusted;` at the start instead of
+  a prefix that would not reach it. A missing hook whose entry mentions its
+  command (behind `timeout`, `if` or `{ }`) gets a hint not to re-run the
+  installer, which would add a second copy. A `settings.json` that is a
+  dangling symlink, not a regular file (a FIFO), over 8 MiB or not UTF-8 is
+  reported, not read, and so is a `~/.claude` that is not a directory; a
+  non-string `env.IRONMEM_MCP_MODE` gets a hint; control characters from the
+  file are escaped in doctor's lines. The plugin path's OK lines say `(if the
+  plugin's wrapper starts; doctor does not check the plugin's own files)`:
+  the wrapper refuses to start when the binary's version differs from the
+  plugin's. A newest mined row dated in the future warns about the clock.
+  Problems are warnings and never fail `doctor` (exit 0). Known limit: the
+  `mined_rows` read is unindexed, a full scan of the drawers table once per
+  `doctor` run.
+- **`scripts/install-ironmem.sh` wires the Claude Code hooks (#377).** It now
+  appends the four hooks to `$CLAUDE_HOME/settings.json` (override with
+  `CLAUDE_SETTINGS_JSON`) unless the ironmem plugin is enabled. Hooks
+  already wired, in shell or exec form, and all other hooks and keys are left
+  alone. A shell-form command counts as
+  wired when ironmem is in program position, as doctor reads it (so `echo
+  ironmem hook stop` and a comment do not, and `hook --harness <v> <name>`
+  and a quoted name do); unlike doctor, the installer reads an operator
+  inside quotes or a comment as the start of a command. A command whose
+  program or script path uses `${CLAUDE_PLUGIN_ROOT}` does not count as
+  wired: Claude Code leaves that variable unset for a `settings.json` hook
+  (measured on 2.1.329), so the installer adds its own and warns that the old
+  entry does not run outside the plugin and can be deleted (naming only the
+  event). When an already-wired
+  hook names a program by a full path (or `~/...`) that is not the same file
+  as the installed one, and none of its commands names the installed one, a
+  WARN names the event and that program path (not the whole entry, which can
+  carry a token); a bare `ironmem` on `PATH`, a `$HOME/...` path and a
+  wrapper script run as `bash <script>` get none, while the plugin's
+  `ironmem-hook.sh` or `ironmem-mcp.sh` named directly as the program gets
+  one, as doctor checks it. An exec-form `~/` program gets a WARN (doctor
+  reads it as not expanded), and is left wired. With the plugin enabled it
+  wires none and warns when `settings.json` also hand-wires any of the four
+  (the hook runs twice where both copies start). With `disableAllHooks` set
+  to `true` it still wires them (a project's settings can set it back) and
+  warns that Claude Code runs none of them instead of printing the mining
+  line. `--skip-hooks` skips only the hooks (the MCP server is still
+  registered); `--skip-wiring` skips both. Without `--skip-hooks`, a re-run
+  adds back any of the four you deleted. Without `jq` it prints the four
+  entries to add by hand, with a note to skip them when the plugin is
+  enabled. If settings.json cannot be read or written, holds more than one
+  JSON value, or is changed by another program while the script runs, it
+  warns, wires nothing, leaves the file as it was, and the install continues.
+  The merged file is written to a temp file beside the file a symlink chain
+  ends at and renamed onto it, so a dotfiles symlink stays a symlink, a reader
+  never sees a partial file, and a write that fails partway leaves the old
+  one; a hard link to the file is not kept, and a new `settings.json` is
+  created mode 0600. The warning tells invalid JSON (with jq's own error), an
+  empty file, and a file that is not a JSON object with array-valued hooks
+  (including `"hooks": false`) apart, and for a settings file other than
+  `~/.claude/settings.json` it says `ironmem doctor` does not read that file.
+  The wired hooks set no `IRONMEM_MCP_MODE`, so they run read-only and don't
+  mine unless trusted reaches them (the line printed after wiring says they
+  mine when the file's `env` sets it, that they do not when it sets another
+  value, and otherwise that the environment Claude Code is launched with
+  decides); a cheaper way to mine outside the plugin is #418. The installer's
+  jq programs use only jq 1.5 builtins. The binary itself is now installed
+  under a temporary name and renamed into place, so a hook that starts
+  mid-install runs the old or the new whole binary, and a relative
+  `IRONMEM_INSTALL_DIR` is made absolute, since hooks and MCP clients start in
+  directories of their own.
 - **Antigravity (`agy`) replaces the Gemini CLI harness (#435).** Gemini CLI
   is deprecated upstream in favour of Antigravity. `ironmem agy <repo>
   [prompt]` launches `agy` with ironmem attached and passes the prompt as
@@ -180,6 +313,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   its source and excerpt, so one imported row can't flood the prompt.
   On a fixed five-prompt fixture, one of whose ids is a 209-byte import, the
   injected text grew from 1,700 to 2,398 bytes.
+- **Search's keyword leg ignores upper-case `AND`, `OR`, `NOT` and `NEAR`
+  (#377).** Unless quoted on their own (`"NOT"`), they are dropped from the
+  query, so `a OR b` requires both words and `a NOT b` requires `b` too;
+  lower-case forms stay ordinary words.
 
 ### Fixed
 
@@ -236,6 +373,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ironmem autopilot` commands are not known to start a process while
   another thread drops a lock. The lock is now unlocked explicitly before
   its file is closed, and an unlock that fails is logged as a warning.
+- **Search no longer drops its keyword leg for hyphenated queries (#377).** A
+  query containing `non-plugin`, `read-only` or an id like `handoff-issue-377`
+  was rejected by FTS5, which read the `-` as a column filter, and the
+  rejection was silently scored as zero keyword hits. Each token is now
+  quoted, so a hyphenated word matches as a phrase (`non` then `plugin`,
+  adjacent). A token with no letter or digit is dropped.
+- **Wing/room-scoped search scores the drawers in its scope directly (#377).**
+  Scope was applied after taking the top vector candidates across every wing,
+  so a scoped search could come back empty while matching drawers existed. The
+  vector leg of a scoped search now reads the scope's drawers and ranks them
+  by exact cosine similarity to the query instead of filtering the global top
+  vector results. The search response's `total_candidates` now counts the
+  in-scope vector candidates (at most the overfetch) instead of the global
+  ones. A query embedding with no usable norm (a NaN or infinite value, or a
+  norm that overflows) gets no vector candidates and a warning; an all-zero
+  one, which the noop embedder gives, still scores every in-scope drawer 0
+  (#430 tracks changing that). A scoped search no longer rebuilds the vector
+  index after a write, since it does not read it. Known limit: the cost is
+  linear in the scope on every scoped search (every in-scope row is read and
+  scored; an 18k-drawer room is about 56 MB of reads), though only the best
+  candidates are held in memory. With PRF on, the scope's vectors are held
+  for the search so the expanded query does not read them again.
+- **Drawers stored without a real embedding are no longer in the vector index
+  (#377).** Autopilot backlog-lineage and collab session rows are stored with
+  an all-zero vector, which matched every query perfectly and pushed real
+  results out of the vector leg. They are left out of the index. Autopilot
+  backlog-lineage rows and collab plans and task lists are still found by
+  keyword search; collab messages were never keyword-indexed and are read by
+  id. Everything the noop embedder (`IRONMEM_EMBED_MODE=noop`) writes is an
+  all-zero vector too, so search over a store it wrote is keyword-only.
+  A damaged stored embedding (a NaN or infinite value, or a norm that
+  overflows or underflows) is now logged: as one warning per index build, with
+  the count and the first five drawer ids, and as a warning naming the drawer
+  when one is added to the index; an all-zero one is not warned about, by the
+  index or by `add_drawer`'s near-duplicate check. An index build whose read
+  of the table fails partway (busy, I/O) now fails instead of installing the
+  rows read so far as the whole index. A
+  scoped search logs one warning, naming the wing and room, with the count of
+  in-scope rows it skips as malformed: an undecodable blob, a length other
+  than the query's, a NaN, infinite, overflowing or underflowing norm, or a
+  similarity that is not finite. An all-zero row is skipped silently.
 
 ## [0.7.0] - 2026-11-09
 

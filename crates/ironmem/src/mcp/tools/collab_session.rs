@@ -38,10 +38,13 @@ pub(super) fn collab_error_to_memory_error(error: CollabError) -> MemoryError {
 /// by id and are not intended for recall, so they carry a full zero vector
 /// rather than an empty slice: `insert_drawer_tx` does not validate embedding
 /// length, but the HNSW index-load path (`load_all_vectors` in `db/schema.rs`)
-/// skips — with a per-row warning — any drawer whose embedding length is not
-/// `EMBED_DIM`. A zero vector stays loadable (contributing no vector signal)
-/// and avoids that warn/skip. Note the generic drawer FTS index still sees
-/// their content (see the `COLLAB_PLAN_ROOM` comment).
+/// counts any drawer whose embedding length is not `EMBED_DIM` as a dimension
+/// mismatch and warns about it. A zero vector of the right length avoids that
+/// warning, and `load_all_vectors` leaves it out of the index without one,
+/// since it has no direction to match on. Their content is still in the drawer
+/// keyword (FTS5) index: `Database::insert_drawer_conn` leaves only
+/// `COLLAB_MESSAGE_ROOM` rows out of it, so `search` can find a plan by keyword.
+/// The prompt-recall hook does not inject one (`PROMPT_RECALL_EXCLUDED_ROOMS`).
 fn store_collab_plan_drawer(
     tx: &rusqlite::Transaction<'_>,
     session_id: &str,
@@ -8866,6 +8869,16 @@ mod tests {
             "search must not panic or error: {:?}",
             result.err()
         );
+        // It is out of the vector index but still found by keyword.
+        let plan_id =
+            crate::db::drawers::generate_id("CANONICAL BODY", "ironrace-memory", "collab-plans");
+        let ids: Vec<String> = result
+            .unwrap()
+            .results
+            .into_iter()
+            .map(|r| r.drawer.id)
+            .collect();
+        assert!(ids.contains(&plan_id), "{ids:?}");
     }
 
     // ── plan-by-reference (#90) collab_status compact-reference tests ──────────

@@ -41,6 +41,9 @@ pub struct App {
     /// Test-only: force the rerank stage even when `IRONMEM_RERANK` is unset
     /// (the env gate is OnceLock-cached and can't be flipped per-test).
     pub(crate) force_rerank: bool,
+    /// Test-only: run pseudo-relevance feedback even when
+    /// `IRONMEM_PRF_ENABLED` is unset (the gate is OnceLock-cached too).
+    pub(crate) force_prf: bool,
     pub index_state: RwLock<IndexState>,
     /// Dirty flag: set after writes, cleared after rebuild.
     dirty: AtomicBool,
@@ -132,7 +135,7 @@ impl App {
 
         // Load vectors and build HNSW index
         let vectors_with_ids = db.load_all_vectors()?;
-        let drawer_count = vectors_with_ids.len();
+        let indexed_count = vectors_with_ids.len();
         let vectors_for_index: Vec<Vec<f32>> =
             vectors_with_ids.iter().map(|(_, v)| v.clone()).collect();
         let id_map: Vec<String> = vectors_with_ids.into_iter().map(|(id, _)| id).collect();
@@ -144,8 +147,8 @@ impl App {
         };
 
         tracing::info!(
-            "Memory loaded: {} drawers, HNSW index built, MCP mode: {:?}",
-            drawer_count,
+            "Memory loaded: {} drawers in the HNSW index, MCP mode: {:?}",
+            indexed_count,
             config.mcp_access_mode,
         );
 
@@ -156,6 +159,7 @@ impl App {
             reranker: RwLock::new(None),
             pref_extractor_override: RwLock::new(None),
             force_rerank: false,
+            force_prf: false,
             index_state: RwLock::new(IndexState { index, id_map }),
             dirty: AtomicBool::new(false),
             graph_cache: RwLock::new(None),
@@ -188,6 +192,7 @@ impl App {
             reranker: RwLock::new(None),
             pref_extractor_override: RwLock::new(None),
             force_rerank: false,
+            force_prf: false,
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -453,6 +458,7 @@ impl App {
             reranker: RwLock::new(None),
             pref_extractor_override: RwLock::new(None),
             force_rerank: false,
+            force_prf: false,
             index_state: RwLock::new(IndexState {
                 index: VectorIndex::build(&[], 100),
                 id_map: Vec::new(),
@@ -520,6 +526,13 @@ impl App {
 
     /// Insert a single embedding into the live HNSW index without a full rebuild.
     /// Falls back to a full rebuild from DB if the index is at capacity.
+    ///
+    /// An embedding with no usable norm is not inserted, for the reason given
+    /// on `Database::load_all_vectors`, which leaves the same rows out of
+    /// every rebuild and classifies them the same way
+    /// (`crate::db::drawers::embedding_norm`): an all-zero embedding is
+    /// skipped at `debug`, any other unusable one with a `warn` naming the
+    /// drawer (a rebuild counts them in one warning instead).
     pub fn insert_into_index(&self, drawer_id: &str, embedding: &[f32]) -> Result<(), MemoryError> {
         let mut state = self
             .index_state
@@ -527,11 +540,36 @@ impl App {
             .map_err(|e| MemoryError::Lock(format!("IndexState lock poisoned: {e}")))?;
 
         if state.id_map.iter().any(|id| id == drawer_id) {
-            // An upsert replay may have changed the stored embedding. Avoid
-            // appending the ID a second time; a lazy rebuild refreshes the
-            // vector from SQLite before the next search.
+            // An upsert replay may have changed the stored embedding (possibly
+            // to a zero vector). Avoid appending the ID a second time; a lazy
+            // rebuild refreshes the vector from SQLite before the next search.
             drop(state);
             self.mark_dirty();
+            return Ok(());
+        }
+
+        let usable = match crate::db::drawers::embedding_norm(embedding) {
+            crate::db::drawers::EmbeddingNorm::Usable(_) => true,
+            crate::db::drawers::EmbeddingNorm::Zero => {
+                tracing::debug!(drawer_id = %drawer_id, "all-zero embedding left out of the vector index");
+                false
+            }
+            crate::db::drawers::EmbeddingNorm::Unusable => {
+                tracing::warn!(
+                    drawer_id = %drawer_id,
+                    "drawer {}",
+                    crate::db::schema::UNUSABLE_NORM_LEFT_OUT
+                );
+                false
+            }
+        };
+        if !usable {
+            drop(state);
+            // The drawer is new to the wing/room graph even though it has no
+            // place in the vector index.
+            if let Ok(mut cache) = self.graph_cache.write() {
+                *cache = None;
+            }
             return Ok(());
         }
 
@@ -617,6 +655,12 @@ impl App {
             self.dirty.store(true, Ordering::Release);
         }
         Ok(())
+    }
+
+    /// Test-only: whether a write has left the HNSW index to be rebuilt.
+    #[cfg(test)]
+    pub(crate) fn index_is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
     }
 
     /// Rebuild the HNSW index if dirty. Called before search.
@@ -1079,6 +1123,168 @@ mod tests {
             session_id_from_params(&params).as_deref(),
             Some("meta-snake-session")
         );
+    }
+
+    // ---- zero vectors stay out of the vector index (#377) ------------------
+
+    fn unit_axis(axis: usize) -> Vec<f32> {
+        let mut v = vec![0.0; ironrace_embed::EMBED_DIM];
+        v[axis] = 1.0;
+        v
+    }
+
+    fn zero_vector() -> Vec<f32> {
+        vec![0.0; ironrace_embed::EMBED_DIM]
+    }
+
+    fn store(app: &App, id: &str, embedding: &[f32]) {
+        app.db
+            .insert_drawer(
+                id,
+                &format!("content {id}"),
+                embedding,
+                "w",
+                "r",
+                "",
+                "test",
+            )
+            .unwrap();
+    }
+
+    /// The drawer ids in the index, sorted. Also checks that the index and
+    /// `id_map` agree on the size.
+    fn indexed_ids(app: &App) -> Vec<String> {
+        let state = app.index_state.read().unwrap();
+        assert_eq!(state.index.len(), state.id_map.len());
+        let mut ids = state.id_map.clone();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn rebuild_indexes_only_nonzero_vectors_and_stays_fresh_after_a_search() {
+        let app = App::open_for_test().unwrap();
+        store(&app, "n1", &unit_axis(1));
+        store(&app, "z1", &zero_vector());
+        store(&app, "n2", &unit_axis(2));
+        store(&app, "z2", &zero_vector());
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+        assert_eq!(indexed_ids(&app), ["n1", "n2"]);
+
+        // Freshness is the dirty flag, not a count of rows against index
+        // entries, so an index smaller than the table is not stale: a search
+        // leaves the flag clear and does not rebuild. `n3` is stored without
+        // marking the index dirty, so only a rebuild would put it in.
+        store(&app, "n3", &unit_axis(3));
+        let filters = crate::db::SearchFilters {
+            wing: None,
+            room: None,
+            limit: 10,
+            include_superseded: false,
+        };
+        crate::search::pipeline::search(&app, "content", &filters).unwrap();
+        assert!(!app.dirty.load(Ordering::Acquire));
+        assert_eq!(indexed_ids(&app), ["n1", "n2"]);
+    }
+
+    /// A damaged embedding is a warning naming the drawer; a deliberate zero
+    /// vector is not. Neither is indexed.
+    #[test]
+    fn insert_into_index_warns_for_a_damaged_embedding_but_not_a_zero_one() {
+        use crate::autopilot::worktree::testing::with_captured_log;
+
+        let app = App::open_for_test().unwrap();
+        store(&app, "z1", &zero_vector());
+        let ((), log) = with_captured_log(|| app.insert_into_index("z1", &zero_vector()).unwrap());
+        assert!(!log.contains("WARN"), "{log}");
+
+        let mut nan = unit_axis(4);
+        nan[0] = f32::NAN;
+        store(&app, "nan1", &nan);
+        let ((), log) = with_captured_log(|| app.insert_into_index("nan1", &nan).unwrap());
+        let warnings: Vec<&str> = log.lines().filter(|line| line.contains("WARN")).collect();
+        assert_eq!(warnings.len(), 1, "{log}");
+        assert!(warnings[0].contains("drawer_id=nan1"), "{log}");
+        assert!(indexed_ids(&app).is_empty());
+    }
+
+    #[test]
+    fn insert_into_index_skips_a_zero_vector_and_keeps_positions_in_step() {
+        let app = App::open_for_test().unwrap();
+        store(&app, "n1", &unit_axis(1));
+        app.insert_into_index("n1", &unit_axis(1)).unwrap();
+        store(&app, "z1", &zero_vector());
+
+        // The skipped drawer is still new to the wing/room graph.
+        *app.graph_cache.write().unwrap() = Some(MemoryGraph {
+            wing_rooms: HashMap::new(),
+            room_wings: HashMap::new(),
+        });
+        app.insert_into_index("z1", &zero_vector()).unwrap();
+        assert!(app.graph_cache.read().unwrap().is_none());
+        assert_eq!(indexed_ids(&app), ["n1"]);
+        assert!(!app.dirty.load(Ordering::Acquire));
+
+        // A later insert lands at the position `id_map` gives it.
+        store(&app, "n2", &unit_axis(2));
+        app.insert_into_index("n2", &unit_axis(2)).unwrap();
+        assert_eq!(indexed_ids(&app), ["n1", "n2"]);
+        let state = app.index_state.read().unwrap();
+        let top = state.index.search(&unit_axis(2), 1);
+        assert_eq!(state.id_map[top[0].0], "n2");
+    }
+
+    #[test]
+    fn a_drawer_whose_embedding_turns_zero_or_nonzero_follows_it_in_and_out() {
+        let app = App::open_for_test().unwrap();
+
+        // Zero, then re-stored with a real vector: it enters the index.
+        store(&app, "x", &zero_vector());
+        app.insert_into_index("x", &zero_vector()).unwrap();
+        assert!(indexed_ids(&app).is_empty());
+        store(&app, "x", &unit_axis(3));
+        app.insert_into_index("x", &unit_axis(3)).unwrap();
+        assert_eq!(indexed_ids(&app), ["x"]);
+
+        // Re-stored as a zero vector: the next rebuild drops it.
+        store(&app, "x", &zero_vector());
+        app.insert_into_index("x", &zero_vector()).unwrap();
+        app.ensure_index_fresh().unwrap();
+        assert!(indexed_ids(&app).is_empty());
+    }
+
+    /// A zero-vector drawer is not in the vector index but is in the
+    /// wing/room graph, so deleting it through the `delete_drawer` tool must
+    /// still refresh what it was part of, and leave the indexed drawer be.
+    #[test]
+    fn deleting_a_drawer_that_is_not_in_the_index_rebuilds_cleanly() {
+        let app = App::open_for_test().unwrap();
+        store(&app, "n1", &unit_axis(1));
+        app.db
+            .insert_drawer("z1", "content z1", &zero_vector(), "zw", "zr", "", "test")
+            .unwrap();
+        app.mark_dirty();
+        app.ensure_index_fresh().unwrap();
+        assert_eq!(indexed_ids(&app), ["n1"]);
+        // Caches the graph, which holds z1's wing.
+        let before = crate::search::graph::graph_stats(&app).unwrap();
+        assert_eq!(before.total_wings, 2);
+
+        let out =
+            crate::mcp::tools::call_tool(&app, "delete_drawer", &serde_json::json!({ "id": "z1" }))
+                .unwrap();
+        assert_eq!(out["success"], true, "{out}");
+        assert!(app.db.get_drawer("z1").unwrap().is_none());
+        let after = crate::search::graph::graph_stats(&app).unwrap();
+        assert_eq!(after.total_wings, 1, "the graph still holds z1's wing");
+
+        app.ensure_index_fresh().unwrap();
+        assert_eq!(indexed_ids(&app), ["n1"]);
+        assert!(!app.dirty.load(Ordering::Acquire));
+        let state = app.index_state.read().unwrap();
+        let top = state.index.search(&unit_axis(1), 1);
+        assert_eq!(state.id_map[top[0].0], "n1");
     }
 
     #[test]

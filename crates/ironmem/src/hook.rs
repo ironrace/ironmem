@@ -401,7 +401,7 @@ fn run_hook_with_input(
                 }
             }
         }
-        "precompact" | "stop" => {
+        name if hook_mines_workspace(name) => {
             bootstrap(&app)?;
             if allows_writes {
                 if let Some(root) = workspace_root.as_deref() {
@@ -436,6 +436,12 @@ fn run_hook_with_input(
     }
 
     Ok(response)
+}
+
+/// True for the hooks whose run, with write access, mines the workspace's
+/// changed files. `ironmem doctor` pins its table of plugin hooks to this.
+pub(crate) fn hook_mines_workspace(hook_name: &str) -> bool {
+    matches!(hook_name, "precompact" | "stop")
 }
 
 /// Open `App` for a lifecycle hook. Without write access a hook never mines,
