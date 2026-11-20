@@ -1446,6 +1446,33 @@ class InstallIronmemSelfTest(unittest.TestCase):
             for program in ("/older/ironmem", "/old/ironmem"):
                 self.assertIn(f"            {program}\n", result.stderr)
 
+    def test_a_separator_in_single_quotes_does_not_hide_a_later_program(self) -> None:
+        # The `;` and `|` in single quotes start no command. The run after
+        # them is still read for its program: another install's gets the
+        # WARN, and this install's keeps the WARN away.
+        for quoted in ("echo 'a;b'", "jq -r '.a|.b' /dev/null", "cd '/tmp/a (b)'"):
+            with self.subTest(quoted=quoted, program="another"), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                stop = f'bash -c "{quoted}; /old/ironmem hook stop"'
+                self.settings_with_stop(home, [{"hooks": [{"type": "command", "command": stop}]}])
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                self.assertIn("the program it names by path is not", result.stderr)
+                self.assertIn("            /old/ironmem\n", result.stderr)
+            with self.subTest(quoted=quoted, program="this install"), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                target = home / ".ironrace" / "bin" / "ironmem"
+                groups = [
+                    {"hooks": [{"type": "command", "command": f'bash -c "{quoted}; {target} hook stop"'}]},
+                    {"hooks": [{"type": "command", "command": "/old/ironmem hook stop"}]},
+                ]
+                self.settings_with_stop(home, groups)
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                self.assertNotIn("the program it names by path is not", result.stderr)
+
     def test_an_exec_form_tilde_program_gets_a_warning_even_for_this_install(self) -> None:
         # Doctor reads an exec-form ~/ program as not expanded, so the hook
         # does not run, even when ~/ would expand to this install's program.

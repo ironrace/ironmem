@@ -903,12 +903,19 @@ _wire_claude_hooks_warn() {
 # its default decides. `""` and `''` are both empty there, and so is `\"\"`
 # outside single quotes, which reaches the inner shell as `""`; in single
 # quotes the inner shell keeps those two characters, so that default is not
-# empty. The commands of such a string are judged only this way: the pass
-# with $dq false reads the command with the `;` `&` `|` `(` `)` and line
-# breaks taken out of every string the $dq pass reads (dq_c_strings_unsplit),
-# so it starts no command inside one. re_dq_later takes the nearest command
-# first, so shell_programs gets the first run of such a string from the $dq
-# pass and the runs after it from the other one. Not told apart: a default
+# empty. The commands of such a string are judged only this way: shell_runs
+# gives its pass with $dq false the command with each run of `;` `&` `|` `(`
+# `)` and line breaks in such a string replaced by one U+0001
+# (dq_c_strings_unsplit), which starts no command and joins no two words into
+# one the matcher knows. shell_programs does not: both its passes read the
+# command as written. re_dq_later is tried empty first, so shell_programs gets
+# the first run of such a string from the $dq pass and the runs after it from
+# the other one. Limits: the string is taken to end at a backslash before a
+# line break and at a `"` inside `$( )`, and what follows keeps its
+# separators; a `bash -c "` in a comment, in single quotes or in a
+# here-document is read as the start of a string; and when another
+# double-quoted -c string comes first in the command, shell_programs can miss
+# a string's first run. Not told apart: a default
 # that is empty for another reason (${CLAUDE_PLUGIN_ROOT:-$UNSET} matches), a
 # `''` default in a double-quoted use inside a single-quoted -c string (read
 # as two characters, though the outer shell drops them), and a -c string
@@ -942,7 +949,7 @@ def re_shell:
   + "(?:\\s+(?:[-+][oO]\\s+" + re_word + "|\\+" + re_seg + "*|--" + re_seg + "*|-[^\\sc\"\u0027;&|()<>]*))*";
 def re_bash_c($q): re_shell + "\\s+-(?!-)[^\\s\"\u0027;&|()<>]*c[^\\s\"\u0027;&|()<>]*\\s+" + $q + "\\s*";
 def re_c_strings($q): "(?:" + re_bash_c($q) + re_head + ")*";
-def re_dq_later: "(?:(?:[^\"\\\\]|\\\\.)*?(?:[;&|)\\n]|(?<!\\$)\\()\\s*)??";
+def re_dq_later: "(?:(?:[^\"\\\\]|\\\\.)*(?:[;&|)\\n]|(?<!\\$)\\()\\s*)??";
 def re_lead($dq):
   re_start + re_head
   + (if $dq then
@@ -979,7 +986,7 @@ def shell_runs($name; $dq):
   or test(re_lead($dq) + re_shell + "\\s+" + re_program("ironmem-mcp\\.sh"; $dq) + re_hook($name));
 def dq_c_strings_unsplit:
   gsub("(?<lead>" + re_start + re_head + re_c_strings("[\"\u0027]") + re_bash_c("\"") + ")(?<body>(?:[^\"\\\\]|\\\\.)*)";
-       .lead + ((.body // "") | [scan("[^;&|()\\n]+")] | join(" ")));
+       .lead + ((.body // "") | [scan("[^;&|()\\n]+")] | join("\u0001")));
 def shell_runs($name): (dq_c_strings_unsplit | shell_runs($name; false)) or shell_runs($name; true);
 def env_args:
   if length == 0 then .

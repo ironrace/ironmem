@@ -713,6 +713,46 @@
       "command": "bash -c \"'${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem' hook stop\"",
       "wired": true,
       "note": "the same default in single quotes inside the string: the inner shell keeps the two quote characters, so it is not empty"
+    },
+    {
+      "command": "bash -c \"true & ${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "the escaped-quote default after a & in a double-quoted bash -c string: empty, as after a ;"
+    },
+    {
+      "command": "bash -c \"true | ${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "the same after a |"
+    },
+    {
+      "command": "bash -c \"(${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop)\"",
+      "wired": false,
+      "note": "the same in a ( ) group"
+    },
+    {
+      "command": "bash -c \"case x in x) ${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop;; esac\"",
+      "wired": false,
+      "note": "the same after the ) of a case pattern"
+    },
+    {
+      "command": "bash -c \"true\n${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "the same on the second line of the string"
+    },
+    {
+      "command": "bash -c \"true\"; bash -c \"true; ${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "the same in the second double-quoted bash -c string of the command"
+    },
+    {
+      "command": "bash -c \"echo \\\"x\\\"; ${CLAUDE_PLUGIN_ROOT:-\\\"\\\"}/bin/ironmem hook stop\"",
+      "wired": false,
+      "note": "the same after an escaped quote pair earlier in the string"
+    },
+    {
+      "command": "echo 'a; b' ; bash -c \"/opt/ironmem; hook stop\"",
+      "wired": false,
+      "note": "a ; between the program and hook in a double-quoted bash -c string, after a ; in single quotes: two commands, and neither runs the hook"
     }
   ],
   "env_rows": [
