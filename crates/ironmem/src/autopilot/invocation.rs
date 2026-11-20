@@ -3304,16 +3304,26 @@ exit {code}"#
             // Build a synthetic credential at runtime so secret scanners do
             // not mistake the redaction fixture for a checked-in credential.
             let fixture_token = format!("sk-{}", "abcdefghijklmnopqrstuvwxyz1234567890");
-            let extra=format!("printf '%s' 'OPENAI_API_KEY={fixture_token}' >&2\nhead -c {bytes} /dev/zero > '{target}'\nsleep 10");
+            // The stub outlives the timeout, so only the limit ends the run
+            // early. Both are far longer than a limit kill takes (under a
+            // second on a quiet machine): a loaded CI runner once spent over
+            // four seconds on one, which a five-second timeout could not
+            // tell from a kill that never came.
+            let timeout = Duration::from_secs(60);
+            let extra=format!("printf '%s' 'OPENAI_API_KEY={fixture_token}' >&2\nhead -c {bytes} /dev/zero > '{target}'\nsleep 120");
             let start = std::time::Instant::now();
             let o = run_supervised_bounded(
                 &binary(dir.path(), &script(&extra, 0)),
                 dir.path(),
                 &s,
-                Duration::from_secs(5),
+                timeout,
             )
             .unwrap();
-            assert!(start.elapsed() < Duration::from_secs(4), "{field}");
+            let elapsed = start.elapsed();
+            // A run the timeout ended also reports the limit, from the check
+            // after the root is reaped: this is what says the limit ended it.
+            assert!(!o.timed_out, "{field}: the timeout ended the run");
+            assert!(elapsed < timeout / 2, "{field} took {elapsed:?}");
             assert!(!o.is_met());
             let reason = o.reason.unwrap();
             assert!(reason.contains("limit"), "{reason}");
