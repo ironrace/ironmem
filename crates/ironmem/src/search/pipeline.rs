@@ -36,6 +36,12 @@ pub struct SearchResult {
 }
 
 /// Execute the full hybrid search pipeline.
+///
+/// The legs read SQLite in separate statements, with no read transaction
+/// around them, so a write another process commits mid-search can be seen by
+/// one leg and not another; the final filtered fetch decides which rows are
+/// returned. (A read transaction would have to span the embedder call and the
+/// optional LLM rerank.)
 pub fn search(
     app: &App,
     query: &str,

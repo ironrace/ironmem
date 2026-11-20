@@ -81,11 +81,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plugin's wrapper starts; doctor does not check the plugin's own files)`:
   the wrapper refuses to start when the binary's version differs from the
   plugin's. A newest mined row dated in the future warns about the clock.
-  Problems are warnings and never fail `doctor` (exit 0).
-  `scripts/install-ironmem.sh` now appends the four hooks to
-  `$CLAUDE_HOME/settings.json` (override with `CLAUDE_SETTINGS_JSON`) unless
-  the ironmem plugin is enabled. Hooks already wired, in shell or exec form,
-  and all other hooks and keys are left alone. A shell-form command counts as
+  Problems are warnings and never fail `doctor` (exit 0). Known limit: the
+  `mined_rows` read is unindexed, a full scan of the drawers table once per
+  `doctor` run.
+- **`scripts/install-ironmem.sh` wires the Claude Code hooks (#377).** It now
+  appends the four hooks to `$CLAUDE_HOME/settings.json` (override with
+  `CLAUDE_SETTINGS_JSON`) unless the ironmem plugin is enabled. Hooks
+  already wired, in shell or exec form, and all other hooks and keys are left
+  alone. A shell-form command counts as
   wired when ironmem is in program position, as doctor reads it (so `echo
   ironmem hook stop` and a comment do not, and `hook --harness <v> <name>`
   and a quoted name do); unlike doctor, the installer reads an operator
@@ -333,7 +336,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a scoped search could come back empty while matching drawers existed. The
   vector leg of a scoped search now reads the scope's drawers and ranks them
   by exact cosine similarity to the query instead of filtering the global top
-  vector results.
+  vector results. The search response's `total_candidates` now counts the
+  in-scope vector candidates (at most the overfetch) instead of the global
+  ones. A query embedding with no usable norm (a NaN or infinite value, or a
+  norm that overflows) gets no vector candidates and a warning; an all-zero
+  one, which the noop embedder gives, still scores every in-scope drawer 0
+  (#430 tracks changing that). A scoped search no longer rebuilds the vector
+  index after a write, since it does not read it. Known limit: the cost is
+  linear in the scope on every scoped search (every in-scope row is read and
+  scored; an 18k-drawer room is about 56 MB of reads), though only the best
+  candidates are held in memory. With PRF on, the scope's vectors are held
+  for the search so the expanded query does not read them again.
 - **Drawers stored without a real embedding are no longer in the vector index
   (#377).** Autopilot backlog-lineage and collab session rows are stored with
   an all-zero vector, which matched every query perfectly and pushed real

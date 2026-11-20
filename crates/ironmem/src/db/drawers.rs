@@ -410,6 +410,11 @@ impl Database {
     /// nothing new leaves this value as it was: it dates the last mined write,
     /// not the last run. `ironmem doctor` shows it because MCP writes keep a
     /// store looking alive while the hooks mine nothing (#377).
+    ///
+    /// Unindexed: no index covers `added_by`, so this is a full scan of
+    /// `drawers`. It runs once per `ironmem doctor`, not on a hot path, so it
+    /// is accepted rather than given a migration (about 20 ms on 40,000
+    /// drawers with a warm cache).
     pub fn newest_mined_filed_at(&self) -> Result<Option<String>, MemoryError> {
         let newest: Option<String> = self.conn.query_row(
             "SELECT MAX(filed_at) FROM drawers WHERE added_by = ?1",
