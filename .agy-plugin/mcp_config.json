@@ -1,10 +1,14 @@
 {
   "mcpServers": {
     "ironmem": {
-      "command": "./bin/ironmem-mcp.sh",
+      "command": "bash",
       "args": [
+        "${PLUGIN_ROOT}/bin/ironmem-mcp.sh",
         "serve"
-      ]
+      ],
+      "env": {
+        "IRONMEM_WORKSPACE_ROOT": " "
+      }
     }
   }
 }

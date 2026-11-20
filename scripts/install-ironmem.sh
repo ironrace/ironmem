@@ -11,7 +11,9 @@
 # The script builds release (unless --skip-build), atomically replaces
 # ~/.ironrace/bin/ironmem, installs bundled Codex/Claude skill dependencies
 # and Muse managed-store skills, registers the MCP server for Claude, Codex,
-# Muse and Antigravity (agy), and verifies the resulting binary runs.
+# Muse and -- when `agy` is installed -- Antigravity, along with Antigravity's
+# lifecycle hooks, and verifies the resulting binary runs. (Gemini CLI is a
+# deprecated alias of agy; it has no wiring of its own.)
 
 set -euo pipefail
 
@@ -141,15 +143,21 @@ Options:
   --skip-skills    Do not install bundled Codex/Claude/Muse skill, agent,
                    command, and prompt dependencies.
   --skip-wiring    Do not register the ironmem MCP server in Claude/Codex/Muse/
-                   Antigravity config.
+                   Antigravity config, or the ironmem lifecycle hooks in
+                   ~/.gemini/config/hooks.json.
   --force-skills   Compatibility flag. Bundled skill/agent/command/prompt
                    files update by default (three-way merged for Codex/Claude,
                    overwritten in the Muse managed store); use --skip-skills
                    to leave existing copies untouched.
   --force-wiring   Replace an existing 'ironmem' MCP entry in ~/.claude.json,
                    ~/.codex/config.toml, ~/.config/muse/settings.json, or
-                   ~/.gemini/config/mcp_config.json with the bundled one (use
-                   only when the config has drifted from a fresh install).
+                   ~/.gemini/config/mcp_config.json, and a divergent 'ironmem'
+                   hook group in ~/.gemini/config/hooks.json, with the bundled
+                   one (use only when the config has drifted from a fresh
+                   install).
+
+Antigravity (agy) is wired only when `agy` is on PATH; Gemini CLI is a
+deprecated alias of agy and gets no wiring of its own.
 EOF
 }
 
@@ -585,6 +593,137 @@ install_md_set() {
   install_ext_set "$label" md "$source_root" "$target_root" "$base_root" "$@"
 }
 
+# True when a JSON config is missing or holds nothing but whitespace. agy
+# creates ~/.gemini/config/mcp_config.json as a 0-byte file on first run, and jq
+# reads an empty file as zero documents: every read comes back blank and every
+# write produces nothing, so an empty file must be seeded like a missing one.
+json_config_is_blank() {
+  [[ ! -s "$1" ]] || ! grep -q '[^[:space:]]' "$1"
+}
+
+# Print the file a config path finally names, following every symlink in the
+# chain: `resolve_config_path <path>`. Dotfiles are often symlinked into a
+# repo, and a rewrite must land in that file, not replace the link with a
+# plain copy. A portable loop over `readlink <link>` (one hop, POSIX enough for
+# macOS and Linux alike) rather than `readlink -f`, which macOS's bash-3.2-era
+# userland lacks. Returns 1 on a chain over 40 links (a loop). The result may
+# not exist: a dangling link resolves to the missing name it points at.
+resolve_config_path() {
+  local path="$1" link hops=0
+
+  while [[ -L "$path" ]]; do
+    hops=$((hops + 1))
+    if (( hops > 40 )); then
+      return 1
+    fi
+    link="$(readlink "$path")" || return 1
+    case "$link" in
+      /*) path="$link" ;;
+      *) path="$(dirname "$path")/$link" ;;
+    esac
+  done
+  printf '%s\n' "$path"
+}
+
+# Seed a missing or blank JSON config with `<seed>` and confirm it then holds
+# exactly one JSON object: `prepare_json_config <label> <config> <seed>`.
+# Returns 1 after a WARN when the path is a symlink that leads nowhere (a
+# dangling link or a loop), is not a regular file, or does not hold one
+# parseable JSON object (a trailing comma, JSONC comments, an array, two
+# concatenated documents). The caller then skips that one harness and the path
+# is left exactly as it was -- the install carries on to the rest.
+#
+# A config created here is owner-only (0600): these files hold other MCP
+# servers' `env` blocks, which routinely carry API tokens. It matches the Rust
+# writer (`mcp_setup::write_atomic`). An existing file, even a blank one, keeps
+# its mode.
+prepare_json_config() {
+  local label="$1" config="$2" seed="$3"
+
+  if [[ -L "$config" && ! -e "$config" ]]; then
+    echo "    WARN: $config is a symlink to $(readlink "$config"), which does not exist" >&2
+    echo "          (a dangling link, or a loop); skipping $label and leaving the link alone." >&2
+    return 1
+  fi
+
+  if [[ -e "$config" && ! -f "$config" ]]; then
+    echo "    WARN: $config exists but is not a regular file; skipping $label." >&2
+    return 1
+  fi
+
+  if json_config_is_blank "$config"; then
+    # ~/.claude.json's parent is $HOME and always exists; Muse's
+    # ~/.config/muse/ and agy's ~/.gemini/config/ may not. Through a symlink
+    # the redirect writes the link's target in place.
+    mkdir -p "$(dirname "$config")"
+    (umask 077 && printf '%s\n' "$seed" > "$config")
+  fi
+
+  # Slurped so two concatenated documents read as two, not as a valid file.
+  if ! jq -e -s 'length == 1 and (.[0] | type) == "object"' "$config" >/dev/null; then
+    echo "    WARN: $config is not a single JSON object; skipping $label." >&2
+    echo "          Fix or remove that file, then re-run." >&2
+    return 1
+  fi
+}
+
+# Print one shell word for `$1`: bare when it is made only of characters no
+# shell treats specially, single-quoted otherwise. Antigravity runs a hook's
+# `command` through `sh -c`, so a value spliced into it must be a safe word --
+# jq's `--arg` makes it valid JSON, not a valid shell token.
+shell_word() {
+  if [[ "$1" =~ ^[A-Za-z0-9_./:@%+=-]+$ ]]; then
+    printf '%s' "$1"
+  else
+    local quote_escape="'\\''"
+    printf "'%s'" "${1//\'/$quote_escape}"
+  fi
+}
+
+# Print `$1` escaped for the inside of a JSON string literal (backslash and
+# double quote), for the hand-edit snippets printed when jq is missing.
+json_escape() {
+  local s="${1//\\/\\\\}"
+  printf '%s' "${s//\"/\\\"}"
+}
+
+# Apply a jq filter to a JSON config in place: `rewrite_json_config <config>
+# <jq args...>`. The output replaces the file only when jq succeeded AND wrote
+# a non-empty document. On failure the temp file is removed, the config is left
+# as it was, and the function returns 1 so the caller can stop wiring that one
+# harness -- a config owned by another tool that jq cannot rewrite must not
+# abort the rest of the install under `set -e`.
+#
+# A symlinked config is resolved first and its target is the file replaced, so
+# the link survives. The temp file sits beside that target, not in $TMPDIR or
+# beside the link, so the `mv` is a same-filesystem rename(2): a running
+# harness reading the config sees the old file or the new one, never a
+# half-copied one (a tmpfs /tmp would turn the rename into a non-atomic copy).
+#
+# The rewritten file keeps the original's mode. `cp -p` (POSIX) stamps the
+# target's permission bits onto the temp file before jq truncates and refills
+# it, so a deliberately shared 0644 file is not narrowed to mktemp's 0600 and a
+# 0600 one is never widened.
+rewrite_json_config() {
+  local config="$1" target tmp
+  shift
+
+  if ! target="$(resolve_config_path "$config")" || [[ ! -f "$target" ]]; then
+    echo "    WARN: could not resolve $config to a regular file; it was left unchanged." >&2
+    return 1
+  fi
+
+  tmp="$(mktemp "$(dirname "$target")/.$(basename "$target").ironmem.XXXXXX")"
+  if cp -p "$target" "$tmp" && jq "$@" "$target" > "$tmp" && [[ -s "$tmp" ]]; then
+    mv -f "$tmp" "$target"
+  else
+    rm -f "$tmp"
+    echo "    WARN: could not update $config; it was left unchanged." >&2
+    echo "          Check that it holds valid JSON in the expected shape, then re-run." >&2
+    return 1
+  fi
+}
+
 # Register the ironmem MCP server in a harness config that keys its servers by
 # id in a top-level `mcpServers` object -- Claude Code, Muse Code, and
 # Antigravity (agy) all do, so one writer serves all three. This mirrors the
@@ -612,25 +751,21 @@ install_md_set() {
 # `args: ["serve"]` upgraded in place by an older `ironmem muse` -- would
 # otherwise keep exactly the hazard `optional` exists to prevent. A `mode` the
 # user set deliberately is left alone; only a missing key is filled.
+# shellcheck disable=SC2016 # the $names in these jq filters are jq variables
 register_json_mcpservers() {
   local label="$1" config="$2" seed="$3" extras="$4"
-  local existing_cmd tmp missing repaired=0
+  local existing_cmd missing repaired=0
 
-  if [[ ! -f "$config" ]]; then
-    # ~/.claude.json's parent is $HOME and always exists; Muse's
-    # ~/.config/muse/ may not, on a machine where Muse has never run.
-    mkdir -p "$(dirname "$config")"
-    printf '%s\n' "$seed" > "$config"
-  fi
+  prepare_json_config "$label MCP registration" "$config" "$seed" || return 0
 
   existing_cmd="$(jq -r '.mcpServers.ironmem.command // empty' "$config" 2>/dev/null || echo "")"
 
   if [[ -z "$existing_cmd" ]]; then
     echo "==> Registering 'ironmem' MCP server in $config"
-    tmp="$(mktemp)"
-    jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" --argjson extras "$extras" \
+    rewrite_json_config "$config" \
+      --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" --argjson extras "$extras" \
       '.mcpServers = ((.mcpServers // {}) + {ironmem: ($extras + {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}})})' \
-      "$config" > "$tmp" && mv -f "$tmp" "$config"
+      || return 0
   elif [[ "$existing_cmd" == "$TARGET" ]]; then
     # Mirror `mcp_setup::is_bare_serve_json`: an entry still carrying the
     # pre-daemon `args: ["serve"]` is upgraded in place to the shared-daemon
@@ -640,19 +775,18 @@ register_json_mcpservers() {
     # launcher this script exists to make unnecessary.
     if jq -e '.mcpServers.ironmem.args == ["serve"]' "$config" >/dev/null 2>&1; then
       echo "==> Upgrading the $label MCP registration to the shared-daemon proxy command"
-      tmp="$(mktemp)"
-      jq --arg sock "$DAEMON_SOCKET_PATH" \
+      rewrite_json_config "$config" --arg sock "$DAEMON_SOCKET_PATH" \
         '.mcpServers.ironmem.args = ["serve", "--connect", $sock]' \
-        "$config" > "$tmp" && mv -f "$tmp" "$config"
+        || return 0
       repaired=1
     fi
 
     if jq -e '.mcpServers.ironmem.env.IRONMEM_MCP_MODE == null' \
       "$config" >/dev/null 2>&1; then
       echo "==> Adding trusted mode to the existing $label MCP registration"
-      tmp="$(mktemp)"
-      jq '.mcpServers.ironmem.env = ((.mcpServers.ironmem.env // {}) + {IRONMEM_MCP_MODE: "trusted"})' \
-        "$config" > "$tmp" && mv -f "$tmp" "$config"
+      rewrite_json_config "$config" \
+        '.mcpServers.ironmem.env = ((.mcpServers.ironmem.env // {}) + {IRONMEM_MCP_MODE: "trusted"})' \
+        || return 0
       repaired=1
     fi
 
@@ -663,10 +797,9 @@ register_json_mcpservers() {
       "$config" 2>/dev/null || echo "")"
     if [[ -n "$missing" ]]; then
       echo "==> Adding $missing to the existing $label MCP registration"
-      tmp="$(mktemp)"
-      jq --argjson extras "$extras" \
+      rewrite_json_config "$config" --argjson extras "$extras" \
         '.mcpServers.ironmem = ($extras + .mcpServers.ironmem)' \
-        "$config" > "$tmp" && mv -f "$tmp" "$config"
+        || return 0
       repaired=1
     fi
 
@@ -675,52 +808,224 @@ register_json_mcpservers() {
     fi
   elif [[ "$FORCE_WIRING" -eq 1 ]]; then
     echo "==> Replacing divergent 'ironmem' MCP entry (was: $existing_cmd)"
-    tmp="$(mktemp)"
-    jq --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" --argjson extras "$extras" \
+    rewrite_json_config "$config" \
+      --arg cmd "$TARGET" --arg sock "$DAEMON_SOCKET_PATH" --argjson extras "$extras" \
       '.mcpServers.ironmem = ($extras + {command: $cmd, args: ["serve", "--connect", $sock], env: {IRONMEM_MCP_MODE: "trusted"}})' \
-      "$config" > "$tmp" && mv -f "$tmp" "$config"
+      || return 0
   else
     echo "    WARN: 'ironmem' MCP entry already exists with command=$existing_cmd" >&2
     echo "          Expected: $TARGET. Re-run with --force-wiring to replace." >&2
   fi
 }
 
-# Register the ironmem lifecycle hooks (`SessionStart`, `PreInvocation`, `Stop`)
-# in Antigravity's global hooks file (`~/.gemini/config/hooks.json`). Top-level
-# keys in Antigravity `hooks.json` are named hook groups, so we manage only the
-# `ironmem` key and leave every other user hook group untouched.
-register_agy_hooks() {
-  local config="$1"
-  local existing_cmd tmp expected_start expected_pre expected_stop
+# Seconds Antigravity lets SessionStart and Stop run before killing them. agy's
+# default is 30 (its embedded hooks.json docs: `timeout`, int seconds, optional,
+# defaults to 30), and agy waits on a hook before continuing. Session-start can
+# bootstrap and mine the whole workspace on first run and Stop mines it again,
+# both synchronously, so 30 s cuts a large repo's first bootstrap off part-way.
+# PreInvocation keeps agy's default: the prompt hook enforces its own
+# millisecond budget and must never hold up a model call for long.
+AGY_SESSION_START_TIMEOUT=120
+AGY_STOP_TIMEOUT=120
 
-  expected_start="IRONMEM_MCP_MODE=trusted \"$TARGET\" hook session-start --harness agy"
-  expected_pre="IRONMEM_MCP_MODE=trusted \"$TARGET\" hook user-prompt-submit --harness agy"
-  expected_stop="IRONMEM_MCP_MODE=trusted \"$TARGET\" hook stop --harness agy"
+# The `IRONMEM_MCP_MODE=...` prefix for the Antigravity hook commands, read from
+# the agy MCP config: `agy_hook_mode_prefix <mcp_config.json>`. The hooks run the
+# same store as the MCP server, so they take the mode the user chose for it:
+#   1. the ironmem entry's own `env.IRONMEM_MCP_MODE`, when it sets one -- a
+#      `restricted` or `read-only` entry must not get trusted-mode hooks that
+#      inject recalled drawer content and mine on every Stop;
+#   2. otherwise the mode in agy's environment when the hook runs, else trusted.
+#      agy runs a hook through `sh -c`, so `${IRONMEM_MCP_MODE:-trusted}` is
+#      expanded then, in the process that inherited the user's environment.
+agy_hook_mode_prefix() {
+  local mcp_config="$1" mode=""
+
+  if [[ -f "$mcp_config" ]]; then
+    mode="$(jq -r -s 'if length == 1 and (.[0] | type) == "object"
+      then .[0].mcpServers.ironmem.env.IRONMEM_MCP_MODE? // empty | strings
+      else empty end' "$mcp_config" 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$mode" ]]; then
+    printf 'IRONMEM_MCP_MODE=%s' "$(shell_word "$mode")"
+  else
+    # shellcheck disable=SC2016 # expanded by agy's `sh -c`, not here
+    printf '%s' 'IRONMEM_MCP_MODE="${IRONMEM_MCP_MODE:-trusted}"'
+  fi
+}
+
+# The `ironmem` hook group this installer writes, as compact JSON:
+# `agy_hooks_group <mode prefix>`.
+agy_hooks_group() {
+  local mode_prefix="$1" target_word
+  target_word="$(shell_word "$TARGET")"
+  jq -n -c \
+    --arg start "$mode_prefix $target_word hook session-start --harness agy" \
+    --arg pre "$mode_prefix $target_word hook user-prompt-submit --harness agy" \
+    --arg stop "$mode_prefix $target_word hook stop --harness agy" \
+    --argjson start_timeout "$AGY_SESSION_START_TIMEOUT" \
+    --argjson stop_timeout "$AGY_STOP_TIMEOUT" \
+    '{SessionStart: [{type: "command", command: $start, timeout: $start_timeout}],
+      PreInvocation: [{type: "command", command: $pre}],
+      Stop: [{type: "command", command: $stop, timeout: $stop_timeout}]}'
+}
+
+# Register the ironmem lifecycle hooks (`SessionStart`, `PreInvocation`, `Stop`)
+# in Antigravity's global hooks file (`~/.gemini/config/hooks.json`):
+# `register_agy_hooks <hooks.json> <mode prefix>`. This installer is the one
+# source of agy hooks -- the .agy-plugin ships MCP only -- so a user never gets
+# the group twice. Top-level keys in Antigravity `hooks.json` are named hook
+# groups, so we manage only the `ironmem` key and leave every other group
+# untouched.
+#
+# The existing group is classified across all three events, not SessionStart
+# alone. An event is ours when any of its handlers runs the expected command.
+#   absent     no `ironmem` key: register the whole group.
+#   ok         every event is ours: nothing to do.
+#   repair     some events are absent, or one of ours lacks the `timeout` this
+#              version sets: fill exactly those gaps and keep everything else
+#              (`enabled`, other events, extra handlers, a timeout the user set).
+#   divergent  an event runs a different command or is not a handler list, or
+#              the group holds other events but none of ours (someone else's
+#              group that happens to be named `ironmem`): warn, and replace
+#              our three events only under --force-wiring. Even then the
+#              group's other keys -- agy's `"enabled": false` disable switch,
+#              other events -- are kept.
+# shellcheck disable=SC2016 # the $names in these jq filters are jq variables
+register_agy_hooks() {
+  local config="$1" mode_prefix="$2"
+  local want state
+
+  prepare_json_config "Antigravity hook registration" "$config" '{}' || return 0
+  want="$(agy_hooks_group "$mode_prefix")"
+
+  if ! state="$(jq -r --argjson want "$want" '
+    def handler_label: if type == "object" and has("command") then .command | tostring else tojson end;
+    if has("ironmem") | not then "absent"
+    elif (.ironmem | type) != "object" then
+      "divergent a \(.ironmem | type) value instead of a hook group"
+    else
+      .ironmem as $group
+      | [ $want | to_entries[] | .key as $k | .value[0] as $h | $group[$k] as $v
+          | if $v == null then {k: $k, s: "missing"}
+            elif ($v | type) != "array" or ($v | length) == 0 then
+              {k: $k, s: "divergent", got: "\($k)=\($v | tojson)"}
+            elif any($v[]; type == "object" and .command == $h.command) | not then
+              {k: $k, s: "divergent", got: "\($k) command=\($v[0] | handler_label)"}
+            elif ($h | has("timeout"))
+                 and (any($v[]; type == "object" and .command == $h.command and has("timeout")) | not) then
+              {k: $k, s: "timeout"}
+            else {k: $k, s: "ok"}
+            end ]
+      | if any(.[]; .s == "divergent") then
+          "divergent \(first(.[] | select(.s == "divergent")) | .got)"
+        elif all(.[]; .s == "missing") and ($group | del(.enabled) | length) > 0 then
+          "divergent none of its lifecycle events (it holds: \($group | keys_unsorted | join(", ")))"
+        elif any(.[]; .s != "ok") then
+          "repair \([.[] | select(.s == "missing") | "\(.k) hook"] + [.[] | select(.s == "timeout") | "\(.k) timeout"] | join(", "))"
+        else "ok"
+        end
+    end' "$config")"; then
+    echo "    WARN: could not read the 'ironmem' hook group in $config; skipping Antigravity hook registration." >&2
+    return 0
+  fi
+
+  case "$state" in
+    absent)
+      echo "==> Registering 'ironmem' lifecycle hooks in $config"
+      rewrite_json_config "$config" --argjson want "$want" '. + {ironmem: $want}' \
+        || return 0
+      ;;
+    ok)
+      echo "    'ironmem' lifecycle hooks already registered for Antigravity"
+      ;;
+    repair\ *)
+      echo "==> Adding the missing ${state#repair } to the existing 'ironmem' Antigravity hook group in $config"
+      rewrite_json_config "$config" --argjson want "$want" '
+        .ironmem = reduce ($want | to_entries[]) as $e (.ironmem;
+          if .[$e.key] == null then .[$e.key] = $e.value
+          else .[$e.key] |= map(
+            if type == "object" and .command == $e.value[0].command
+               and (has("timeout") | not) and ($e.value[0] | has("timeout"))
+            then . + {timeout: $e.value[0].timeout}
+            else . end)
+          end)' \
+        || return 0
+      ;;
+    *)
+      if [[ "$FORCE_WIRING" -eq 1 ]]; then
+        echo "==> Replacing divergent 'ironmem' Antigravity hooks entry (was: ${state#divergent })"
+        rewrite_json_config "$config" --argjson want "$want" '
+          .ironmem = (if (.ironmem | type) == "object" then .ironmem else {} end) + $want' \
+          || return 0
+      else
+        echo "    WARN: 'ironmem' Antigravity hooks entry in $config already exists with ${state#divergent }" >&2
+        echo "          Expected SessionStart: $(jq -r '.SessionStart[0].command' <<< "$want")" >&2
+        echo "          Re-run with --force-wiring to replace its SessionStart, PreInvocation and Stop" >&2
+        echo "          (its other keys, such as \"enabled\", are kept)." >&2
+        return 0
+      fi
+      ;;
+  esac
+
+  if jq -e '.ironmem.enabled? == false' "$config" >/dev/null 2>&1; then
+    echo "    NOTE: the 'ironmem' Antigravity hook group in $config is disabled (\"enabled\": false); left disabled."
+  fi
+}
+
+# Register the ironmem MCP server in Codex's `config.toml`:
+# `register_codex_toml <config.toml>`. TOML editing without a TOML parser is
+# fragile, so we only ever append a missing block -- we never rewrite an
+# existing one. --force-wiring is a no-op here and prints a manual-edit hint
+# instead.
+#
+# Appending writes through a symlink into the file it names, so a symlinked
+# config.toml keeps its link. A link that leads nowhere -- dangling, or a loop
+# `resolve_config_path` gives up on -- is warned about and Codex wiring is
+# skipped: appending would create the missing target (or fail on the loop and
+# abort the install), and a file conjured at a dotfiles path the user may have
+# moved is not ours to make.
+register_codex_toml() {
+  local config="$1" resolved
+
+  if [[ -L "$config" ]]; then
+    if ! resolved="$(resolve_config_path "$config")" || [[ ! -e "$resolved" ]]; then
+      echo "    WARN: $config is a symlink to $(readlink "$config"), which does not exist" >&2
+      echo "          (a dangling link, or a loop); skipping Codex MCP registration and leaving the link alone." >&2
+      return 0
+    fi
+  fi
+
+  if [[ -e "$config" && ! -f "$config" ]]; then
+    echo "    WARN: $config exists but is not a regular file; skipping Codex MCP registration." >&2
+    return 0
+  fi
 
   if [[ ! -f "$config" ]]; then
     mkdir -p "$(dirname "$config")"
-    printf '{}\n' > "$config"
+    # Owner-only, like every MCP config this script creates: it will hold
+    # other servers' env tokens too.
+    (umask 077 && : > "$config")
   fi
 
-  existing_cmd="$(jq -r '.ironmem.SessionStart[0].command // empty' "$config" 2>/dev/null || echo "")"
-
-  if [[ -z "$existing_cmd" ]]; then
-    echo "==> Registering 'ironmem' lifecycle hooks in $config"
-    tmp="$(mktemp)"
-    jq --arg start "$expected_start" --arg pre "$expected_pre" --arg stop "$expected_stop" \
-      '. + {ironmem: {SessionStart: [{type: "command", command: $start}], PreInvocation: [{type: "command", command: $pre}], Stop: [{type: "command", command: $stop}]}}' \
-      "$config" > "$tmp" && mv -f "$tmp" "$config"
-  elif [[ "$existing_cmd" == "$expected_start" ]]; then
-    echo "    'ironmem' lifecycle hooks already registered for Antigravity"
-  elif [[ "$FORCE_WIRING" -eq 1 ]]; then
-    echo "==> Replacing divergent 'ironmem' Antigravity hooks entry"
-    tmp="$(mktemp)"
-    jq --arg start "$expected_start" --arg pre "$expected_pre" --arg stop "$expected_stop" \
-      '.ironmem = {SessionStart: [{type: "command", command: $start}], PreInvocation: [{type: "command", command: $pre}], Stop: [{type: "command", command: $stop}]}' \
-      "$config" > "$tmp" && mv -f "$tmp" "$config"
+  if grep -q '^\[mcp_servers\.ironmem\]' "$config"; then
+    if [[ "$FORCE_WIRING" -eq 1 ]]; then
+      echo "    WARN: --force-wiring cannot safely rewrite TOML in place." >&2
+      echo "          Edit $config by hand to point command = \"$TARGET\"." >&2
+    else
+      echo "    'ironmem' MCP server already registered for Codex"
+    fi
   else
-    echo "    WARN: 'ironmem' Antigravity hooks entry already exists with SessionStart command=$existing_cmd" >&2
-    echo "          Expected: $expected_start. Re-run with --force-wiring to replace." >&2
+    echo "==> Appending [mcp_servers.ironmem] to $config"
+    {
+      echo ""
+      echo "[mcp_servers.ironmem]"
+      echo "command = \"$TARGET\""
+      echo "args = [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"]"
+      echo ""
+      echo "[mcp_servers.ironmem.env]"
+      echo "IRONMEM_MCP_MODE = \"trusted\""
+    } >> "$config"
   fi
 }
 
@@ -752,6 +1057,10 @@ echo "    $VERSION_OUTPUT"
 
 CODEX_HOME="${CODEX_HOME:-$HOME/.codex}"
 CLAUDE_HOME="${CLAUDE_HOME:-$HOME/.claude}"
+# Set out here, not in the wiring block, because the legacy-registration check
+# at the end reads the same files and runs even under --skip-wiring.
+CLAUDE_CONFIG_JSON="${CLAUDE_CONFIG_JSON:-$HOME/.claude.json}"
+CODEX_CONFIG_TOML="${CODEX_CONFIG_TOML:-$CODEX_HOME/config.toml}"
 
 if [[ "$SKIP_SKILLS" -eq 0 ]]; then
   if [[ "$FORCE_SKILLS" -eq 1 ]]; then
@@ -816,8 +1125,6 @@ fi
 # MCP server registration. Split from skills because a sysadmin may want to
 # install the files but wire MCP themselves.
 if [[ "$SKIP_WIRING" -eq 0 ]]; then
-  CLAUDE_CONFIG_JSON="${CLAUDE_CONFIG_JSON:-$HOME/.claude.json}"
-  CODEX_CONFIG_TOML="${CODEX_CONFIG_TOML:-$CODEX_HOME/config.toml}"
 
   # Muse reads $XDG_CONFIG_HOME/muse/settings.json when that variable is set
   # and non-empty, and ~/.config/muse/settings.json otherwise -- never both, so
@@ -833,51 +1140,55 @@ if [[ "$SKIP_WIRING" -eq 0 ]]; then
   AGY_CONFIG_JSON="${AGY_CONFIG_JSON:-$HOME/.gemini/config/mcp_config.json}"
   AGY_HOOKS_JSON="${AGY_HOOKS_JSON:-$HOME/.gemini/config/hooks.json}"
 
+  # Antigravity is wired only where it is installed: both of its files are
+  # global, and the hooks run on every agy session in every directory, so a
+  # machine without agy must not get a pre-armed ~/.gemini/config. AGY_BIN
+  # names the binary to look for (default `agy` on PATH); it is only looked up,
+  # never run.
+  AGY_BIN_NAME="${AGY_BIN:-agy}"
+  if command -v "$AGY_BIN_NAME" >/dev/null 2>&1; then
+    AGY_FOUND=1
+  else
+    AGY_FOUND=0
+    echo "==> Antigravity ($AGY_BIN_NAME) not found on PATH; skipping Antigravity MCP and hook registration."
+    echo "    Install agy, then re-run this script to wire $AGY_CONFIG_JSON and $AGY_HOOKS_JSON."
+  fi
+
   # ---- Claude Code, Muse Code, and Antigravity: object-shaped mcpServers ----
   if ! command -v jq >/dev/null 2>&1; then
-    echo "==> WARN: jq not installed; skipping Claude, Muse, and Antigravity MCP/hook registration checks." >&2
-    echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON and $AGY_CONFIG_JSON:" >&2
+    if [[ "$AGY_FOUND" -eq 1 ]]; then
+      echo "==> WARN: jq not installed; skipping Claude, Muse, and Antigravity MCP/hook registration checks." >&2
+      echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON and $AGY_CONFIG_JSON:" >&2
+    else
+      echo "==> WARN: jq not installed; skipping Claude and Muse MCP registration checks." >&2
+      echo "          Install jq, or add this manually to $CLAUDE_CONFIG_JSON:" >&2
+    fi
     echo "          { \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" } } } }" >&2
     echo "          ...and the same to $MUSE_CONFIG_JSON, with \"mode\": \"optional\" added to" >&2
     echo "          the ironmem entry so a stale command cannot abort a Muse session, and" >&2
     echo "          \"schema_version\": 1 alongside \"mcpServers\" if you are creating that file:" >&2
     echo "          { \"schema_version\": 1, \"mcpServers\": { \"ironmem\": { \"command\": \"$TARGET\", \"args\": [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"], \"env\": { \"IRONMEM_MCP_MODE\": \"trusted\" }, \"mode\": \"optional\" } } }" >&2
+    if [[ "$AGY_FOUND" -eq 1 ]]; then
+      agy_target_json="$(json_escape "$(shell_word "$TARGET")")"
+      echo "          ...and add this \"ironmem\" hook group to $AGY_HOOKS_JSON, alongside its" >&2
+      echo "          other top-level keys (use the IRONMEM_MCP_MODE you gave the ironmem entry" >&2
+      echo "          in $AGY_CONFIG_JSON, if not trusted):" >&2
+      echo "          { \"ironmem\": { \"SessionStart\": [ { \"type\": \"command\", \"command\": \"IRONMEM_MCP_MODE=trusted $agy_target_json hook session-start --harness agy\", \"timeout\": $AGY_SESSION_START_TIMEOUT } ], \"PreInvocation\": [ { \"type\": \"command\", \"command\": \"IRONMEM_MCP_MODE=trusted $agy_target_json hook user-prompt-submit --harness agy\" } ], \"Stop\": [ { \"type\": \"command\", \"command\": \"IRONMEM_MCP_MODE=trusted $agy_target_json hook stop --harness agy\", \"timeout\": $AGY_STOP_TIMEOUT } ] } }" >&2
+    fi
   else
     register_json_mcpservers "Claude" "$CLAUDE_CONFIG_JSON" '{}' '{}'
     register_json_mcpservers "Muse" "$MUSE_CONFIG_JSON" \
       '{"schema_version": 1}' '{"mode": "optional"}'
-    register_json_mcpservers "Antigravity" "$AGY_CONFIG_JSON" '{}' '{}'
-    register_agy_hooks "$AGY_HOOKS_JSON"
+    if [[ "$AGY_FOUND" -eq 1 ]]; then
+      register_json_mcpservers "Antigravity" "$AGY_CONFIG_JSON" '{}' '{}'
+      # Read after the MCP registration, so the hooks get the mode the agy
+      # MCP server will actually run with.
+      register_agy_hooks "$AGY_HOOKS_JSON" "$(agy_hook_mode_prefix "$AGY_CONFIG_JSON")"
+    fi
   fi
 
   # ---- Codex: ~/.codex/config.toml [mcp_servers.ironmem] --------------------
-  # TOML editing without a TOML parser is fragile, so we only ever append a
-  # missing block — we never rewrite an existing one. --force-wiring is a
-  # no-op here and prints a manual-edit hint instead.
-  if [[ ! -f "$CODEX_CONFIG_TOML" ]]; then
-    mkdir -p "$(dirname "$CODEX_CONFIG_TOML")"
-    : > "$CODEX_CONFIG_TOML"
-  fi
-
-  if grep -q '^\[mcp_servers\.ironmem\]' "$CODEX_CONFIG_TOML"; then
-    if [[ "$FORCE_WIRING" -eq 1 ]]; then
-      echo "    WARN: --force-wiring cannot safely rewrite TOML in place." >&2
-      echo "          Edit $CODEX_CONFIG_TOML by hand to point command = \"$TARGET\"." >&2
-    else
-      echo "    'ironmem' MCP server already registered for Codex"
-    fi
-  else
-    echo "==> Appending [mcp_servers.ironmem] to $CODEX_CONFIG_TOML"
-    {
-      echo ""
-      echo "[mcp_servers.ironmem]"
-      echo "command = \"$TARGET\""
-      echo "args = [\"serve\", \"--connect\", \"$DAEMON_SOCKET_PATH\"]"
-      echo ""
-      echo "[mcp_servers.ironmem.env]"
-      echo "IRONMEM_MCP_MODE = \"trusted\""
-    } >> "$CODEX_CONFIG_TOML"
-  fi
+  register_codex_toml "$CODEX_CONFIG_TOML"
 
 else
   echo "==> Skipping MCP wiring"
@@ -987,8 +1298,14 @@ fi
 # (ironrace-memory → ironmem). We do NOT edit these files — a legacy entry
 # may point at a forked or staging binary deliberately. Warn only, with the
 # exact command to remove it.
-CLAUDE_CONFIG="$HOME/.claude.json"
-CODEX_CONFIG="$HOME/.codex/config.toml"
+#
+# Both read the files the wiring above wrote, honoring CLAUDE_CONFIG_JSON and
+# CODEX_CONFIG_TOML/CODEX_HOME. Checking a hard-coded ~/.claude.json or
+# ~/.codex/config.toml would miss a legacy entry in an overridden config, and
+# could report one from a file this run never used. (Muse and Antigravity have
+# no pre-rename registrations to look for.)
+CLAUDE_CONFIG="$CLAUDE_CONFIG_JSON"
+CODEX_CONFIG="$CODEX_CONFIG_TOML"
 LEGACY_FOUND=0
 
 if [[ -f "$CLAUDE_CONFIG" ]] && command -v jq >/dev/null 2>&1; then

@@ -938,12 +938,25 @@ mod tests {
     #[test]
     fn env_metrics_harness_delegate_unknown_returns_none() {
         // An unregistered value produces None, so `mcp_harness` also falls
-        // back to its default for unknown IRONMEM_HARNESS values. "gemini" is
-        // now a REAL registered harness (#190 Task 11); use a placeholder id
-        // that is genuinely absent from REGISTRY instead.
+        // back to its default for unknown IRONMEM_HARNESS values. "gemini"
+        // cannot play this role (it is a deprecated alias of agy), so use a
+        // placeholder id that is genuinely absent from REGISTRY.
         let result =
             crate::harness::canonicalize_input("not-a-real-harness", crate::harness::REGISTRY);
         assert!(result.is_none());
+    }
+
+    /// Gemini CLI is deprecated in favour of Antigravity, so its clientInfo
+    /// name attributes MCP traffic to agy, as does agy's own client name. A
+    /// name that merely contains the letters "agy" is not agy.
+    #[test]
+    fn client_info_names_for_gemini_and_antigravity_classify_as_agy() {
+        let harness = |name: &str| {
+            harness_from_client_info(&serde_json::json!({ "clientInfo": { "name": name } }))
+        };
+        assert_eq!(harness("gemini-cli").as_deref(), Some("agy"));
+        assert_eq!(harness("antigravity-client").as_deref(), Some("agy"));
+        assert_eq!(harness("legacy-tool"), None);
     }
 
     // ---- third-harness classification via injected registry -----------------
@@ -962,6 +975,11 @@ mod tests {
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: crate::harness::HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     };
 
     #[test]

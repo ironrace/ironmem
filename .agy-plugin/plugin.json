@@ -1,7 +1,7 @@
 {
   "name": "ironmem",
   "version": "0.7.0",
-  "description": "Rust MCP memory backend for Antigravity (agy) with semantic search, knowledge graph, automatic migrate-or-init bootstrap, and incremental workspace mining.",
+  "description": "Rust MCP memory backend for Antigravity (agy) with semantic search, knowledge graph and automatic migrate-or-init bootstrap. The plugin ships the MCP server only; scripts/install-ironmem.sh wires the lifecycle hooks (session context, prompt recall, incremental workspace mining).",
   "author": {
     "name": "Jeffrey Crum"
   },

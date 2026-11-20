@@ -129,10 +129,12 @@ The hooks are diff-aware:
   --workspace` reads `plugin.json`/`hooks.json`/`.mcp.json` and asserts
   `plugin.json`'s version matches `Cargo.toml` (`plugin_metadata.rs`),
   parses `hooks/hooks.json`'s `UserPromptSubmit` command (`hook.rs`),
-  requires the plugin's `bin/ironmem-mcp.sh` and `hooks/ironmem-hook.sh` to
-  exist (`packaging.rs`'s `REQUIRED_ASSETS` is a fixed literal list --
-  `bin/ironmem-mcp.sh`, `hooks/ironmem-hook.sh`, `plugin.json` -- identical
-  for every harness, never `<id>`-templated), and parses review-agent Markdown
+  requires the plugin's `bin/ironmem-mcp.sh` and `plugin.json` to exist
+  (`packaging.rs`'s `REQUIRED_ASSETS` is a fixed literal list, identical for
+  every harness, never `<id>`-templated), requires `hooks/ironmem-hook.sh`
+  when the registry's `plugin_ships_hooks` is `true` and forbids `hooks/` and
+  `hooks.json` when it is `false` (Antigravity, whose hooks the installer
+  writes), and parses review-agent Markdown
   frontmatter (`plugin_metadata.rs`'s lean-profile guard) -- so these paths
   escalate to running every gate declared for the phase, the same as any
   other gate-covered change
@@ -249,8 +251,9 @@ directories' JSON, shell assets, and agent Markdown is read by `cargo test
 --workspace` (`plugin_metadata.rs`'s `read_json`/
 `plugin_versions_match_cargo_toml`/`claude_review_agents_advertise_lean_
 profile`, `hook.rs`'s `hooks.json` parse, `packaging.rs`'s `REQUIRED_ASSETS`
-existence check for the literal `bin/ironmem-mcp.sh`,
-`hooks/ironmem-hook.sh`, and `plugin.json`), so a path inside one is
+existence check for the literal `bin/ironmem-mcp.sh` and `plugin.json`, plus
+`hooks/ironmem-hook.sh` when `plugin_ships_hooks` is `true` and the absence
+of `hooks/` and `hooks.json` when it is `false`), so a path inside one is
 gate-covered, not inert, and must classify
 `UNKNOWN` (escalate) instead. A look-alike segment like
 `.claude-plugin-backup` does not match — the check is a whole-segment

@@ -205,7 +205,7 @@ mod tests {
             assert_eq!(name, implementer.label().to_ascii_lowercase());
         }
         let names: Vec<&str> = ALL.iter().map(|i| i.cli_name()).collect();
-        let err = Implementer::from_str("gemini").unwrap_err().to_string();
+        let err = Implementer::from_str("zeta").unwrap_err().to_string();
         for name in names {
             assert!(err.contains(&format!("'{name}'")), "{err}");
         }
@@ -262,7 +262,7 @@ mod tests {
 
     #[test]
     fn unknown_implementer_names_every_valid_value() {
-        let err = Implementer::from_str("gemini").unwrap_err().to_string();
+        let err = Implementer::from_str("zeta").unwrap_err().to_string();
         assert!(
             err.contains("expected 'claude', 'codex' or 'muse'"),
             "got: {err}"

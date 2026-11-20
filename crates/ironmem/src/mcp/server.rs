@@ -85,6 +85,19 @@ fn mcp_harness(ctx: &ConnectionContext) -> String {
             if let Some(id) = crate::harness::canonicalize_input(&value, crate::harness::REGISTRY) {
                 return id.to_string();
             }
+            // Unrecognized: say so once instead of silently attributing the
+            // session to the client-info harness (or claude).
+            crate::harness::warn_once(
+                format!("unknown-env-harness:{value}"),
+                format!(
+                    "ironmem: warning: unknown IRONMEM_HARNESS {value:?}; ignoring it (known: {})",
+                    crate::harness::REGISTRY
+                        .iter()
+                        .map(|spec| spec.id)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            );
         }
     }
     ctx.harness.clone().unwrap_or_else(|| "claude".to_string())
@@ -2698,6 +2711,25 @@ mod tests {
             "connection 2 attributed to the codex harness, not clobbered by \
              connection 1's already-learned harness"
         );
+    }
+
+    /// `IRONMEM_HARNESS=gemini` (a deprecated alias) attributes to agy; an
+    /// unrecognized value is ignored (with a stderr warning) in favour of the
+    /// connection's own clientInfo harness instead of being trusted.
+    #[test]
+    fn env_harness_maps_the_deprecated_alias_and_ignores_unknown_values() {
+        let _g = METRICS_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = |harness: Option<&str>| ConnectionContext {
+            session_id: None,
+            harness: harness.map(str::to_string),
+            honor_env: true,
+        };
+        std::env::set_var("IRONMEM_HARNESS", "gemini");
+        assert_eq!(mcp_harness(&ctx(Some("codex"))), "agy");
+        std::env::set_var("IRONMEM_HARNESS", "not-a-real-harness");
+        assert_eq!(mcp_harness(&ctx(Some("codex"))), "codex");
+        assert_eq!(mcp_harness(&ctx(None)), "claude");
+        std::env::remove_var("IRONMEM_HARNESS");
     }
 
     /// H4 acceptance: with `IRONMEM_HARNESS=codex` set in the process env, a

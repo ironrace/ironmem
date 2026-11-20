@@ -838,6 +838,11 @@ mod tests {
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: crate::harness::HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     };
 
     fn three_entry_registry() -> [HarnessSpec; 3] {
@@ -927,6 +932,11 @@ mod tests {
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: crate::harness::HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         const AGENTS_NATIVE_2: HarnessSpec = HarnessSpec {
@@ -941,6 +951,11 @@ mod tests {
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: crate::harness::HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         let reg = [REGISTRY[0], REGISTRY[1], AGENTS_NATIVE_1, AGENTS_NATIVE_2];
@@ -966,6 +981,11 @@ mod tests {
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: crate::harness::HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         const SPEC_COPY: HarnessSpec = HarnessSpec {
@@ -980,6 +1000,11 @@ mod tests {
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: crate::harness::HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         const SPECS: [HarnessSpec; 4] = [REGISTRY[0], REGISTRY[1], SPEC_IMPORT, SPEC_COPY];
@@ -1019,6 +1044,21 @@ mod tests {
         assert_eq!(targets, vec!["GEMINI.md"]);
     }
 
+    /// `write-rules --harness gemini` writes what `--harness agy` writes:
+    /// Gemini CLI is a deprecated alias of Antigravity, whose rules file is
+    /// the canonical AGENTS.md. An unknown name is still refused.
+    #[test]
+    fn resolve_write_targets_maps_deprecated_gemini_to_agy() {
+        let agy = resolve_write_targets(None, Some("agy"), REGISTRY).unwrap();
+        assert_eq!(agy, vec!["AGENTS.md"]);
+        assert_eq!(
+            resolve_write_targets(None, Some("gemini"), REGISTRY).unwrap(),
+            agy
+        );
+        let err = resolve_write_targets(None, Some("zeta"), REGISTRY).unwrap_err();
+        assert!(err.to_string().contains("unknown harness 'zeta'"), "{err}");
+    }
+
     #[test]
     fn default_rules_targets_injected_excludes_non_default() {
         let reg = three_entry_registry();
@@ -1042,6 +1082,11 @@ mod tests {
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: crate::harness::HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     };
 
     const DECLARED_IMPORT_SPEC: HarnessSpec = HarnessSpec {
@@ -1058,6 +1103,11 @@ mod tests {
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: crate::harness::HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     };
 
     const SYNTHEX_GROK_SPEC: HarnessSpec = HarnessSpec {
@@ -1072,6 +1122,11 @@ mod tests {
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: crate::harness::HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     };
 
     fn to_path_contents(plan: &[WritePlanItem]) -> Vec<(PathBuf, String)> {

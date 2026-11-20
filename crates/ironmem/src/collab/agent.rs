@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn rejects_unknown_string() {
-        let err = "gemini".parse::<Agent>().unwrap_err();
+        let err = "zeta".parse::<Agent>().unwrap_err();
         assert!(err.contains("unknown agent"));
     }
 

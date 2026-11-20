@@ -5,6 +5,9 @@
 //! lookup helpers take an explicit `registry: &[HarnessSpec]` slice so they
 //! work on injected test slices without global-state mutation.
 
+use std::collections::HashSet;
+use std::sync::{LazyLock, Mutex};
+
 mod packaging;
 pub use packaging::check_packaging_coverage;
 
@@ -20,6 +23,26 @@ pub enum TranscriptParserKind {
     Claude,
     Codex,
     None,
+}
+
+/// Wire format a harness's hook stdout uses (see `crate::hook::format_hook_output`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookOutputFormat {
+    /// The serialized `crate::hook::HookResponse`: Claude Code's
+    /// `hookSpecificOutput.additionalContext` for injected context and
+    /// `decision: "block"` to hold a Stop. Codex, and every harness that
+    /// injects nothing, use it too.
+    HookResponse,
+    /// Antigravity's camelCase protojson hook contract: SessionStart and
+    /// PreInvocation take `{"injectSteps": [{"systemMessage": {"systemMessage":
+    /// "..."}}]}`, Stop takes `{"decision": "continue"}` to keep the agent
+    /// going, and anything else is `{}`. PreInvocation fires before EVERY
+    /// model call of a turn and numbers them in `invocationNum`, so prompt
+    /// recall runs on the first call only, and an injected `systemMessage`
+    /// persists in the conversation trajectory, so recalled excerpts are
+    /// fenced as data.
+    InjectSteps,
 }
 
 /// Strategy used to populate a harness rules file.
@@ -143,12 +166,35 @@ pub struct HarnessSpec {
     pub client_info_aliases: &'static [&'static str],
     /// Values accepted by `IRONMEM_HARNESS` that map to this harness.
     pub env_aliases: &'static [&'static str],
-    /// Whether the harness supports `hookSpecificOutput.additionalContext`.
+    /// Retired harness names that now resolve to this harness. They are
+    /// accepted wherever an `env_aliases` value is (`--harness`,
+    /// `IRONMEM_HARNESS`, `write-rules --harness`), and using one prints a
+    /// one-line deprecation notice on stderr.
+    pub deprecated_aliases: &'static [&'static str],
+    /// Whether the harness has a hook channel that injects context into the
+    /// session (Claude Code's `hookSpecificOutput.additionalContext`,
+    /// Antigravity's `injectSteps`). [`Self::hook_output`] picks the format.
     pub additional_context_support: bool,
     /// Whether the harness emits occupancy samples that ironmem can capture.
     pub occupancy_support: bool,
     /// Which transcript parser to use when measuring token counts.
     pub transcript_parser: TranscriptParserKind,
+    /// The JSON shape this harness reads from a hook's stdout.
+    pub hook_output: HookOutputFormat,
+    /// The flag the launcher puts before an initial prompt (`agy -i
+    /// <prompt>`). `None` passes the prompt as one positional argument
+    /// (`<bin> [prompt]`).
+    pub prompt_flag: Option<&'static str>,
+    /// Whether `.<id>-plugin/` ships the lifecycle hooks
+    /// (`hooks/ironmem-hook.sh`). `false` when `scripts/install-ironmem.sh`
+    /// is their one source (Antigravity's global `hooks.json`), so the
+    /// plugin must ship none: a second copy would fire every hook twice.
+    pub plugin_ships_hooks: bool,
+    /// Whether `scripts/install-ironmem.sh` registers this harness's MCP
+    /// server (Antigravity's only when `agy` is on PATH). Doctor's hint for
+    /// a missing registration points at the installer first when it does,
+    /// and at the harness's own launcher when it does not.
+    pub installer_registers: bool,
 }
 
 /// All known harnesses.  Add new entries here; never hard-code harness ids
@@ -168,6 +214,11 @@ pub const REGISTRY: &[HarnessSpec] = &[
         additional_context_support: true,
         occupancy_support: true,
         transcript_parser: TranscriptParserKind::Claude,
+        hook_output: HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: true,
     },
     HarnessSpec {
         id: "codex",
@@ -181,6 +232,11 @@ pub const REGISTRY: &[HarnessSpec] = &[
         additional_context_support: false,
         occupancy_support: true,
         transcript_parser: TranscriptParserKind::Codex,
+        hook_output: HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: true,
     },
     HarnessSpec {
         id: "grok",
@@ -199,6 +255,11 @@ pub const REGISTRY: &[HarnessSpec] = &[
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     },
     HarnessSpec {
         id: "agy",
@@ -211,12 +272,32 @@ pub const REGISTRY: &[HarnessSpec] = &[
         // global MCP config path (~/.gemini/config/mcp_config.json) and
         // interactive prompt flag (`-i <prompt>`) are verified live against
         // `agy`.
+        //
+        // Hook contract, from the hooks docs embedded in agy 1.5.13 (read
+        // with `strings`, not captured from a live session): payloads are
+        // camelCase protojson; PreInvocation fires before every model call
+        // and carries `invocationNum` (proto3 varint, omitted when 0); Stop
+        // fires when the execution loop stops (once per turn, and again after
+        // each continuation a Stop hook asked for) and carries
+        // `continuationActive`; hooks run with the hooks.json folder as cwd.
+        //
+        // `clientInfo.name`: the agy binary contains "antigravity-client";
+        // no MCP `initialize` was captured, so that string is unverified on
+        // the wire. A bare "agy" alias would match any name containing those
+        // three letters ("legacy-tool"), so only the full product name is
+        // matched. "gemini" classifies here because Gemini CLI is deprecated
+        // upstream in favour of Antigravity (see `deprecated_aliases`).
         write_rules_default: false,
-        client_info_aliases: &["antigravity", "agy"],
+        client_info_aliases: &["antigravity", "gemini"],
         env_aliases: &["agy", "antigravity"],
         additional_context_support: true,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: HookOutputFormat::InjectSteps,
+        prompt_flag: Some("-i"),
+        deprecated_aliases: &["gemini"],
+        plugin_ships_hooks: false,
+        installer_registers: true,
     },
     HarnessSpec {
         id: "muse",
@@ -244,6 +325,11 @@ pub const REGISTRY: &[HarnessSpec] = &[
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: true,
     },
 ];
 
@@ -303,7 +389,11 @@ pub fn classify_client_info<'r>(name: &str, registry: &'r [HarnessSpec]) -> Opti
 
 /// Canonicalize an `IRONMEM_HARNESS`-style input string to a harness id.
 ///
-/// Returns the `id` if `input` exactly matches any `env_alias`.
+/// Returns the `id` if `input` exactly matches any `env_alias`, or any
+/// `deprecated_aliases` entry. A deprecated alias also prints a one-line
+/// notice on stderr (once per process per alias), so every caller that
+/// accepts it (`--harness`, `IRONMEM_HARNESS`, `write-rules --harness`)
+/// tells the user without repeating itself on every lookup.
 pub fn canonicalize_input<'r>(input: &str, registry: &'r [HarnessSpec]) -> Option<&'r str> {
     for spec in registry {
         for alias in spec.env_aliases {
@@ -312,7 +402,60 @@ pub fn canonicalize_input<'r>(input: &str, registry: &'r [HarnessSpec]) -> Optio
             }
         }
     }
-    None
+    let spec = deprecated_alias_spec(input, registry)?;
+    warn_deprecated_alias(input, spec);
+    Some(spec.id)
+}
+
+/// `input`, or the id a retired harness name now means (printing the
+/// deprecation notice once). Any other input, known or not, comes back
+/// unchanged, so callers that pass `claude-code` through verbatim keep doing
+/// so.
+pub fn replace_deprecated_alias<'r>(input: &'r str, registry: &'r [HarnessSpec]) -> &'r str {
+    match deprecated_alias_spec(input, registry) {
+        Some(spec) => {
+            warn_deprecated_alias(input, spec);
+            spec.id
+        }
+        None => input,
+    }
+}
+
+fn warn_deprecated_alias(input: &str, spec: &HarnessSpec) {
+    warn_once(
+        format!("deprecated:{input}"),
+        deprecated_alias_notice(input, spec),
+    );
+}
+
+/// The harness a retired name now resolves to, if `input` is one. Pure: no
+/// notice is printed (see [`canonicalize_input`]).
+pub fn deprecated_alias_spec<'r>(
+    input: &str,
+    registry: &'r [HarnessSpec],
+) -> Option<&'r HarnessSpec> {
+    registry
+        .iter()
+        .find(|spec| spec.deprecated_aliases.contains(&input))
+}
+
+/// The one-line stderr notice for a retired harness name.
+pub fn deprecated_alias_notice(input: &str, spec: &HarnessSpec) -> String {
+    format!(
+        "ironmem: warning: harness {input:?} is deprecated and now means {:?} ({}); use {:?} instead",
+        spec.id, spec.display_name, spec.id
+    )
+}
+
+/// Print `message` on stderr unless `key` was already printed by this
+/// process. Hooks and the MCP server resolve the harness many times per run,
+/// and a warning repeated on every lookup would bury everything else.
+pub fn warn_once(key: String, message: String) {
+    static PRINTED: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Default::default);
+    let mut printed = PRINTED.lock().unwrap_or_else(|e| e.into_inner());
+    if printed.insert(key) {
+        eprintln!("{message}");
+    }
 }
 
 /// Return the `rules_file` for every harness where `write_rules_default` is `true`.
@@ -399,8 +542,8 @@ pub(crate) fn rules_file_entries(registry: &[HarnessSpec]) -> Result<Vec<RulesFi
 /// (the same default the `--listen` daemon binds and the auto-spawn path
 /// spawns against — see `crate::config::Config` and `crate::mcp::daemon`).
 /// `_harness_id` is accepted anyway so every registration call site
-/// (`ensure_claude_registered`, `ensure_codex_registered`, and future
-/// grok/gemini launchers, #190 Task 12/13) threads the harness it is
+/// (`ensure_claude_registered`, `ensure_codex_registered`, and the
+/// grok/agy/muse launchers, #190 Task 12/13) threads the harness it is
 /// registering through this one seam — a future regression that
 /// accidentally introduces per-harness variation changes this function's
 /// signature/behavior in an obvious, reviewable way, and is caught by
@@ -554,6 +697,11 @@ mod tests {
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     };
 
     fn three_entry_registry() -> [HarnessSpec; 3] {
@@ -671,6 +819,11 @@ mod tests {
             additional_context_support: true,
             occupancy_support: true,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
         let beta = HarnessSpec {
             id: "beta",
@@ -684,6 +837,11 @@ mod tests {
             additional_context_support: true,
             occupancy_support: true,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         let err = default_rules_targets(&[alpha, beta]).unwrap_err();
@@ -707,6 +865,11 @@ mod tests {
             additional_context_support: true,
             occupancy_support: true,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
         let beta = HarnessSpec {
             id: "beta",
@@ -720,6 +883,11 @@ mod tests {
             additional_context_support: true,
             occupancy_support: true,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         let entries =
@@ -745,6 +913,11 @@ mod tests {
             additional_context_support: true,
             occupancy_support: true,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
         let beta = HarnessSpec {
             id: "beta",
@@ -758,6 +931,11 @@ mod tests {
             additional_context_support: true,
             occupancy_support: true,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         let err = rules_file_entries(&[alpha, beta]).unwrap_err();
@@ -780,6 +958,11 @@ mod tests {
             additional_context_support: false,
             occupancy_support: false,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         }
     }
 
@@ -1014,6 +1197,11 @@ mod tests {
             additional_context_support: true,
             occupancy_support: true,
             transcript_parser: TranscriptParserKind::None,
+            hook_output: HookOutputFormat::HookResponse,
+            prompt_flag: None,
+            deprecated_aliases: &[],
+            plugin_ships_hooks: true,
+            installer_registers: false,
         };
 
         // Build 3-entry registry; look up by id, never by index, so the test
@@ -1112,7 +1300,7 @@ mod tests {
         );
     }
 
-    // ---- #190 Task 11: grok/gemini registry rows + proxy-command helper ---
+    // ---- #190 Task 11: grok/agy registry rows + proxy-command helper ------
 
     #[test]
     fn registry_contains_grok_spec() {
@@ -1145,19 +1333,52 @@ mod tests {
             !spec.write_rules_default,
             "agy is not yet a default write-rules target"
         );
-        assert_eq!(spec.client_info_aliases, &["antigravity", "agy"]);
+        assert_eq!(spec.client_info_aliases, &["antigravity", "gemini"]);
         assert_eq!(spec.env_aliases, &["agy", "antigravity"]);
+        assert_eq!(spec.deprecated_aliases, &["gemini"]);
         assert!(
             spec.additional_context_support,
             "agy supports context injection via SessionStart/PreInvocation injectSteps"
         );
+        assert_eq!(spec.hook_output, HookOutputFormat::InjectSteps);
+        assert_eq!(spec.prompt_flag, Some("-i"));
         assert_eq!(
-            classify_client_info("antigravity-cli", REGISTRY),
+            classify_client_info("antigravity-client", REGISTRY),
             Some("agy")
         );
-        assert_eq!(classify_client_info("agy", REGISTRY), Some("agy"));
         assert_eq!(canonicalize_input("agy", REGISTRY), Some("agy"));
         assert_eq!(canonicalize_input("antigravity", REGISTRY), Some("agy"));
+    }
+
+    /// Gemini CLI is deprecated upstream in favour of Antigravity, so every
+    /// "gemini" input resolves to agy: the `--harness`/`IRONMEM_HARNESS`
+    /// spelling as a deprecated alias, and MCP clientInfo names containing
+    /// "gemini" by classification.
+    #[test]
+    fn gemini_is_a_deprecated_alias_of_agy() {
+        assert_eq!(canonicalize_input("gemini", REGISTRY), Some("agy"));
+        let spec = deprecated_alias_spec("gemini", REGISTRY).expect("gemini is retired");
+        assert_eq!(spec.id, "agy");
+        let notice = deprecated_alias_notice("gemini", spec);
+        assert!(!notice.contains('\n'), "one line: {notice}");
+        assert!(notice.contains("deprecated"), "{notice}");
+        assert!(notice.contains("\"agy\""), "{notice}");
+        for name in ["gemini-cli", "Gemini CLI MCP Client", "gemini"] {
+            assert_eq!(classify_client_info(name, REGISTRY), Some("agy"), "{name}");
+        }
+        // Only the retired spelling is deprecated; agy's own aliases are not.
+        assert!(deprecated_alias_spec("agy", REGISTRY).is_none());
+        assert!(deprecated_alias_spec("zeta", REGISTRY).is_none());
+    }
+
+    /// A bare three-letter "agy" substring alias would claim any client name
+    /// that happens to contain those letters. agy's own `--harness agy`
+    /// spelling still resolves exactly through `env_aliases`.
+    #[test]
+    fn client_names_merely_containing_agy_are_not_antigravity() {
+        for name in ["legacy-tool", "stagy", "agy"] {
+            assert_eq!(classify_client_info(name, REGISTRY), None, "{name}");
+        }
     }
 
     #[test]

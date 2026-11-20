@@ -12,7 +12,7 @@
 //! fully-supported fallback (in-process stdio) regardless of what a harness's
 //! registered command happens to be.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::error::MemoryError;
 
@@ -54,20 +54,166 @@ pub(crate) enum RegisterOutcome {
     Upgraded,
 }
 
-/// Write `contents` to `path` atomically (write to a temp sibling, then rename).
-fn write_atomic(path: &Path, contents: &str) -> Result<(), MemoryError> {
+/// How many times [`update_config`] re-reads and re-merges a config that
+/// another writer changed between ironmem's read and its write.
+const CONFLICT_RETRIES: usize = 3;
+
+/// Read-modify-write `path` without losing a concurrent writer's change.
+///
+/// `merge` gets the current contents (`None` when the file is missing) and
+/// returns the outcome plus the new contents, or `None` contents when nothing
+/// needs writing. The write lands only if the file still holds what `merge`
+/// saw — still missing, or byte-identical — and is otherwise retried from a
+/// fresh read, so a harness that rewrites its own config at the same time
+/// (`agy mcp add`, Claude Code saving `~/.claude.json`) keeps its change.
+/// Best effort: the check-then-rename leaves a window of a few syscalls.
+///
+/// A symlinked config (dotfiles kept in a repo) is written through: the link
+/// is resolved and its target updated in place, so the link survives (see
+/// [`resolve_config_target`]).
+fn update_config(
+    path: &Path,
+    mut merge: impl FnMut(Option<&str>) -> Result<(RegisterOutcome, Option<String>), MemoryError>,
+) -> Result<RegisterOutcome, MemoryError> {
+    let target = resolve_config_target(path)?;
+    let path = target.as_path();
+    for _ in 0..CONFLICT_RETRIES {
+        let current = read_optional(path)?;
+        let (outcome, next) = merge(current.as_deref())?;
+        let Some(next) = next else {
+            return Ok(outcome);
+        };
+        if write_atomic(path, &next, current.as_deref())? {
+            return Ok(outcome);
+        }
+    }
+    Err(MemoryError::Config(format!(
+        "{} kept changing while ironmem registered its MCP server; re-run the launcher",
+        path.display()
+    )))
+}
+
+/// The file a config path names: the path itself, or, when it is a symlink,
+/// the file the link resolves to. Writing the resolved target (temp file in
+/// the target's directory, then a rename over the target) keeps the link,
+/// where renaming over the link would replace it with a plain file. A
+/// dangling link is an error rather than a reason to create its target,
+/// since a broken dotfile link usually means a missing checkout, not a
+/// fresh install.
+fn resolve_config_target(path: &Path) -> Result<PathBuf, MemoryError> {
+    let is_link = std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false);
+    if !is_link {
+        return Ok(path.to_path_buf());
+    }
+    std::fs::canonicalize(path).map_err(|e| {
+        let points_at = std::fs::read_link(path)
+            .map(|target| target.display().to_string())
+            .unwrap_or_else(|_| "an unreadable target".to_string());
+        if e.kind() == std::io::ErrorKind::NotFound {
+            MemoryError::Config(format!(
+                "{} is a symlink to {points_at}, which does not exist; create the target or remove the link, then re-run",
+                path.display()
+            ))
+        } else {
+            MemoryError::Config(format!(
+                "resolve symlink {} ({points_at}): {e}",
+                path.display()
+            ))
+        }
+    })
+}
+
+/// The file's contents, or `None` when it does not exist.
+fn read_optional(path: &Path) -> Result<Option<String>, MemoryError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    crate::error::read_to_string_with_path(path)
+        .map(Some)
+        .map_err(MemoryError::Config)
+}
+
+/// Write `contents` to `path` atomically (write to a temp sibling, then
+/// rename), but only while `path` still holds `expected` (`None`: still
+/// missing). Returns `false`, writing nothing, when another writer got there
+/// first.
+///
+/// The new file keeps an existing file's permissions, and a file created
+/// from scratch is owner-only (0600 on Unix): these configs hold other MCP
+/// servers' `env` blocks, which routinely carry API tokens, so a rewrite
+/// must never widen who can read them.
+fn write_atomic(path: &Path, contents: &str, expected: Option<&str>) -> Result<bool, MemoryError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| MemoryError::Config(format!("create {}: {e}", parent.display())))?;
     }
     let tmp = path.with_extension(format!("ironmem-tmp-{}", std::process::id()));
-    std::fs::write(&tmp, contents)
-        .map_err(|e| MemoryError::Config(format!("write {}: {e}", tmp.display())))?;
-    std::fs::rename(&tmp, path).map_err(|e| {
+    let cleanup = |e: String| {
         let _ = std::fs::remove_file(&tmp);
+        MemoryError::Config(e)
+    };
+    // A temp file a crashed earlier run left behind would otherwise keep
+    // its old mode and contents.
+    let _ = std::fs::remove_file(&tmp);
+    write_private(&tmp, contents).map_err(|e| cleanup(format!("write {}: {e}", tmp.display())))?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        std::fs::set_permissions(&tmp, meta.permissions())
+            .map_err(|e| cleanup(format!("chmod {}: {e}", tmp.display())))?;
+    }
+
+    match expected {
+        // Create-if-absent: a hard link fails when the target exists, so a
+        // file that appeared since the read is merged on the next attempt
+        // rather than replaced. Filesystems without hard links fall back to
+        // an existence check and a rename.
+        None => match std::fs::hard_link(&tmp, path) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(true)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(false)
+            }
+            Err(_) if path.exists() => {
+                let _ = std::fs::remove_file(&tmp);
+                Ok(false)
+            }
+            Err(_) => rename_into_place(&tmp, path),
+        },
+        Some(expected) => {
+            if read_optional(path)?.as_deref() != Some(expected) {
+                let _ = std::fs::remove_file(&tmp);
+                return Ok(false);
+            }
+            rename_into_place(&tmp, path)
+        }
+    }
+}
+
+fn rename_into_place(tmp: &Path, path: &Path) -> Result<bool, MemoryError> {
+    std::fs::rename(tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(tmp);
         MemoryError::Config(format!("rename to {}: {e}", path.display()))
     })?;
-    Ok(())
+    Ok(true)
+}
+
+/// Create `path` (which must not exist) readable by its owner only.
+fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }
 
 /// True when `args` is exactly the single-element `["serve"]` array this
@@ -88,9 +234,11 @@ fn is_bare_serve_json(entry: &serde_json::Value) -> bool {
 /// `["serve"]` entry in place (see module docs).
 ///
 /// `seed` is the document a MISSING file starts from before the entry is
-/// inserted — see [`fresh_file_seed`]. It is ignored when the file exists,
-/// and must be a JSON object (anything else is refused like a non-object
-/// file would be).
+/// inserted — see [`fresh_file_seed`]. An existing file that is empty or
+/// whitespace-only (Antigravity creates its `mcp_config.json` as 0 bytes)
+/// is treated as missing and also starts from `seed`. It is ignored when the
+/// file has content, and must be a JSON object (anything else is refused
+/// like a non-object file would be).
 ///
 /// `entry_extras` are harness-specific keys merged into a BRAND-NEW
 /// `ironmem` entry alongside `command`/`args` — see [`fresh_entry_extras`].
@@ -105,13 +253,32 @@ pub(crate) fn ensure_json_mcpservers_registered(
     seed: serde_json::Value,
     entry_extras: serde_json::Map<String, serde_json::Value>,
 ) -> Result<RegisterOutcome, MemoryError> {
-    let mut root: serde_json::Value = if config_path.exists() {
-        let raw =
-            crate::error::read_to_string_with_path(config_path).map_err(MemoryError::Config)?;
-        serde_json::from_str(&raw)
-            .map_err(|e| MemoryError::Config(format!("parse {}: {e}", config_path.display())))?
-    } else {
-        seed
+    update_config(config_path, |current| {
+        merge_json_mcpservers(
+            config_path,
+            current,
+            exe,
+            proxy_args,
+            seed.clone(),
+            entry_extras.clone(),
+        )
+    })
+}
+
+/// One merge of [`ensure_json_mcpservers_registered`] over the file's
+/// `current` contents: the outcome, and the new contents when it changed.
+fn merge_json_mcpservers(
+    config_path: &Path,
+    current: Option<&str>,
+    exe: &str,
+    proxy_args: &[String],
+    seed: serde_json::Value,
+    entry_extras: serde_json::Map<String, serde_json::Value>,
+) -> Result<(RegisterOutcome, Option<String>), MemoryError> {
+    let mut root: serde_json::Value = match current {
+        Some(raw) if !raw.trim().is_empty() => serde_json::from_str(raw)
+            .map_err(|e| MemoryError::Config(format!("parse {}: {e}", config_path.display())))?,
+        _ => seed,
     };
 
     let obj = root.as_object_mut().ok_or_else(|| {
@@ -132,7 +299,7 @@ pub(crate) fn ensure_json_mcpservers_registered(
     let existing_entry = servers.get("ironmem").cloned();
     let outcome = match existing_entry {
         Some(entry) if !is_bare_serve_json(&entry) => {
-            return Ok(RegisterOutcome::AlreadyRegistered)
+            return Ok((RegisterOutcome::AlreadyRegistered, None))
         }
         Some(mut entry) => {
             // Upgrade IN PLACE: mutate only `command`/`args` on the existing
@@ -163,8 +330,7 @@ pub(crate) fn ensure_json_mcpservers_registered(
 
     let pretty = serde_json::to_string_pretty(&root)
         .map_err(|e| MemoryError::Config(format!("serialize {}: {e}", config_path.display())))?;
-    write_atomic(config_path, &pretty)?;
-    Ok(outcome)
+    Ok((outcome, Some(pretty)))
 }
 
 /// The document a missing JSON-`mcpServers` config starts from, per harness.
@@ -219,12 +385,19 @@ pub(crate) fn ensure_codex_registered(
     exe: &str,
     proxy_args: &[String],
 ) -> Result<RegisterOutcome, MemoryError> {
-    let existing = if config_path.exists() {
-        crate::error::read_to_string_with_path(config_path).map_err(MemoryError::Config)?
-    } else {
-        String::new()
-    };
+    update_config(config_path, |current| {
+        Ok(merge_codex(current.unwrap_or(""), exe, proxy_args))
+    })
+}
 
+/// One merge of [`ensure_codex_registered`] over the file's `existing`
+/// contents (empty when missing): the outcome, and the new contents when it
+/// changed.
+fn merge_codex(
+    existing: &str,
+    exe: &str,
+    proxy_args: &[String],
+) -> (RegisterOutcome, Option<String>) {
     let args_toml = toml_string_array(proxy_args);
 
     // H3: scope the stale-line search to the `[mcp_servers.ironmem]` section
@@ -243,18 +416,17 @@ pub(crate) fn ensure_codex_registered(
 
         if let Some(rel_idx) = scoped.find(STALE_BARE_SERVE_TOML_LINE) {
             let abs_idx = header_idx + rel_idx;
-            let mut upgraded = existing.clone();
+            let mut upgraded = existing.to_string();
             upgraded.replace_range(
                 abs_idx..abs_idx + STALE_BARE_SERVE_TOML_LINE.len(),
                 &format!("args = {args_toml}"),
             );
-            write_atomic(config_path, &upgraded)?;
-            return Ok(RegisterOutcome::Upgraded);
+            return (RegisterOutcome::Upgraded, Some(upgraded));
         }
-        return Ok(RegisterOutcome::AlreadyRegistered);
+        return (RegisterOutcome::AlreadyRegistered, None);
     }
 
-    let mut next = existing;
+    let mut next = existing.to_string();
     if !next.is_empty() && !next.ends_with('\n') {
         next.push('\n');
     }
@@ -262,8 +434,7 @@ pub(crate) fn ensure_codex_registered(
         "\n[mcp_servers.ironmem]\ncommand = \"{}\"\nargs = {args_toml}\n\n[mcp_servers.ironmem.env]\nIRONMEM_MCP_MODE = \"trusted\"\n",
         toml_basic_escape(exe)
     ));
-    write_atomic(config_path, &next)?;
-    Ok(RegisterOutcome::Registered)
+    (RegisterOutcome::Registered, Some(next))
 }
 
 #[cfg(test)]
@@ -764,5 +935,255 @@ mod tests {
             v["mcpServers"]["ironmem"].get("mode").is_none(),
             "upgrade must not add keys the user did not write: {v}"
         );
+    }
+
+    /// Antigravity creates `~/.gemini/config/mcp_config.json` as a 0-byte
+    /// file on first run: an empty or whitespace-only file is registered
+    /// into like a missing one (from the seed), not refused as unparseable.
+    #[test]
+    fn empty_or_blank_existing_file_is_treated_as_missing() {
+        for (name, contents) in [("empty", ""), ("blank", " \n\t\n")] {
+            let dir = tempfile::tempdir().unwrap();
+            let cfg = dir.path().join("mcp_config.json");
+            std::fs::write(&cfg, contents).unwrap();
+            let proxy_args = test_proxy_args();
+
+            let outcome = ensure_claude_registered(&cfg, "/bin/ironmem", &proxy_args).unwrap();
+            assert_eq!(outcome, RegisterOutcome::Registered, "{name}");
+            let raw = std::fs::read_to_string(&cfg).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+            assert_eq!(
+                v,
+                serde_json::json!({
+                    "mcpServers": { "ironmem": { "command": "/bin/ironmem", "args": proxy_args } }
+                }),
+                "{name}"
+            );
+            let again = ensure_claude_registered(&cfg, "/bin/ironmem", &proxy_args).unwrap();
+            assert_eq!(again, RegisterOutcome::AlreadyRegistered, "{name}");
+            assert_eq!(std::fs::read_to_string(&cfg).unwrap(), raw, "{name}");
+        }
+    }
+
+    /// The seed (Muse's envelope) applies to an empty file the same way.
+    #[test]
+    fn empty_existing_file_starts_from_the_seed() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("settings.json");
+        std::fs::write(&cfg, "").unwrap();
+        ensure_json_mcpservers_registered(
+            &cfg,
+            "/bin/ironmem",
+            &test_proxy_args(),
+            fresh_file_seed("muse"),
+            serde_json::Map::new(),
+        )
+        .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["schema_version"], serde_json::json!(1));
+    }
+
+    /// These configs hold other servers' `env` blocks (API tokens), so a
+    /// rewrite keeps an owner-only file owner-only, and a file ironmem
+    /// creates is owner-only from the start.
+    #[cfg(unix)]
+    #[test]
+    fn registration_keeps_a_private_config_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+
+        let existing = dir.path().join("mcp_config.json");
+        std::fs::write(
+            &existing,
+            r#"{"mcpServers":{"github":{"command":"gh","env":{"GITHUB_TOKEN":"t"}}}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600)).unwrap();
+        ensure_claude_registered(&existing, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(mode(&existing), 0o600, "rewrite must not widen a 0600 file");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&existing).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["github"]["env"]["GITHUB_TOKEN"], "t");
+
+        // A deliberately wider file keeps its mode too: ironmem does not chmod.
+        let shared = dir.path().join("shared.json");
+        std::fs::write(&shared, "{}").unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o644)).unwrap();
+        ensure_claude_registered(&shared, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(mode(&shared), 0o644);
+
+        let fresh = dir.path().join("nested").join("fresh.json");
+        ensure_claude_registered(&fresh, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(mode(&fresh), 0o600, "a created config starts owner-only");
+
+        let codex = dir.path().join("codex").join("config.toml");
+        ensure_codex_registered(&codex, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(mode(&codex), 0o600);
+        // No temp sibling is left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().contains("ironmem-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    /// `write_atomic` writes nothing when the file no longer holds what the
+    /// merge read, or appeared after the merge saw it missing.
+    #[test]
+    fn write_atomic_refuses_when_another_writer_got_there_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("mcp_config.json");
+        std::fs::write(&cfg, "changed by agy").unwrap();
+        assert!(!write_atomic(&cfg, "ours", Some("what we read")).unwrap());
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "changed by agy");
+        assert!(!write_atomic(&cfg, "ours", None).unwrap());
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "changed by agy");
+        assert!(write_atomic(&cfg, "ours", Some("changed by agy")).unwrap());
+        assert_eq!(std::fs::read_to_string(&cfg).unwrap(), "ours");
+
+        let missing = dir.path().join("new.json");
+        assert!(write_atomic(&missing, "ours", None).unwrap());
+        assert_eq!(std::fs::read_to_string(&missing).unwrap(), "ours");
+    }
+
+    /// A server another writer adds between ironmem's read and its write
+    /// survives: the conflict re-reads the file and merges again.
+    #[test]
+    fn a_concurrent_write_is_merged_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("mcp_config.json");
+        std::fs::write(&cfg, r#"{"mcpServers":{"a":{"command":"a"}}}"#).unwrap();
+        let proxy_args = test_proxy_args();
+        let mut calls = 0;
+        let outcome = update_config(&cfg, |current| {
+            calls += 1;
+            if calls == 1 {
+                // Simulate `agy mcp add b` landing after our read.
+                std::fs::write(
+                    &cfg,
+                    r#"{"mcpServers":{"a":{"command":"a"},"b":{"command":"b"}}}"#,
+                )
+                .unwrap();
+            }
+            merge_json_mcpservers(
+                &cfg,
+                current,
+                "/bin/ironmem",
+                &proxy_args,
+                serde_json::json!({}),
+                serde_json::Map::new(),
+            )
+        })
+        .unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered);
+        assert_eq!(calls, 2, "the conflict triggers exactly one re-merge");
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        for server in ["a", "b", "ironmem"] {
+            assert!(v["mcpServers"][server].is_object(), "{server} kept: {v}");
+        }
+    }
+
+    /// A file that never stops changing is reported, not clobbered.
+    #[test]
+    fn a_config_that_keeps_changing_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("mcp_config.json");
+        std::fs::write(&cfg, "{}").unwrap();
+        let mut n = 0;
+        let err = update_config(&cfg, |_| {
+            n += 1;
+            std::fs::write(&cfg, format!("{{\"n\":{n}}}")).unwrap();
+            Ok((RegisterOutcome::Registered, Some("ours".to_string())))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("kept changing"), "{err}");
+        assert_eq!(n, CONFLICT_RETRIES);
+        assert_ne!(std::fs::read_to_string(&cfg).unwrap(), "ours");
+    }
+
+    /// A symlinked config (dotfiles) is written through: the link stays a
+    /// link, its target gets the entry and keeps its mode, and no temp file
+    /// is left next to either.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_config_keeps_its_link_and_updates_the_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dotfiles = dir.path().join("dotfiles");
+        let config_dir = dir.path().join("home").join(".gemini").join("config");
+        std::fs::create_dir_all(&dotfiles).unwrap();
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let target = dotfiles.join("mcp_config.json");
+        std::fs::write(&target, r#"{"mcpServers":{"github":{"command":"gh"}}}"#).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = config_dir.join("mcp_config.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        let outcome = ensure_claude_registered(&link, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert_eq!(outcome, RegisterOutcome::Registered);
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link must survive"
+        );
+        assert_eq!(std::fs::read_link(&link).unwrap(), target);
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(v["mcpServers"]["github"]["command"], "gh");
+        assert!(v["mcpServers"]["ironmem"].is_object(), "{v}");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        for d in [&dotfiles, &config_dir] {
+            let leftovers: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_name().to_string_lossy().contains("ironmem-tmp"))
+                .collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
+        assert_eq!(
+            ensure_claude_registered(&link, "/bin/ironmem", &test_proxy_args()).unwrap(),
+            RegisterOutcome::AlreadyRegistered
+        );
+
+        // The Codex TOML writer goes through the same path.
+        let toml_target = dotfiles.join("config.toml");
+        std::fs::write(&toml_target, "model = \"x\"\n").unwrap();
+        let toml_link = dir.path().join("config.toml");
+        std::os::unix::fs::symlink(&toml_target, &toml_link).unwrap();
+        ensure_codex_registered(&toml_link, "/bin/ironmem", &test_proxy_args()).unwrap();
+        assert!(std::fs::symlink_metadata(&toml_link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(std::fs::read_to_string(&toml_target)
+            .unwrap()
+            .contains("[mcp_servers.ironmem]"));
+    }
+
+    /// A dangling link is reported, and its target is not created.
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlinked_config_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("dotfiles").join("mcp_config.json");
+        let link = dir.path().join("mcp_config.json");
+        std::os::unix::fs::symlink(&missing, &link).unwrap();
+
+        let err = ensure_claude_registered(&link, "/bin/ironmem", &test_proxy_args()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is a symlink to"), "{msg}");
+        assert!(msg.contains("does not exist"), "{msg}");
+        assert!(!missing.exists(), "the target must not be created");
+        assert!(std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
     }
 }

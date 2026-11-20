@@ -276,7 +276,7 @@ pub fn run_launcher(
     // failure or when disabled.
     let prompt = context_inject::maybe_inject_context(&canonical, prompt, &opts);
 
-    let args = argv::build_args_for(harness.harness_id(), prompt.as_deref());
+    let args = argv::build_args_for(harness.spec(), prompt.as_deref());
     eprintln!(
         "ironmem: launching {} in {}",
         harness.label(),
@@ -312,10 +312,7 @@ pub(crate) fn launch_invocation(
     spec: &crate::harness::HarnessSpec,
     prompt: Option<&str>,
 ) -> (String, Vec<String>) {
-    (
-        spec.binary.to_string(),
-        argv::build_args_for(spec.id, prompt),
-    )
+    (spec.binary.to_string(), argv::build_args_for(spec, prompt))
 }
 
 #[cfg(test)]
@@ -464,6 +461,11 @@ mod tests {
         additional_context_support: false,
         occupancy_support: false,
         transcript_parser: TranscriptParserKind::None,
+        hook_output: crate::harness::HookOutputFormat::HookResponse,
+        prompt_flag: None,
+        deprecated_aliases: &[],
+        plugin_ships_hooks: true,
+        installer_registers: false,
     };
 
     #[test]

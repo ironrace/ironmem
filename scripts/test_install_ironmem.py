@@ -10,6 +10,12 @@ but carries two things Claude does not: its settings file lives under
 XDG_CONFIG_HOME rather than $HOME, and its entry needs `"mode": "optional"` --
 without it Muse treats the server as required and aborts the whole session when
 the command is unavailable. Both are pinned here.
+
+Antigravity (agy) gets an MCP entry and a global `ironmem` hook group, and only
+when `agy` is on PATH. Every agy test resolves a stub `agy` from PATH that
+records any invocation, and asserts it was never run: the installer only looks
+agy up. Every installer run pins AGY_CONFIG_JSON, AGY_HOOKS_JSON and AGY_BIN so
+no test can reach a developer's real ~/.gemini or real agy.
 """
 from __future__ import annotations
 
@@ -71,6 +77,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
         *,
         skip_skills: bool = True,
         skip_wiring: bool = False,
+        force_wiring: bool = False,
         extra_env: dict[str, str] | None = None,
         expected_returncode: int = 0,
     ) -> subprocess.CompletedProcess[str]:
@@ -81,6 +88,8 @@ class InstallIronmemSelfTest(unittest.TestCase):
             command.append("--skip-skills")
         if skip_wiring:
             command.append("--skip-wiring")
+        if force_wiring:
+            command.append("--force-wiring")
         result = subprocess.run(
             command,
             cwd=ROOT,
@@ -101,6 +110,15 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 # every full-install test. Tests that pin the Muse argv override
                 # MUSE_BIN with a recording shim.
                 "MUSE_BIN": str(home / ".no-muse-here"),
+                # Pinned, not inherited: an exported AGY_CONFIG_JSON or
+                # AGY_HOOKS_JSON would send every run's agy wiring to the
+                # developer's real, token-bearing ~/.gemini/config files.
+                "AGY_CONFIG_JSON": str(home / ".gemini" / "config" / "mcp_config.json"),
+                "AGY_HOOKS_JSON": str(home / ".gemini" / "config" / "hooks.json"),
+                # Pinned to a path that does not exist, so agy reads as absent
+                # even on a machine that has it. Tests that wire agy use
+                # agy_env(), which resolves a stub from PATH instead.
+                "AGY_BIN": str(home / ".no-agy-here"),
                 **(extra_env or {}),
             },
             capture_output=True,
@@ -318,14 +336,75 @@ class InstallIronmemSelfTest(unittest.TestCase):
         payload = json.loads(config.read_text(encoding="utf-8"))
         return payload["mcpServers"]["ironmem"]
 
+    def agy_env(self, home: pathlib.Path) -> dict[str, str]:
+        """Env that puts a stub `agy` first on PATH, resolved by name.
+
+        AGY_BIN is emptied so the installer falls back to a bare `agy`, which
+        must come from PATH. The stub records any invocation; the installer
+        only looks agy up, so assert_agy_never_ran checks that log stays absent.
+        """
+        stub_dir = home / "agy-stub-bin"
+        stub_dir.mkdir(parents=True, exist_ok=True)
+        stub = stub_dir / "agy"
+        stub.write_text(
+            "#!/bin/sh\n"
+            f"echo \"$@\" >> '{home / 'agy-stub-ran.log'}'\n"
+            "exit 97\n",
+            encoding="utf-8",
+        )
+        stub.chmod(stub.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return {"AGY_BIN": "", "PATH": str(stub_dir) + os.pathsep + os.environ["PATH"]}
+
+    def assert_agy_never_ran(self, home: pathlib.Path) -> None:
+        self.assertFalse(
+            (home / "agy-stub-ran.log").exists(), "the installer must never run agy"
+        )
+
+    def agy_paths(self, home: pathlib.Path) -> tuple[pathlib.Path, pathlib.Path]:
+        config_dir = home / ".gemini" / "config"
+        return config_dir / "mcp_config.json", config_dir / "hooks.json"
+
+    def expected_hook_command(self, home: pathlib.Path, mode: str, subcommand: str) -> str:
+        target = home / ".ironrace" / "bin" / "ironmem"
+        return f"IRONMEM_MCP_MODE={mode} {target} hook {subcommand} --harness agy"
+
+    def ironmem_hook_group(self, home: pathlib.Path, mode: str = "trusted") -> dict[str, object]:
+        return {
+            "SessionStart": [
+                {
+                    "type": "command",
+                    "command": self.expected_hook_command(home, mode, "session-start"),
+                    "timeout": 120,
+                }
+            ],
+            "PreInvocation": [
+                {
+                    "type": "command",
+                    "command": self.expected_hook_command(home, mode, "user-prompt-submit"),
+                }
+            ],
+            "Stop": [
+                {
+                    "type": "command",
+                    "command": self.expected_hook_command(home, mode, "stop"),
+                    "timeout": 120,
+                }
+            ],
+        }
+
+    def stray_files(self, directory: pathlib.Path, *keep: str) -> list[str]:
+        return sorted(p.name for p in directory.iterdir() if p.name not in keep)
+
     def test_fresh_agy_registration_uses_trusted_mode_and_ignores_xdg(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
             xdg = home / "xdg-elsewhere"
-            agy_config = home / ".gemini" / "config" / "mcp_config.json"
+            agy_config, _ = self.agy_paths(home)
 
             self.run_installer(
-                home, home / ".claude.json", extra_env={"XDG_CONFIG_HOME": str(xdg)}
+                home,
+                home / ".claude.json",
+                extra_env={**self.agy_env(home), "XDG_CONFIG_HOME": str(xdg)},
             )
 
             self.assertTrue(agy_config.is_file())
@@ -335,11 +414,53 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertEqual(len(server.get("args", [])), 3)
             self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
             self.assertNotIn("mode", server)
+            self.assert_agy_never_ran(home)
+
+    def test_agy_absent_from_path_skips_agy_wiring(self) -> None:
+        # The production lookup: a bare `agy` on PATH. Every directory that
+        # holds an `agy` (a developer's real install included) is dropped from
+        # PATH, so this run sees a machine without Antigravity.
+        path = os.pathsep.join(
+            d
+            for d in os.environ["PATH"].split(os.pathsep)
+            if d and not (pathlib.Path(d) / "agy").exists()
+        )
+        if shutil.which("jq", path=path) is None or shutil.which("bash", path=path) is None:
+            self.skipTest("jq or bash lives only beside agy on this PATH")
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+
+            result = self.run_installer(
+                home, home / ".claude.json", extra_env={"AGY_BIN": "", "PATH": path}
+            )
+
+            self.assertIn("Antigravity (agy) not found on PATH", result.stdout)
+            self.assertIn("skipping Antigravity MCP and hook registration", result.stdout)
+            # Not just the two files: no ~/.gemini tree at all for a machine
+            # that never ran agy.
+            self.assertFalse((home / ".gemini").exists())
+            # Everything else is still wired.
+            self.assertIn("ironmem", json.loads((home / ".claude.json").read_text())["mcpServers"])
+            self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text())
+
+    def test_agy_on_path_wires_both_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, hooks_path = self.agy_paths(home)
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            self.assertNotIn("not found on PATH", result.stdout)
+            self.assertIn("ironmem", json.loads(agy_config.read_text())["mcpServers"])
+            self.assertEqual(
+                json.loads(hooks_path.read_text()), {"ironmem": self.ironmem_hook_group(home)}
+            )
+            self.assert_agy_never_ran(home)
 
     def test_existing_agy_bare_serve_is_upgraded_preserving_siblings(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
-            agy_config = home / ".gemini" / "config" / "mcp_config.json"
+            agy_config, _ = self.agy_paths(home)
             agy_config.parent.mkdir(parents=True, exist_ok=True)
             agy_config.write_text(
                 json.dumps(
@@ -356,7 +477,7 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.run_installer(home, home / ".claude.json")
+            self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
 
             payload = json.loads(agy_config.read_text(encoding="utf-8"))
             self.assertEqual(payload["mcpServers"]["other"]["command"], "/bin/other")
@@ -364,10 +485,67 @@ class InstallIronmemSelfTest(unittest.TestCase):
             self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
             self.assertEqual(server.get("env", {}).get("IRONMEM_MCP_MODE"), "trusted")
 
+    def test_unrelated_agy_mcp_entries_survive_every_write_path(self) -> None:
+        # mcp_config.json holds other servers' credentials. Whichever path the
+        # installer takes -- fresh add, in-place repair, or --force-wiring over
+        # a divergent entry -- everything except mcpServers.ironmem must come
+        # back equal in value, the other server's env token included.
+        siblings = {
+            "theme": "dark",
+            "mcpServers": {
+                "github": {
+                    "command": "/opt/github-mcp",
+                    "args": ["stdio", "--read-only"],
+                    "env": {"GITHUB_TOKEN": "ghp_fixture_token_value", "LOG": "1"},
+                }
+            },
+        }
+        cases = {
+            "fresh add": (None, False),
+            "repair": ({"command": "{target}", "args": ["serve"]}, False),
+            "force over divergent": ({"command": "/elsewhere/ironmem", "args": ["x"]}, True),
+        }
+        for name, (ironmem_entry, force) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                target = str(home / ".ironrace" / "bin" / "ironmem")
+                agy_config, _ = self.agy_paths(home)
+                agy_config.parent.mkdir(parents=True)
+                before = json.loads(json.dumps(siblings))
+                if ironmem_entry is not None:
+                    entry = {k: (target if v == "{target}" else v) for k, v in ironmem_entry.items()}
+                    before["mcpServers"]["ironmem"] = entry
+                agy_config.write_text(json.dumps(before, indent=2), encoding="utf-8")
+
+                self.run_installer(
+                    home, home / ".claude.json", force_wiring=force, extra_env=self.agy_env(home)
+                )
+
+                after = json.loads(agy_config.read_text(encoding="utf-8"))
+                server = after["mcpServers"].pop("ironmem")
+                self.assertEqual(server["command"], target)
+                self.assertEqual(after, siblings)
+
+    def test_divergent_agy_mcp_command_is_kept_without_force_wiring(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, _ = self.agy_paths(home)
+            agy_config.parent.mkdir(parents=True)
+            original = json.dumps(
+                {"mcpServers": {"ironmem": {"command": "/elsewhere/ironmem", "args": ["serve"]}}}
+            )
+            agy_config.write_text(original, encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            self.assertEqual(agy_config.read_text(encoding="utf-8"), original)
+            self.assertIn("command=/elsewhere/ironmem", result.stderr)
+            self.assertIn("--force-wiring", result.stderr)
+
     def test_explicit_agy_mode_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
-            agy_config = home / ".gemini" / "config" / "mcp_config.json"
+            agy_config, _ = self.agy_paths(home)
             agy_config.parent.mkdir(parents=True, exist_ok=True)
             agy_config.write_text(
                 json.dumps(
@@ -384,25 +562,122 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.run_installer(home, home / ".claude.json")
+            self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
 
             server = self.read_agy_server(agy_config)
             self.assertEqual(server["env"]["IRONMEM_MCP_MODE"], "read-only")
             self.assertEqual(server.get("args", [])[:2], ["serve", "--connect"])
 
+    def test_restricted_agy_mcp_mode_flows_into_the_hooks(self) -> None:
+        # A restricted agy MCP entry exists to keep stored drawer content out
+        # of Antigravity. Trusted-mode hooks would inject recall excerpts on
+        # every PreInvocation and mine on every Stop regardless.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, hooks_path = self.agy_paths(home)
+            agy_config.parent.mkdir(parents=True)
+            agy_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ironmem": {
+                                "command": str(home / ".ironrace" / "bin" / "ironmem"),
+                                "args": ["serve"],
+                                "env": {"IRONMEM_MCP_MODE": "restricted"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            self.run_installer(
+                home,
+                home / ".claude.json",
+                # An ambient trusted must not beat the entry's explicit mode.
+                extra_env={**self.agy_env(home), "IRONMEM_MCP_MODE": "trusted"},
+            )
+
+            group = json.loads(hooks_path.read_text(encoding="utf-8"))["ironmem"]
+            self.assertEqual(group, self.ironmem_hook_group(home, mode="restricted"))
+            for event in ("SessionStart", "PreInvocation", "Stop"):
+                self.assertNotIn("trusted", group[event][0]["command"])
+
+    def test_unreadable_agy_mcp_config_leaves_hooks_on_the_ambient_mode(self) -> None:
+        # No readable mode on the agy MCP entry: the hooks defer to the mode in
+        # agy's environment when they run, else trusted -- never a hard-coded
+        # trusted that overrides an ambient restricted.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, hooks_path = self.agy_paths(home)
+            agy_config.parent.mkdir(parents=True)
+            agy_config.write_text("[1, 2]\n", encoding="utf-8")
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            self.assertEqual(agy_config.read_text(encoding="utf-8"), "[1, 2]\n")
+            self.assertIn(f"{agy_config} is not a single JSON object", result.stderr)
+            group = json.loads(hooks_path.read_text(encoding="utf-8"))["ironmem"]
+            self.assertEqual(
+                group,
+                self.ironmem_hook_group(home, mode='"${IRONMEM_MCP_MODE:-trusted}"'),
+            )
+            # What that prefix does once agy's `sh -c` runs it.
+            command = group["PreInvocation"][0]["command"].replace(
+                str(home / ".ironrace" / "bin" / "ironmem"), "printenv IRONMEM_MCP_MODE #"
+            )
+            for ambient, expected in ((None, "trusted"), ("restricted", "restricted")):
+                env = {k: v for k, v in os.environ.items() if k != "IRONMEM_MCP_MODE"}
+                if ambient is not None:
+                    env["IRONMEM_MCP_MODE"] = ambient
+                ran = subprocess.run(
+                    ["sh", "-c", command], env=env, capture_output=True, text=True, check=True
+                )
+                self.assertEqual(ran.stdout.strip(), expected)
+
+    def test_hook_command_quotes_an_install_path_with_shell_metacharacters(self) -> None:
+        # agy runs the hook command through `sh -c`; a `$`, backtick, quote or
+        # space in the install path must reach the binary verbatim.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            install_dir = home / "odd dir $HOME `id` it's" / "bin"
+            _, hooks_path = self.agy_paths(home)
+
+            self.run_installer(
+                home,
+                home / ".claude.json",
+                extra_env={**self.agy_env(home), "IRONMEM_INSTALL_DIR": str(install_dir)},
+            )
+
+            command = json.loads(hooks_path.read_text(encoding="utf-8"))["ironmem"]["Stop"][0][
+                "command"
+            ]
+            ran = subprocess.run(
+                ["sh", "-c", f'set -- {command}; printf "%s\\n" "$@"'],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(
+                ran.stdout.splitlines(),
+                ["IRONMEM_MCP_MODE=trusted", str(install_dir / "ironmem"), "hook", "stop",
+                 "--harness", "agy"],
+            )
+
     def test_skip_wiring_leaves_agy_untouched(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
 
-            self.run_installer(home, home / ".claude.json", skip_wiring=True)
+            self.run_installer(
+                home, home / ".claude.json", skip_wiring=True, extra_env=self.agy_env(home)
+            )
 
-            self.assertFalse((home / ".gemini" / "config" / "mcp_config.json").exists())
-            self.assertFalse((home / ".gemini" / "config" / "hooks.json").exists())
+            self.assertFalse((home / ".gemini").exists())
 
     def test_fresh_agy_hooks_registration_and_idempotency(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             home = pathlib.Path(directory)
-            hooks_path = home / ".gemini" / "config" / "hooks.json"
+            _, hooks_path = self.agy_paths(home)
             hooks_path.parent.mkdir(parents=True, exist_ok=True)
             # Pre-existing sibling hook must survive untouched.
             hooks_path.write_text(
@@ -416,10 +691,13 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            self.run_installer(home, home / ".claude.json")
+            first = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
 
+            self.assertIn("Registering 'ironmem' lifecycle hooks", first.stdout)
             payload = json.loads(hooks_path.read_text(encoding="utf-8"))
-            self.assertIn("lint-checker", payload)
+            self.assertEqual(
+                payload["lint-checker"], {"Stop": [{"type": "command", "command": "./lint.sh"}]}
+            )
             ironmem = payload["ironmem"]
             target = str(home / ".ironrace" / "bin" / "ironmem")
             for event, subcmd in (
@@ -431,11 +709,491 @@ class InstallIronmemSelfTest(unittest.TestCase):
                 self.assertIn(target, cmd)
                 self.assertIn(f"hook {subcmd} --harness agy", cmd)
                 self.assertIn("IRONMEM_MCP_MODE=trusted", cmd)
+            # agy kills a hook at 30 s by default; session-start and Stop can
+            # mine the workspace, so they carry a longer explicit budget.
+            self.assertEqual(ironmem["SessionStart"][0]["timeout"], 120)
+            self.assertEqual(ironmem["Stop"][0]["timeout"], 120)
+            self.assertNotIn("timeout", ironmem["PreInvocation"][0])
 
-            # Second run is idempotent and reports already registered.
-            second = self.run_installer(home, home / ".claude.json")
-            self.assertIn("already registered for Antigravity", second.stdout)
+            # Second run is idempotent. The MCP writer prints its own "already
+            # registered for Antigravity" line on this run too, so match the
+            # hooks' line exactly and rule out every hooks write path.
+            second = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+            self.assertIn("'ironmem' lifecycle hooks already registered for Antigravity", second.stdout)
+            self.assertNotIn("Registering 'ironmem' lifecycle hooks", second.stdout)
+            self.assertNotIn("Antigravity hook group", second.stdout)
+            self.assertNotIn("Replacing divergent 'ironmem' Antigravity", second.stdout)
             self.assertEqual(json.loads(hooks_path.read_text(encoding="utf-8")), payload)
+            self.assert_agy_never_ran(home)
+
+    def test_zero_byte_agy_configs_are_seeded_and_wired(self) -> None:
+        # agy creates mcp_config.json as a 0-byte file on first run; jq reads
+        # that as zero documents, so it must be seeded like a missing file.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, hooks_path = self.agy_paths(home)
+            agy_config.parent.mkdir(parents=True)
+            agy_config.write_bytes(b"")
+            hooks_path.write_bytes(b"")
+
+            self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            server = self.read_agy_server(agy_config)
+            self.assertEqual(server["command"], str(home / ".ironrace" / "bin" / "ironmem"))
+            self.assertEqual(
+                json.loads(hooks_path.read_text(encoding="utf-8")),
+                {"ironmem": self.ironmem_hook_group(home)},
+            )
+
+    def test_unparseable_agy_hooks_file_warns_and_the_install_continues(self) -> None:
+        # agy reads HuJSON, so a trailing comma or a comment is legal there and
+        # a parse error to jq. That must cost the agy hooks only: no abort, no
+        # rewrite, no temp file left beside it, and every later step still runs.
+        for name, content in (
+            ("trailing comma", '{"lint": {"Stop": []},}\n'),
+            ("comment", '// my hooks\n{"lint": {"Stop": []}}\n'),
+            ("array", "[]\n"),
+            ("two documents", "{} {}\n"),
+        ):
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                agy_config, hooks_path = self.agy_paths(home)
+                hooks_path.parent.mkdir(parents=True)
+                hooks_path.write_text(content, encoding="utf-8")
+
+                result = self.run_installer(
+                    home, home / ".claude.json", extra_env=self.agy_env(home)
+                )
+
+                self.assertEqual(hooks_path.read_text(encoding="utf-8"), content)
+                self.assertIn(f"WARN: {hooks_path} is not a single JSON object", result.stderr)
+                self.assertIn("skipping Antigravity hook registration", result.stderr)
+                self.assertEqual(
+                    self.stray_files(hooks_path.parent, "hooks.json", "mcp_config.json"), []
+                )
+                # The rest of the install still ran.
+                self.assertIn("ironmem", json.loads(agy_config.read_text())["mcpServers"])
+                self.assertIn(
+                    "[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text()
+                )
+                self.assertIn("==> Done", result.stdout)
+
+    def test_symlinked_agy_configs_keep_the_link_and_update_the_target(self) -> None:
+        # Dotfiles are often symlinked in from a repo. The rewrite must land in
+        # the file the link names -- through a relative link and a two-hop
+        # chain alike -- leave both links in place, keep the target's other
+        # entries, and leave no temp file beside the link or the target.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, hooks_path = self.agy_paths(home)
+            agy_config.parent.mkdir(parents=True)
+            dotfiles = home / "dotfiles"
+            dotfiles.mkdir()
+            mcp_target = dotfiles / "agy-mcp.json"
+            mcp_target.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "github": {"command": "gh-mcp", "env": {"GITHUB_TOKEN": "t0k"}}
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            hooks_target = dotfiles / "agy-hooks.json"
+            hooks_target.write_text(
+                json.dumps({"lint": {"Stop": [{"command": "./lint.sh"}]}}), encoding="utf-8"
+            )
+            mcp_link = os.path.relpath(mcp_target, agy_config.parent)
+            agy_config.symlink_to(mcp_link)
+            hop = dotfiles / "hooks-hop.json"
+            hop.symlink_to(hooks_target)
+            hooks_path.symlink_to(hop)
+
+            self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            self.assertTrue(agy_config.is_symlink())
+            self.assertEqual(os.readlink(agy_config), mcp_link)
+            self.assertTrue(hooks_path.is_symlink())
+            self.assertEqual(os.readlink(hooks_path), str(hop))
+            self.assertEqual(os.readlink(hop), str(hooks_target))
+            mcp = json.loads(mcp_target.read_text(encoding="utf-8"))
+            self.assertEqual(
+                mcp["mcpServers"]["github"], {"command": "gh-mcp", "env": {"GITHUB_TOKEN": "t0k"}}
+            )
+            self.assertEqual(
+                mcp["mcpServers"]["ironmem"]["command"],
+                str(home / ".ironrace" / "bin" / "ironmem"),
+            )
+            hooks = json.loads(hooks_target.read_text(encoding="utf-8"))
+            self.assertEqual(hooks["lint"], {"Stop": [{"command": "./lint.sh"}]})
+            self.assertEqual(hooks["ironmem"], self.ironmem_hook_group(home))
+            self.assertEqual(self.stray_files(agy_config.parent, "hooks.json", "mcp_config.json"), [])
+            self.assertEqual(
+                self.stray_files(
+                    dotfiles, "agy-mcp.json", "agy-hooks.json", "hooks-hop.json"
+                ),
+                [],
+            )
+
+    def test_dangling_symlinked_agy_configs_warn_and_are_left_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, hooks_path = self.agy_paths(home)
+            agy_config.parent.mkdir(parents=True)
+            missing_mcp = home / "dotfiles" / "gone-mcp.json"
+            missing_hooks = home / "dotfiles" / "gone-hooks.json"
+            agy_config.symlink_to(missing_mcp)
+            hooks_path.symlink_to(missing_hooks)
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            for link, missing in ((agy_config, missing_mcp), (hooks_path, missing_hooks)):
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(os.readlink(link), str(missing))
+                self.assertFalse(missing.exists(), "a dangling link's target must not be created")
+                self.assertIn(f"WARN: {link} is a symlink to {missing}", result.stderr)
+            self.assertFalse((home / "dotfiles").exists())
+            # The rest of the install still ran.
+            self.assertIn("[mcp_servers.ironmem]", (home / ".codex" / "config.toml").read_text())
+            self.assertIn("==> Done", result.stdout)
+
+    def test_codex_config_symlink_that_leads_nowhere_skips_codex_wiring(self) -> None:
+        # Appending through a dangling link would create the missing target; a
+        # loop would fail the append and abort the install. Either way: warn,
+        # leave the link alone, skip Codex, and finish everything else.
+        for name in ("dangling", "loop"):
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                codex_toml = home / ".codex" / "config.toml"
+                codex_toml.parent.mkdir(parents=True)
+                if name == "dangling":
+                    pointee = home / "dotfiles" / "codex.toml"
+                    codex_toml.symlink_to(pointee)
+                else:
+                    pointee = home / ".codex" / "loop-b.toml"
+                    pointee.symlink_to(codex_toml)
+                    codex_toml.symlink_to(pointee)
+
+                result = self.run_installer(home, home / ".claude.json")
+
+                self.assertTrue(codex_toml.is_symlink())
+                self.assertEqual(os.readlink(codex_toml), str(pointee))
+                if name == "dangling":
+                    self.assertFalse(pointee.exists(), "a dangling link's target must not be created")
+                    self.assertFalse((home / "dotfiles").exists())
+                self.assertIn(f"WARN: {codex_toml} is a symlink to {pointee}", result.stderr)
+                self.assertIn("skipping Codex MCP registration", result.stderr)
+                self.assertNotIn("Appending [mcp_servers.ironmem]", result.stdout)
+                # Every other harness is still wired and the run completes.
+                self.assertIn(
+                    "ironmem", json.loads((home / ".claude.json").read_text())["mcpServers"]
+                )
+                self.assertIn("==> Done", result.stdout)
+
+    def test_symlinked_codex_config_is_appended_through_the_link(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            codex_toml = home / ".codex" / "config.toml"
+            codex_toml.parent.mkdir(parents=True)
+            real = home / "dotfiles" / "codex.toml"
+            real.parent.mkdir()
+            real.write_text('model = "o3"\n', encoding="utf-8")
+            codex_toml.symlink_to(real)
+
+            self.run_installer(home, home / ".claude.json")
+
+            self.assertTrue(codex_toml.is_symlink())
+            self.assertEqual(os.readlink(codex_toml), str(real))
+            content = real.read_text(encoding="utf-8")
+            self.assertTrue(content.startswith('model = "o3"\n'))
+            self.assertIn("[mcp_servers.ironmem]", content)
+
+    def test_legacy_codex_check_reads_the_configured_codex_toml(self) -> None:
+        # run_installer's default pin equals $HOME/.codex/config.toml, which is
+        # exactly what a hard-coded check reads; only an override pointing
+        # elsewhere tells the two apart. A decoy at the default path carries a
+        # legacy section the configured file does not, and vice versa.
+        legacy = '[mcp_servers.ironrace_memory]\ncommand = "/old/ironrace-memory"\n'
+        for skip_wiring in (False, True):
+            for legacy_in in ("override", "default"):
+                name = f"legacy in {legacy_in}, skip_wiring={skip_wiring}"
+                with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                    home = pathlib.Path(directory)
+                    override = home / "elsewhere" / "codex.toml"
+                    default = home / ".codex" / "config.toml"
+                    for path in (override, default):
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                    (override if legacy_in == "override" else default).write_text(
+                        legacy, encoding="utf-8"
+                    )
+                    (default if legacy_in == "override" else override).write_text(
+                        'model = "o3"\n', encoding="utf-8"
+                    )
+
+                    result = self.run_installer(
+                        home,
+                        home / ".claude.json",
+                        skip_wiring=skip_wiring,
+                        extra_env={"CODEX_CONFIG_TOML": str(override)},
+                    )
+
+                    if legacy_in == "override":
+                        self.assertIn(
+                            f"Codex ({override}) has an [mcp_servers.ironrace_memory] section",
+                            result.stdout,
+                        )
+                    else:
+                        self.assertNotIn("Legacy MCP registrations detected", result.stdout)
+                        self.assertNotIn(str(default), result.stdout)
+
+    def test_legacy_claude_check_reads_the_configured_claude_json(self) -> None:
+        # The Claude twin of the Codex test above: an override pointing away
+        # from $HOME/.claude.json, with a legacy server in exactly one of the
+        # two files. Only the configured file may be reported.
+        legacy = {"mcpServers": {"ironrace-memory": {"command": "/old/ironrace-memory"}}}
+        clean = {"theme": "dark"}
+        for skip_wiring in (False, True):
+            for legacy_in in ("override", "default"):
+                name = f"legacy in {legacy_in}, skip_wiring={skip_wiring}"
+                with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                    home = pathlib.Path(directory)
+                    override = home / "elsewhere" / "claude.json"
+                    default = home / ".claude.json"
+                    override.parent.mkdir(parents=True)
+                    override.write_text(
+                        json.dumps(legacy if legacy_in == "override" else clean), encoding="utf-8"
+                    )
+                    default.write_text(
+                        json.dumps(legacy if legacy_in == "default" else clean), encoding="utf-8"
+                    )
+
+                    result = self.run_installer(home, override, skip_wiring=skip_wiring)
+
+                    if legacy_in == "override":
+                        self.assertIn(
+                            f"Claude Code ({override}) has an 'ironrace-memory' server",
+                            result.stdout,
+                        )
+                    else:
+                        self.assertNotIn("Legacy MCP registrations detected", result.stdout)
+                        self.assertNotIn(str(default), result.stdout)
+                    # The check only reports; the legacy entry is never removed.
+                    holder = override if legacy_in == "override" else default
+                    self.assertIn(
+                        "ironrace-memory", json.loads(holder.read_text())["mcpServers"]
+                    )
+
+    def test_rewrite_keeps_an_existing_config_mode(self) -> None:
+        # mktemp creates its file 0600; renaming it over a deliberately shared
+        # 0644 config must not narrow it, and a 0600 one must never widen.
+        for mode in (0o644, 0o600, 0o640):
+            with self.subTest(oct(mode)), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                agy_config, hooks_path = self.agy_paths(home)
+                agy_config.parent.mkdir(parents=True)
+                claude = home / ".claude.json"
+                for path, content in (
+                    (agy_config, {"mcpServers": {"other": {"command": "x"}}}),
+                    (hooks_path, {"lint": {"Stop": []}}),
+                    (claude, {"theme": "dark"}),
+                ):
+                    path.write_text(json.dumps(content), encoding="utf-8")
+                    path.chmod(mode)
+
+                self.run_installer(home, claude, extra_env=self.agy_env(home))
+
+                for path in (agy_config, hooks_path, claude):
+                    self.assertIn("ironmem", path.read_text(encoding="utf-8"), path)
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), mode, path)
+
+    def test_blank_existing_config_keeps_its_mode_when_seeded(self) -> None:
+        # agy creates mcp_config.json 0-byte and 0644 on first run; seeding it
+        # is a rewrite of an existing file, not a new one.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, _ = self.agy_paths(home)
+            agy_config.parent.mkdir(parents=True)
+            agy_config.write_bytes(b"")
+            agy_config.chmod(0o644)
+
+            self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            self.assertIn("ironmem", self.read_agy_server(agy_config)["command"])
+            self.assertEqual(stat.S_IMODE(agy_config.stat().st_mode), 0o644)
+
+    def test_newly_created_configs_are_owner_only(self) -> None:
+        # MCP configs collect other servers' env tokens, so a file this script
+        # creates starts 0600 whatever the umask -- as the Rust writer does.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            agy_config, hooks_path = self.agy_paths(home)
+            claude = home / ".claude.json"
+            muse = home / ".config" / "muse" / "settings.json"
+            codex = home / ".codex" / "config.toml"
+
+            previous = os.umask(0o022)
+            try:
+                self.run_installer(home, claude, extra_env=self.agy_env(home))
+            finally:
+                os.umask(previous)
+
+            for path in (agy_config, hooks_path, claude, muse, codex):
+                self.assertTrue(path.is_file(), path)
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600, path)
+
+    def test_partial_ironmem_hook_group_is_repaired_in_place(self) -> None:
+        # Only SessionStart is ours (an older install, or PreInvocation/Stop
+        # deleted by hand). The gaps are filled; the user's extra SessionStart
+        # handler and `enabled` key are kept, and our SessionStart handler
+        # gains the timeout this version sets.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            _, hooks_path = self.agy_paths(home)
+            hooks_path.parent.mkdir(parents=True)
+            start = {
+                "type": "command",
+                "command": self.expected_hook_command(home, "trusted", "session-start"),
+            }
+            extra = {"type": "command", "command": "./my-session-note.sh", "timeout": 5}
+            hooks_path.write_text(
+                json.dumps({"ironmem": {"enabled": True, "SessionStart": [start, extra]}}),
+                encoding="utf-8",
+            )
+
+            result = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            self.assertIn("Adding the missing", result.stdout)
+            self.assertIn("PreInvocation hook", result.stdout)
+            self.assertIn("Stop hook", result.stdout)
+            self.assertIn("SessionStart timeout", result.stdout)
+            want = self.ironmem_hook_group(home)
+            group = json.loads(hooks_path.read_text(encoding="utf-8"))["ironmem"]
+            self.assertEqual(group["enabled"], True)
+            self.assertEqual(group["SessionStart"], [{**start, "timeout": 120}, extra])
+            self.assertEqual(group["PreInvocation"], want["PreInvocation"])
+            self.assertEqual(group["Stop"], want["Stop"])
+
+    def test_divergent_ironmem_hook_group_is_kept_without_force_wiring(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            _, hooks_path = self.agy_paths(home)
+            hooks_path.parent.mkdir(parents=True)
+            group = self.ironmem_hook_group(home)
+            group["Stop"] = [{"type": "command", "command": "/opt/fork/ironmem hook stop"}]
+            group["enabled"] = False
+            group["PostToolUse"] = [{"matcher": "*", "hooks": [{"command": "./audit.sh"}]}]
+            original = json.dumps({"ironmem": group, "lint": {"Stop": []}})
+            hooks_path.write_text(original, encoding="utf-8")
+
+            kept = self.run_installer(home, home / ".claude.json", extra_env=self.agy_env(home))
+
+            self.assertEqual(hooks_path.read_text(encoding="utf-8"), original)
+            self.assertIn("Stop command=/opt/fork/ironmem hook stop", kept.stderr)
+            self.assertIn("--force-wiring", kept.stderr)
+
+            forced = self.run_installer(
+                home, home / ".claude.json", force_wiring=True, extra_env=self.agy_env(home)
+            )
+
+            self.assertIn("Replacing divergent 'ironmem' Antigravity hooks entry", forced.stdout)
+            payload = json.loads(hooks_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["lint"], {"Stop": []})
+            # --force-wiring replaces our three events; the user's disable
+            # switch and their other events stay.
+            self.assertEqual(
+                payload["ironmem"],
+                {
+                    **self.ironmem_hook_group(home),
+                    "enabled": False,
+                    "PostToolUse": group["PostToolUse"],
+                },
+            )
+            self.assertIn("left disabled", forced.stdout)
+
+    def test_user_owned_ironmem_hook_groups_are_not_clobbered(self) -> None:
+        cases = {
+            # Ours and complete, but switched off with agy's documented
+            # `enabled: false`: nothing to write, and it stays off.
+            "our group, disabled": lambda home: {
+                "ironmem": {"enabled": False, **self.ironmem_hook_group(home)}
+            },
+            # Someone else's group that happens to be named `ironmem`, holding
+            # none of our events: not ours to fill in.
+            "foreign group": lambda home: {
+                "ironmem": {
+                    "enabled": False,
+                    "PreToolUse": [{"matcher": "run_command", "hooks": [{"command": "./x.sh"}]}],
+                }
+            },
+        }
+        for name, payload_for in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as directory:
+                home = pathlib.Path(directory)
+                _, hooks_path = self.agy_paths(home)
+                hooks_path.parent.mkdir(parents=True)
+                original = json.dumps(payload_for(home))
+                hooks_path.write_text(original, encoding="utf-8")
+
+                result = self.run_installer(
+                    home, home / ".claude.json", extra_env=self.agy_env(home)
+                )
+
+                self.assertEqual(hooks_path.read_text(encoding="utf-8"), original)
+                if name == "our group, disabled":
+                    self.assertIn(
+                        "'ironmem' lifecycle hooks already registered for Antigravity",
+                        result.stdout,
+                    )
+                    self.assertIn("left disabled", result.stdout)
+                else:
+                    self.assertIn("none of its lifecycle events", result.stderr)
+                    self.assertIn("PreToolUse", result.stderr)
+
+    def test_missing_jq_prints_the_agy_hooks_snippet(self) -> None:
+        # A PATH with every tool the installer needs except jq: a farm of
+        # symlinks to the real PATH's executables, minus jq and agy.
+        with tempfile.TemporaryDirectory() as directory:
+            home = pathlib.Path(directory)
+            farm = home / "path-without-jq"
+            farm.mkdir()
+            for entry in os.environ["PATH"].split(os.pathsep):
+                if not entry or not os.path.isdir(entry):
+                    continue
+                for tool in os.listdir(entry):
+                    link = farm / tool
+                    source = pathlib.Path(entry) / tool
+                    if tool in ("jq", "agy") or os.path.lexists(link):
+                        continue
+                    try:
+                        runnable = source.is_file() and os.access(source, os.X_OK)
+                    except OSError:  # e.g. a root-only /usr/sbin entry
+                        continue
+                    if runnable:
+                        link.symlink_to(source)
+            self.assertIsNone(shutil.which("jq", path=str(farm)))
+            _, hooks_path = self.agy_paths(home)
+
+            without_agy = self.run_installer(
+                home, home / ".claude.json", extra_env={"PATH": str(farm)}
+            )
+            self.assertIn("jq not installed; skipping Claude and Muse", without_agy.stderr)
+            self.assertNotIn("hooks.json", without_agy.stderr)
+
+            with_agy = self.run_installer(
+                home,
+                home / ".claude.json",
+                extra_env={**self.agy_env(home), "PATH": str(home / "agy-stub-bin") + os.pathsep + str(farm)},
+            )
+
+            self.assertIn("Claude, Muse, and Antigravity", with_agy.stderr)
+            self.assertIn(f"hook group to {hooks_path}", with_agy.stderr)
+            snippet = next(
+                line.strip() for line in with_agy.stderr.splitlines() if '"PreInvocation"' in line
+            )
+            self.assertEqual(json.loads(snippet), {"ironmem": self.ironmem_hook_group(home)})
+            self.assertFalse(hooks_path.exists())
+            self.assert_agy_never_ran(home)
 
     def test_full_install_moves_bases_outside_discovery_roots(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
