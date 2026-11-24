@@ -3478,7 +3478,7 @@ exit {code}"#
             dir.path(),
             &script(
                 "while [ ! -f root-release ]; do sleep 0.01; done\n\
-                 sh -c 'echo $$ > straggler.pid; exec sleep 5' &\n\
+                 sh -c 'echo $$ > straggler.pid; exec sleep 300' &\n\
                  while [ ! -f straggler.pid ]; do sleep 0.01; done",
                 0,
             ),
@@ -4176,9 +4176,12 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         assert_eq!(previous_limit, None);
         std::fs::write(dir.path().join("root-release"), "release").unwrap();
         // Detect the exit without reaping, so the group can still be killed
-        // safely if the root hangs; reap only once it has exited.
+        // safely if the root hangs; reap only once it has exited. Timed
+        // from the release, since the wait for the descendant above may
+        // itself have taken most of a ceiling.
+        let released = Instant::now();
         while !crate::autopilot::dispatch::exited_unreaped(&mut child).unwrap() {
-            if started.elapsed() >= Duration::from_secs(30) {
+            if released.elapsed() >= SLOW_RUNNER_CEILING {
                 crate::autopilot::dispatch::kill_process_group(&mut child);
                 let _ = child.wait();
                 panic!("root did not finish writing the oversized artifact");
@@ -4577,7 +4580,10 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             let daemon_dir = dir.path().join("daemon");
             std::fs::create_dir(&daemon_dir).unwrap();
             std::os::unix::fs::symlink("/bin/sh", daemon_dir.join("ironmem")).unwrap();
-            std::fs::write(daemon_dir.join("serve"), "sleep 30\n:\n").unwrap();
+            // Outlives the run's ceiling and the wait for cleanup below
+            // together, so a daemon that cleanup missed is still there
+            // when that wait ends, and is never taken for one it killed.
+            std::fs::write(daemon_dir.join("serve"), "sleep 300\n:\n").unwrap();
             let daemon = daemon_dir.join("ironmem");
             let configured = daemon_dir.join("daemon.sock");
             let socket = if on_configured_socket {
