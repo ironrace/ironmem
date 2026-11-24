@@ -4998,7 +4998,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let bin = binary(
             dir.path(),
             &observable(
-                "sleep 30 &\n\
+                "sleep 300 &\n\
                  echo $! > tool.pid\n\
                  while [ ! -f root-release ]; do sleep 0.01; done\n\
                  kill \"$(cat tool.pid)\"\n\
@@ -5009,16 +5009,26 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
             let run = scope.spawn(|| {
                 run_supervised_bounded_with(&cli, &bin, dir.path(), &s, SLOW_RUNNER_CEILING, None)
             });
-            // Shorter than the tool's 30 s, so a tool that is never recorded
-            // is still running when the wait gives up, and well inside the
-            // run's ceiling, so the release below always reaches the root.
+            // Timed from the moment the stub names its tool, since the stub
+            // first waits for the supervisor's first sample, which a loaded
+            // runner can take most of this long over. Until then the run's
+            // own ceiling bounds the loop. The tool's 300 s outlives that
+            // ceiling and this wait together, so a tool that is never
+            // recorded is still running when the wait gives up, and the pid
+            // the root kills is still the tool's.
             let wait = Duration::from_secs(20);
-            let started = Instant::now();
+            let mut named: Option<Instant> = None;
             let mut recorded = false;
-            while !recorded && !run.is_finished() && started.elapsed() < wait {
+            while !recorded
+                && !run.is_finished()
+                && !named.is_some_and(|named| named.elapsed() >= wait)
+            {
                 let tool = std::fs::read_to_string(dir.path().join("tool.pid"))
                     .ok()
                     .and_then(|pid| pid.trim().parse::<u32>().ok());
+                if tool.is_some() && named.is_none() {
+                    named = Some(Instant::now());
+                }
                 recorded = tool.is_some_and(|tool| {
                     crate::autopilot::process_tree::read_identity(&a)
                         .is_ok_and(|identity| identity.descendants.iter().any(|d| d.pid == tool))
