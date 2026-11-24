@@ -27,4 +27,21 @@ ignore = [
     # Direct dependency in crates/ironmem and benchmarks/abeval. Remove in the
     # PR that migrates off chrono to jiff or time (#440).
     "RUSTSEC-2026-0543",
+    # RUSTSEC-2026-0574 to -0582 — nine "unsound" reports on heapless 0.8.0
+    # (not vulnerabilities). Only in the benchmarks/provbench/{labeler,phase1}
+    # lockfiles, under gix 0.77 -> gix-hash -> faster-hex 0.10.1. faster-hex
+    # imports heapless only without its `alloc` feature, and gix-hash turns
+    # that feature on (through `std`), so no heapless code is called. No
+    # 0.8.x release fixes them; the fix is heapless >= 0.9.4. Remove in the
+    # PR that moves those two benchmarks to a gix without faster-hex 0.10
+    # (#451).
+    "RUSTSEC-2026-0574",
+    "RUSTSEC-2026-0575",
+    "RUSTSEC-2026-0576",
+    "RUSTSEC-2026-0577",
+    "RUSTSEC-2026-0578",
+    "RUSTSEC-2026-0579",
+    "RUSTSEC-2026-0580",
+    "RUSTSEC-2026-0581",
+    "RUSTSEC-2026-0582",
 ]

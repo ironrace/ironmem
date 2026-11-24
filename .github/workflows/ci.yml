@@ -232,9 +232,11 @@ jobs:
       # One step per lockfile. `working-directory` only picks the lockfile:
       # the action runs `cargo audit --json --file <working-directory>/Cargo.lock`
       # from the repository root, so the ignore list in .cargo/audit.toml
-      # applies to these runs too. The one id it hides in them is
+      # applies to these runs too. The ids it hides in them are
       # RUSTSEC-2024-0436 (`paste`, a proc-macro) in provbench/baseline,
-      # phase1 and scoring; abeval and labeler report nothing without it.
+      # phase1 and scoring, RUSTSEC-2026-0543 (`chrono`) in abeval, and the
+      # nine `heapless` 0.8.0 ids (RUSTSEC-2026-0574 to -0582) in
+      # provbench/labeler and phase1.
       - name: audit benchmarks/abeval lockfile
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998  # v2
         with:
