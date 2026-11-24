@@ -2895,6 +2895,14 @@ pub(crate) mod contract_tests {
         );
     }
 
+    /// The ceiling for a supervised run whose stub should finish at once.
+    /// It is there to end a run that hangs, never to tell one outcome from
+    /// another: a loaded CI runner once took over four seconds on a step
+    /// that takes under one on a quiet machine, and a three-second ceiling
+    /// would have read that as a timeout. Shorter than the 120 s probe in
+    /// [`await_first_sample`], which it must stay.
+    const SLOW_RUNNER_CEILING: Duration = Duration::from_secs(60);
+
     /// Shell for a stub that goes on only once the supervisor has sampled
     /// it, as any real harness outlives that sample: it starts a probe
     /// `sleep`, waits until the identity file records the probe as an
@@ -2905,7 +2913,7 @@ pub(crate) mod contract_tests {
     /// a probe that has ended. Exits 97 if none recorded it, or 96 if the
     /// identity file is there and cannot be read (while it waits, a failed
     /// read only means "not yet"). A test that supervises the stub gives
-    /// its run a ceiling (3 to 60 s) shorter than the probe's 120 s, so
+    /// its run a ceiling (10 to 60 s) shorter than the probe's 120 s, so
     /// there the ceiling ends a run no sample recorded, and 97 and 96 are
     /// seen only where the probe is shortened.
     pub(crate) fn await_first_sample() -> &'static str {
@@ -2987,7 +2995,7 @@ exit {code}"#
             super::super::process_tree::ProcessTracker::owning_every_descendant(child.id());
         let result = (|| {
             while !repo.join("root-ready").exists() {
-                if child.try_wait()?.is_some() || started.elapsed() >= Duration::from_secs(3) {
+                if child.try_wait()?.is_some() || started.elapsed() >= SLOW_RUNNER_CEILING {
                     return Err(validation("fixture did not wait for process observation"));
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -3003,7 +3011,7 @@ exit {code}"#
                 if let Some(status) = child.try_wait()? {
                     break status;
                 }
-                if started.elapsed() >= Duration::from_secs(3) {
+                if started.elapsed() >= SLOW_RUNNER_CEILING {
                     return Err(validation("fixture did not exit after release"));
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -3042,13 +3050,13 @@ exit {code}"#
             };
             let bin = binary(dir.path(), &script(&extra, code));
             let o = if code == 0 {
-                run_supervised_bounded(&bin, dir.path(), &s, Duration::from_secs(3)).unwrap()
+                run_supervised_bounded(&bin, dir.path(), &s, SLOW_RUNNER_CEILING).unwrap()
             } else {
                 run_observed_fixture(&bin, dir.path(), &s)
             };
             assert!(
                 !o.timed_out,
-                "the nonzero fixture must exit normally after observation"
+                "exit {code}: the fixture must exit by itself, not at the timeout: {o:?}"
             );
             assert_eq!(o.process_success, code == 0);
             assert_eq!(o.is_error, code != 0);
@@ -3355,9 +3363,13 @@ exit {code}"#
             &binary(dir.path(), &script(&observable(""), 0)),
             dir.path(),
             &s,
-            Duration::from_secs(3),
+            SLOW_RUNNER_CEILING,
         )
         .unwrap();
+        // A run the timeout ends before the stub names its thread is refused
+        // with the same reason, so without this the test passes having never
+        // offered the unrequested thread.
+        assert!(!o.timed_out, "{o:?}");
         assert!(!o.is_met());
         assert_eq!(
             o.native_session_id, None,
@@ -3436,7 +3448,7 @@ exit {code}"#
             &binary(dir.path(), &script(&extra, 0)),
             dir.path(),
             &s,
-            Duration::from_secs(3),
+            SLOW_RUNNER_CEILING,
         )
         .unwrap();
         assert!(o.is_met(), "{o:?}");
@@ -4428,9 +4440,8 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                  echo journal",
             ),
         );
-        let o =
-            run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5), None)
-                .unwrap();
+        let o = run_supervised_bounded_with(&cli, &bin, dir.path(), &s, SLOW_RUNNER_CEILING, None)
+            .unwrap();
         assert!(o.process_success && o.is_met(), "{o:?}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("prompt-seen")).unwrap(),
@@ -4459,9 +4470,8 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                  echo journal",
             ),
         );
-        let o =
-            run_supervised_bounded_with(&cli, &bin, dir.path(), &s, Duration::from_secs(5), None)
-                .unwrap();
+        let o = run_supervised_bounded_with(&cli, &bin, dir.path(), &s, SLOW_RUNNER_CEILING, None)
+            .unwrap();
         assert!(o.process_success && o.is_met(), "{o:?}");
         assert_eq!(
             std::fs::read_to_string(dir.path().join("no-daemon")).unwrap(),
