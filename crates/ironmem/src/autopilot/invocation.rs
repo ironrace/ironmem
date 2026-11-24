@@ -2895,12 +2895,14 @@ pub(crate) mod contract_tests {
         );
     }
 
-    /// The ceiling for a supervised run whose stub should finish at once.
+    /// The ceiling for a supervised run whose stub should finish at once,
+    /// and for a test's own wait on one step of such a stub.
     /// It is there to end a run that hangs, never to tell one outcome from
     /// another: a loaded CI runner once took over four seconds on a step
     /// that takes under one on a quiet machine, and a three-second ceiling
     /// would have read that as a timeout. Shorter than the 120 s probe in
     /// [`await_first_sample`], which it must stay.
+    #[cfg(unix)]
     const SLOW_RUNNER_CEILING: Duration = Duration::from_secs(60);
 
     /// Shell for a stub that goes on only once the supervisor has sampled
@@ -2995,8 +2997,11 @@ exit {code}"#
             super::super::process_tree::ProcessTracker::owning_every_descendant(child.id());
         let result = (|| {
             while !repo.join("root-ready").exists() {
-                if child.try_wait()?.is_some() || started.elapsed() >= SLOW_RUNNER_CEILING {
+                if child.try_wait()?.is_some() {
                     return Err(validation("fixture did not wait for process observation"));
+                }
+                if started.elapsed() >= SLOW_RUNNER_CEILING {
+                    return Err(validation("fixture never reached process observation"));
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -3054,6 +3059,8 @@ exit {code}"#
             } else {
                 run_observed_fixture(&bin, dir.path(), &s)
             };
+            // Only the supervised run (exit 0) can set this. The observed
+            // fixture has no timeout of its own and panics at its ceiling.
             assert!(
                 !o.timed_out,
                 "exit {code}: the fixture must exit by itself, not at the timeout: {o:?}"
@@ -3368,8 +3375,11 @@ exit {code}"#
         .unwrap();
         // A run the timeout ends before the stub names its thread is refused
         // with the same reason, so without this the test passes having never
-        // offered the unrequested thread.
+        // offered the unrequested thread. So is a stub that never launched,
+        // which is not a timeout either: only a stub that ran to its own
+        // exit 0 has printed the thread.
         assert!(!o.timed_out, "{o:?}");
+        assert!(o.process_success, "{o:?}");
         assert!(!o.is_met());
         assert_eq!(
             o.native_session_id, None,
@@ -3485,7 +3495,7 @@ exit {code}"#
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            assert!(started.elapsed() < Duration::from_secs(3), "root hung");
+            assert!(started.elapsed() < SLOW_RUNNER_CEILING, "root hung");
             std::thread::sleep(Duration::from_millis(5));
         };
         let result = finish_supervised(
@@ -4152,7 +4162,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         let mut tracker =
             super::super::process_tree::ProcessTracker::owning_every_descendant(child.id());
         let ready = dir.path().join("descendant-ready");
-        while !ready.exists() && started.elapsed() < Duration::from_secs(3) {
+        while !ready.exists() && started.elapsed() < SLOW_RUNNER_CEILING {
             std::thread::sleep(Duration::from_millis(5));
         }
         if !ready.exists() {
@@ -4631,7 +4641,7 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
                 // parent a moment to reap them. A zombie counts as gone:
                 // without an init reaper it is never collected, and its
                 // group probe keeps succeeding on it.
-                let deadline = Instant::now() + Duration::from_secs(2);
+                let deadline = Instant::now() + SLOW_RUNNER_CEILING;
                 while !(gone(pid) && group_gone(pid)) && Instant::now() < deadline {
                     std::thread::sleep(Duration::from_millis(20));
                 }
@@ -4991,18 +5001,15 @@ while [ ! -s escaped.pid ]; do sleep 0.01; done"#,
         );
         std::thread::scope(|scope| {
             let run = scope.spawn(|| {
-                run_supervised_bounded_with(
-                    &cli,
-                    &bin,
-                    dir.path(),
-                    &s,
-                    Duration::from_secs(10),
-                    None,
-                )
+                run_supervised_bounded_with(&cli, &bin, dir.path(), &s, SLOW_RUNNER_CEILING, None)
             });
+            // Shorter than the tool's 30 s, so a tool that is never recorded
+            // is still running when the wait gives up, and well inside the
+            // run's ceiling, so the release below always reaches the root.
+            let wait = Duration::from_secs(20);
             let started = Instant::now();
             let mut recorded = false;
-            while !recorded && !run.is_finished() && started.elapsed() < Duration::from_secs(5) {
+            while !recorded && !run.is_finished() && started.elapsed() < wait {
                 let tool = std::fs::read_to_string(dir.path().join("tool.pid"))
                     .ok()
                     .and_then(|pid| pid.trim().parse::<u32>().ok());
